@@ -15,6 +15,9 @@ LANE_MAP: dict[str, Lane] = {
     "whisperx": "local",
     "azure": "local",
     "azure-batch": "azure",
+    "nim-sortformer-str": "local",
+    "nim-sortformer-ofl": "local",
+    "nemo-clustering": "local",
 }
 
 

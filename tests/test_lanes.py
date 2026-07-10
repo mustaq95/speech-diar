@@ -5,7 +5,7 @@ from apps.background_worker.lanes import lane_for, split_by_lane
 
 
 def test_local_models_map_to_local_lane() -> None:
-    for model_id in ("pyannote", "whisperx", "azure"):
+    for model_id in ("pyannote", "whisperx", "azure", "nim-sortformer-str", "nim-sortformer-ofl", "nemo-clustering"):
         assert lane_for(model_id) == "local"
 
 

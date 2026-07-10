@@ -13,6 +13,12 @@ function pct(value: number, duration: number): number {
 /** Fixed vertical gap between one model's row/band and the next, regardless of speaker count. */
 const ROW_GAP = 8;
 
+/** Minimum height for every model's row/band and gutter label, regardless of speaker count
+ * (speaker lanes are sized as a percentage of the band's actual height, so more speakers
+ * make the lanes thinner instead of growing the box off-screen). Bands still flex-grow to
+ * equally fill any extra vertical space when fewer models are shown. */
+const BAND_H = 104;
+
 interface StudioProps {
   models: ModelRun[];
   active: ActiveMap;
@@ -105,27 +111,25 @@ function Band({
   time,
   duration,
   now,
-  marginTop,
+  gap,
 }: {
   model: ModelRun;
   glow: boolean;
   time: number;
   duration: number;
   now: number;
-  marginTop: number;
+  gap: boolean;
 }) {
-  const laneH = 24;
   const pad = 9;
   const numSpk = Math.max(model.numSpk, 1);
-  const height = numSpk * laneH + pad * 2;
   const busy = isInFlight(model);
   const failed = model.status === "failed";
 
-  const bandStyle = { minHeight: height, flex: "1 1 auto", marginTop } as const;
+  const bandClass = `model-band${gap ? " model-row-gap" : ""}${busy ? " pending-band" : ""}${failed ? " failed-band" : ""}`;
 
   if (busy) {
     return (
-      <div className="model-band pending-band" style={bandStyle}>
+      <div className={bandClass}>
         <span className="spinner" />
         <div>
           <p className="mono">{modelTimingLabel(model, duration, now)}</p>
@@ -136,7 +140,7 @@ function Band({
 
   if (failed) {
     return (
-      <div className="model-band failed-band" style={bandStyle}>
+      <div className={bandClass}>
         <span className="fail-mark">✕</span>
         <div>
           <p className="mono">{modelTimingLabel(model, duration, now)}</p>
@@ -146,7 +150,7 @@ function Band({
   }
 
   return (
-    <div className="model-band" style={bandStyle}>
+    <div className={bandClass}>
       {overlapsFor(model).map((range, index) => (
         <span
           key={`overlap-${index}`}
@@ -203,12 +207,9 @@ export function Studio({
 }: StudioProps) {
   const shown = models.filter((model) => active[model.id]);
   const outerRef = useRef<HTMLDivElement | null>(null);
-  const laneH = 24;
-  const pad = 9;
   const rulerH = 30;
   const waveH = 104;
-  const minInnerH =
-    rulerH + waveH + shown.reduce((sum, model) => sum + Math.max(model.numSpk, 1) * laneH + pad * 2, 0) + ROW_GAP * Math.max(shown.length - 1, 0);
+  const minInnerH = rulerH + waveH + shown.length * BAND_H + ROW_GAP * Math.max(shown.length - 1, 0);
 
   const seek = (event: React.MouseEvent<HTMLDivElement>) => {
     const target = outerRef.current;
@@ -218,16 +219,26 @@ export function Studio({
     onSeek(ratio * duration);
   };
 
+  const modelRows = shown.length > 0 ? ` repeat(${shown.length}, minmax(${BAND_H}px, 1fr))` : "";
+
   return (
     <div className="studio-shell">
-      <div className="studio-gutter">
+      <div
+        className="studio-grid"
+        style={{
+          minHeight: minInnerH,
+          gridTemplateRows: `${rulerH}px ${waveH}px${modelRows}`,
+        }}
+      >
         <div className="gutter-ruler" />
-        <Transport time={time} duration={duration} playing={playing} onToggle={onToggle} onStep={onStep} clockRef={clockRef} miniFillRef={miniFillRef} />
+        <div className="gutter-transport">
+          <Transport time={time} duration={duration} playing={playing} onToggle={onToggle} onStep={onStep} clockRef={clockRef} miniFillRef={miniFillRef} />
+        </div>
         {shown.map((model, index) => (
           <div
             key={model.id}
-            className="gutter-model"
-            style={{ minHeight: Math.max(model.numSpk, 1) * laneH + pad * 2, flex: "1 1 auto", marginTop: index === 0 ? 0 : ROW_GAP }}
+            className={`gutter-model${index > 0 ? " model-row-gap" : ""}`}
+            style={{ gridRow: 3 + index }}
           >
             <div>
               <span className="mono">{String(index + 1).padStart(2, "0")}</span>
@@ -241,21 +252,21 @@ export function Studio({
             </div>
           </div>
         ))}
-      </div>
-      <div className="studio-scroll" ref={scrollRef}>
-        <div
-          className="studio-inner"
-          ref={(node) => { innerRef(node); outerRef.current = node; }}
-          style={{ width: `${100 * zoom}%`, minWidth: "100%", minHeight: minInnerH, height: "100%" }}
-          onClick={seek}
-        >
-          <Ruler duration={duration} />
-          <Wave waveFillRef={waveFillRef} time={time} duration={duration} wavePeaks={wavePeaks} />
-          {shown.map((model, index) => (
-            <Band key={model.id} model={model} glow={glow} time={time} duration={duration} now={now} marginTop={index === 0 ? 0 : ROW_GAP} />
-          ))}
-          <div ref={playheadRef} className="playhead" style={{ left: `${pct(time, duration)}%` }}>
-            <span />
+        <div className="studio-scroll" ref={scrollRef}>
+          <div
+            className="studio-inner"
+            ref={(node) => { innerRef(node); outerRef.current = node; }}
+            style={{ width: `${100 * zoom}%`, minWidth: "100%" }}
+            onClick={seek}
+          >
+            <Ruler duration={duration} />
+            <Wave waveFillRef={waveFillRef} time={time} duration={duration} wavePeaks={wavePeaks} />
+            {shown.map((model, index) => (
+              <Band key={model.id} model={model} glow={glow} time={time} duration={duration} now={now} gap={index > 0} />
+            ))}
+            <div ref={playheadRef} className="playhead" style={{ left: `${pct(time, duration)}%` }}>
+              <span />
+            </div>
           </div>
         </div>
       </div>

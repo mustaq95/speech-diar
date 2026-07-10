@@ -25,14 +25,16 @@ class Settings(BaseSettings):
     )
 
     # --- Database (Postgres) ---
-    database_url: str = "postgresql+psycopg://diarization:diarization@localhost:5432/diarization"
+    database_url: str = "postgresql+psycopg://postgres:pg123456@localhost:5432/diarization"
 
     # --- Queue (Redis / RQ) ---
     redis_url: str = "redis://localhost:6379/0"
     worker_concurrency: int = 1
 
     # --- Primary storage lane: MinIO / S3 (local models) ---
-    s3_endpoint_url: str | None = "http://localhost:9000"
+    # Port 9010: on DGX Spark hosts running the Parakeet NIM containers, host
+    # port 9000 is owned by parakeet-nim-str's HTTP API.
+    s3_endpoint_url: str | None = "http://localhost:9010"
     s3_bucket: str = "diarization-audio"
     aws_access_key_id: str | None = None
     aws_secret_access_key: str | None = None
@@ -63,6 +65,26 @@ class Settings(BaseSettings):
 
     # --- Local diarization models (DGX Spark: cuda; dev machine: cpu) ---
     diarization_device: str = "cpu"
+    # Required by pyannote community-1, a gated HuggingFace model. Accept its
+    # conditions at https://huggingface.co/pyannote/speaker-diarization-community-1
+    # then set this to a HuggingFace access token.
+    huggingface_token: str | None = None
+
+    # --- NVIDIA Parakeet-Sortformer NIM (DGX Spark local Triton/Riva containers) ---
+    # Started via ./deploy/parakeet_nim_up.sh; gRPC only (speaker tags are not
+    # exposed by the plain HTTP /v1/audio/transcriptions route).
+    nim_str_grpc: str = "localhost:50051"
+    nim_ofl_grpc: str = "localhost:50052"
+    nim_language: str = "multi"
+    nim_max_speakers: int = 8
+    nim_grpc_timeout_sec: int = 600
+
+    # --- NeMo Clustering Diarizer (custom container, no turnkey NIM ships this) ---
+    # Started via ./deploy/nemo-clustering/nemo_clustering_up.sh; cascaded
+    # MarbleNet VAD + TitaNet + spectral clustering, for meetings with more
+    # speakers than the Sortformer NIMs above are tuned for.
+    nemo_clustering_url: str = "http://localhost:9020"
+    nemo_clustering_timeout_sec: int = 1800
 
     @property
     def cors_origins_list(self) -> list[str]:

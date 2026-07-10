@@ -476,7 +476,7 @@ export default function App() {
               <button type="button" onClick={() => setZoom((value) => Math.min(6, value + 1))}>+</button>
             </div>
           </section>
-          <section className="studio-grid">
+          <section className="studio-layout">
             <Studio
               models={dashboardModels}
               active={active}

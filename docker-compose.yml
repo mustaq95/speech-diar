@@ -5,8 +5,8 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_DB: diarization
-      POSTGRES_USER: diarization
-      POSTGRES_PASSWORD: diarization
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: pg123456
     ports:
       - "5432:5432"
     volumes:
@@ -24,8 +24,8 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
-      - "9000:9000"
-      - "9099:9001"  # web console only; 9001 is taken locally, S3 API (9000) stays default
+      - "9010:9000"  # S3 API; remapped from 9000, which the parakeet-nim-str NIM container owns on this host
+      - "9099:9001"  # web console only; 9001 is taken locally too (parakeet-nim-ofl HTTP)
     volumes:
       - miniodata:/data
 

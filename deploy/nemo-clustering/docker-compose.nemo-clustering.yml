@@ -1,0 +1,40 @@
+# NeMo Clustering Diarizer -- cascaded diarization (MarbleNet VAD + TitaNet +
+# spectral clustering) for meetings with many speakers (8+), where Sortformer
+# (deploy/parakeet/) is capped. No turnkey NIM exists for this pipeline, so
+# this is a custom image built from the official NGC NeMo container.
+#
+# Service: nemo-clustering -- HTTP :9020 (POST /diarize, GET /health/ready)
+#
+# Prereqs: cp deploy/nemo-clustering/nemo-clustering.env.example deploy/nemo-clustering/nemo-clustering.env
+#          ./deploy/nemo-clustering/nemo_clustering_up.sh
+
+services:
+  nemo-clustering:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nemo-clustering:local
+    container_name: nemo-clustering
+    restart: unless-stopped
+    gpus: all
+    ipc: host
+    shm_size: "8gb"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    env_file:
+      - path: nemo-clustering.env
+        required: false
+    environment:
+      - NEMO_CACHE_DIR=/root/.cache/torch/NeMo
+    ports:
+      - "${NEMO_CLUSTERING_PORT:-9020}:9020"
+    volumes:
+      - nemo-clustering-cache:/root/.cache/torch/NeMo
+
+volumes:
+  nemo-clustering-cache:
+    name: nemo-clustering-cache

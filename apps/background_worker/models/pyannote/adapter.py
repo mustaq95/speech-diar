@@ -7,9 +7,9 @@ from .runner import PyAnnoteRawOutput
 
 
 class PyAnnoteAdapter(ModelAdapter[PyAnnoteRawOutput]):
-    name = "PyAnnote Audio 3.1"
+    name = "PyAnnote Community-1"
     short = "PyAnnote"
-    description = "End-to-end neural diarization · v3.1"
+    description = "End-to-end neural speaker diarization · community-1 (v4)"
 
     def adapt(self, raw: PyAnnoteRawOutput) -> DiarizationModelRun:
         speaker_index: dict[str, int] = {}

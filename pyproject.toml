@@ -14,7 +14,9 @@ dependencies = [
     "boto3>=1.34",
     "azure-storage-blob>=12.19",
     "azure-cognitiveservices-speech>=1.40",
+    "nvidia-riva-client>=2.14",
     "requests>=2.31",
+    "httpx>=0.27",
     "rq>=1.16",
     "redis>=5.0",
     "python-dotenv>=1.0",
@@ -26,7 +28,7 @@ dependencies = [
 [project.optional-dependencies]
 models = [
     "torch>=2.3",
-    "pyannote.audio>=3.1",
+    "pyannote.audio>=4.0",
     "whisperx",
 ]
 
@@ -35,7 +37,6 @@ models = [
 dev = [
     "pytest>=8.0",
     "fakeredis>=2.23",
-    "httpx>=0.27",
     "honcho>=2.0.0",
 ]
 

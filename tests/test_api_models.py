@@ -20,6 +20,6 @@ def test_get_models_lists_every_registered_engine_with_availability(client: Test
 def test_unimplemented_engines_are_listed_but_marked_unavailable(client: TestClient) -> None:
     response = client.get("/models")
     body = {entry["id"]: entry for entry in response.json()}
-    assert body["pyannote"]["available"] is False
     assert body["whisperx"]["available"] is False
+    assert body["pyannote"]["available"] is True
     assert body["azure-batch"]["available"] is True

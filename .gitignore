@@ -5,6 +5,9 @@ project/
 .env
 .env.local
 .worker_pool.pids
+apps/frontend/vite.config.js
+apps/frontend/vite.config.d.ts
+apps/frontend/*.tsbuildinfo
 
 # Python
 .venv
@@ -12,3 +15,6 @@ __pycache__
 *.pyc
 .pytest_cache
 *.egg-info
+deploy/parakeet/parakeet-nim.env
+deploy/nemo-clustering/nemo-clustering.env
+.gstack/

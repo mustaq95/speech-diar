@@ -2,8 +2,12 @@
 output to the shared contract. No merging, no fabrication — one segment per
 raw phrase/turn the engine actually reported."""
 
+from apps.background_worker.models import _nim_shared
 from apps.background_worker.models.azure_batch.adapter import AzureBatchAdapter
 from apps.background_worker.models.azure_speech.adapter import AzureSpeechAdapter
+from apps.background_worker.models.nemo_clustering.adapter import NemoClusteringAdapter
+from apps.background_worker.models.nim_sortformer_ofl.adapter import NimSortformerOflAdapter
+from apps.background_worker.models.nim_sortformer_str.adapter import NimSortformerStrAdapter
 from apps.background_worker.models.pyannote.adapter import PyAnnoteAdapter
 from apps.background_worker.models.whisperx.adapter import WhisperXAdapter
 
@@ -81,6 +85,137 @@ def test_azure_batch_adapter_processing_ms_none_when_timing_missing() -> None:
     assert AzureBatchAdapter().processing_ms({"recognizedPhrases": []}) is None
 
 
+def test_pyannote_adapter_maps_tracks_and_rebases_speakers_by_first_appearance() -> None:
+    raw = [
+        {"start": 0.0, "end": 0.4, "label": "SPEAKER_01"},
+        {"start": 0.5, "end": 0.7, "label": "SPEAKER_00"},
+        {"start": 0.8, "end": 1.0, "label": "SPEAKER_01"},
+    ]
+    run = PyAnnoteAdapter().adapt(raw)
+    assert run.id == "pyannote"
+    assert run.num_spk == 2
+    assert [seg.spk for seg in run.segs] == [0, 1, 0]  # first-appearance order, not label sort order
+    assert run.segs[0].s == 0.0 and run.segs[0].e == 0.4
+
+
+def test_pyannote_adapter_no_merging_of_adjacent_same_speaker_tracks() -> None:
+    raw = [
+        {"start": 0.0, "end": 1.0, "label": "SPEAKER_00"},
+        {"start": 1.0, "end": 2.0, "label": "SPEAKER_00"},
+    ]
+    run = PyAnnoteAdapter().adapt(raw)
+    assert len(run.segs) == 2
+
+
 def test_static_metadata_present_for_get_models_registry() -> None:
-    for adapter in (AzureSpeechAdapter(), AzureBatchAdapter(), PyAnnoteAdapter(), WhisperXAdapter()):
+    for adapter in (
+        AzureSpeechAdapter(),
+        AzureBatchAdapter(),
+        PyAnnoteAdapter(),
+        WhisperXAdapter(),
+        NimSortformerOflAdapter(),
+        NimSortformerStrAdapter(),
+        NemoClusteringAdapter(),
+    ):
         assert adapter.name and adapter.short and adapter.description
+
+
+def test_nim_group_words_into_turns_groups_consecutive_same_speaker() -> None:
+    words = [
+        {"speaker_tag": 0, "start_ms": 0, "end_ms": 200, "word": "hi"},
+        {"speaker_tag": 0, "start_ms": 200, "end_ms": 400, "word": "there"},
+        {"speaker_tag": 1, "start_ms": 500, "end_ms": 700, "word": "hey"},
+    ]
+    turns = _nim_shared.group_words_into_turns(words)
+    assert turns == [(0, 0.0, 0.4), (1, 0.5, 0.7)]
+
+
+def test_nim_group_words_into_turns_never_recoalesces_separated_runs() -> None:
+    """Speaker 0 appears again after speaker 1 -- must stay two separate
+    turns, not merge back into the earlier speaker-0 run (never coalesce)."""
+    words = [
+        {"speaker_tag": 0, "start_ms": 0, "end_ms": 100, "word": "a"},
+        {"speaker_tag": 1, "start_ms": 100, "end_ms": 200, "word": "b"},
+        {"speaker_tag": 0, "start_ms": 200, "end_ms": 300, "word": "c"},
+    ]
+    turns = _nim_shared.group_words_into_turns(words)
+    assert [tag for tag, _, _ in turns] == [0, 1, 0]
+    assert len(turns) == 3
+
+
+def test_nim_group_words_into_turns_sorts_out_of_order_words() -> None:
+    words = [
+        {"speaker_tag": 1, "start_ms": 500, "end_ms": 700, "word": "b"},
+        {"speaker_tag": 0, "start_ms": 0, "end_ms": 200, "word": "a"},
+    ]
+    turns = _nim_shared.group_words_into_turns(words)
+    assert [s for _, s, _ in turns] == [0.0, 0.5]
+
+
+def test_nim_group_words_into_turns_empty_input() -> None:
+    assert _nim_shared.group_words_into_turns([]) == []
+
+
+def test_nim_sortformer_ofl_adapter_maps_turns_and_rebases_speakers() -> None:
+    raw = {
+        "audio_duration_sec": 1.0,
+        "words": [
+            {"speaker_tag": 5, "start_ms": 0, "end_ms": 200, "word": "hi"},
+            {"speaker_tag": 5, "start_ms": 200, "end_ms": 400, "word": "there"},
+            {"speaker_tag": 2, "start_ms": 500, "end_ms": 700, "word": "hey"},
+        ],
+    }
+    run = NimSortformerOflAdapter().adapt(raw)
+    assert run.id == "nim-sortformer-ofl"
+    assert run.num_spk == 2
+    assert [seg.spk for seg in run.segs] == [0, 1]  # first-appearance order, not raw tag values
+    assert run.segs[0].s == 0.0 and run.segs[0].e == 0.4
+    assert NimSortformerOflAdapter().audio_duration_sec(raw) == 1.0
+
+
+def test_nim_sortformer_str_adapter_maps_turns_and_rebases_speakers() -> None:
+    raw = {
+        "audio_duration_sec": 1.0,
+        "words": [
+            {"speaker_tag": 0, "start_ms": 0, "end_ms": 200, "word": "hi"},
+            {"speaker_tag": 1, "start_ms": 200, "end_ms": 400, "word": "there"},
+        ],
+    }
+    run = NimSortformerStrAdapter().adapt(raw)
+    assert run.id == "nim-sortformer-str"
+    assert run.num_spk == 2
+    assert [seg.spk for seg in run.segs] == [0, 1]
+
+
+def test_nemo_clustering_adapter_parses_rttm_and_rebases_speakers_by_first_appearance() -> None:
+    raw = {
+        "audio_duration_sec": 10.0,
+        "rttm": (
+            "SPEAKER rec 1 0.00 2.00 <NA> <NA> speaker_3 <NA> <NA>\n"
+            "SPEAKER rec 1 2.00 3.00 <NA> <NA> speaker_1 <NA> <NA>\n"
+            "SPEAKER rec 1 5.00 1.50 <NA> <NA> speaker_3 <NA> <NA>\n"
+        ),
+    }
+    run = NemoClusteringAdapter().adapt(raw)
+    assert run.id == "nemo-clustering"
+    assert run.num_spk == 2
+    assert [seg.spk for seg in run.segs] == [0, 1, 0]  # speaker_3 seen first, despite label ">" speaker_1
+    assert run.segs[0].s == 0.0 and run.segs[0].e == 2.0
+    assert NemoClusteringAdapter().audio_duration_sec(raw) == 10.0
+
+
+def test_nemo_clustering_adapter_no_merging_of_adjacent_same_speaker_lines() -> None:
+    raw = {
+        "rttm": (
+            "SPEAKER rec 1 0.00 1.00 <NA> <NA> speaker_0 <NA> <NA>\n"
+            "SPEAKER rec 1 1.00 1.00 <NA> <NA> speaker_0 <NA> <NA>\n"
+        )
+    }
+    run = NemoClusteringAdapter().adapt(raw)
+    assert len(run.segs) == 2
+
+
+def test_nemo_clustering_adapter_empty_rttm_yields_no_segments() -> None:
+    run = NemoClusteringAdapter().adapt({"rttm": ""})
+    assert run.segs == []
+    assert run.num_spk == 0
