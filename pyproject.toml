@@ -37,6 +37,7 @@ dev = [
     "pytest>=8.0",
     "fakeredis>=2.23",
     "honcho>=2.0.0",
+    "ipykernel>=7.3.0",
 ]
 
 [build-system]

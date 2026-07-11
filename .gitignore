@@ -8,6 +8,9 @@ project/
 apps/frontend/vite.config.js
 apps/frontend/vite.config.d.ts
 apps/frontend/*.tsbuildinfo
+.claude/
+.cursor/
+.gstack/
 
 # Python
 .venv
@@ -15,8 +18,5 @@ __pycache__
 *.pyc
 .pytest_cache
 *.egg-info
-deploy/parakeet/parakeet-nim.env
-deploy/nemo-clustering/nemo-clustering.env
-deploy/3d-speaker-clustering/3d-speaker-clustering.env
-deploy/diarizen/diarizen.env
-.gstack/
+*.env
+
