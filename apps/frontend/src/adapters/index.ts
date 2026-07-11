@@ -67,7 +67,12 @@ export function modelRunFromMetadata(meta: ModelMetadata): ModelRun {
   return { id: meta.id, name: meta.name, short: meta.short, description: meta.description, segs: [], numSpk: 0 };
 }
 
-/** Available engines default on; unimplemented ones default off and stay off (their toggle is disabled). */
-export function deriveActiveFromCatalog(catalog: ModelMetadata[]): ActiveMap {
-  return Object.fromEntries(catalog.map((meta) => [meta.id, meta.available]));
+/** Reconciles a saved Settings choice with the current catalog: an
+ * unavailable model (unimplemented, or excluded via server-side
+ * `ENABLED_MODELS`) is always forced off regardless of what was saved, and a
+ * model with no saved entry (new to the catalog) defaults to `available`. */
+export function mergeActiveWithCatalog(saved: ActiveMap, catalog: ModelMetadata[]): ActiveMap {
+  return Object.fromEntries(
+    catalog.map((meta) => [meta.id, meta.available && (saved[meta.id] ?? meta.available)]),
+  );
 }

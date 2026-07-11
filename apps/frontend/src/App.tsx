@@ -8,17 +8,17 @@ import { SettingsView } from "./components/SettingsView";
 import { MIN_PX_PER_SEC, Studio } from "./components/Studio";
 import { TopBar } from "./components/TopBar";
 import { UploadingScreen } from "./components/UploadingScreen";
-import { boundsFor, buildEvents, fmt, loadProjects, saveProjects } from "./utils";
+import { boundsFor, buildEvents, fmt, loadModelActive, loadProjects, saveModelActive, saveProjects } from "./utils";
 import {
   DEMO_AUDIO_FILE_ID,
   audioStreamUrl,
-  deriveActiveFromCatalog,
   deriveDefaultEval,
   deriveDefaultParams,
   fetchEvaluation,
   fetchModelCatalog,
   fetchRuntimeConfig,
   getDiarizationEvaluation,
+  mergeActiveWithCatalog,
   modelRunFromMetadata,
   patchUploadTiming,
   uploadAudio,
@@ -109,10 +109,22 @@ export default function App() {
       .catch(() => undefined);
   }, []);
 
-  // Seed "which models run next" from the catalog until a real evaluation exists.
+  // Seed "which models run next" once the catalog first loads, merging in any
+  // Settings choice already saved in localStorage. A one-time ref guard
+  // instead of an `evaluation` dependency: starting a new recording or
+  // clearing the loaded evaluation must never re-enable models the user
+  // turned off in Settings.
+  const seededActiveRef = useRef(false);
+  useEffect(() => {
+    if (catalog.length === 0 || seededActiveRef.current) return;
+    seededActiveRef.current = true;
+    setActive(mergeActiveWithCatalog(loadModelActive() ?? {}, catalog));
+  }, [catalog]);
+
+  // Reset param/eval-config defaults to the catalog shell whenever there's no
+  // real evaluation loaded (before first upload, or after "+ New recording").
   useEffect(() => {
     if (catalog.length === 0 || evaluation) return;
-    setActive(deriveActiveFromCatalog(catalog));
     const shell: DiarizationEvaluation = { audioFileId: 0, durationSec: 0, models: catalogModels };
     setParams(deriveDefaultParams(shell));
     setEvalCfg(deriveDefaultEval(shell));
@@ -403,7 +415,11 @@ export default function App() {
 
   const toggleModel = (id: ModelRun["id"]) => {
     if (!evaluation && availableMap[id] === false) return;
-    setActive((value) => ({ ...value, [id]: !value[id] }));
+    setActive((value) => {
+      const next = { ...value, [id]: !value[id] };
+      saveModelActive(next);
+      return next;
+    });
   };
 
   const setEval = <K extends keyof EvalConfig>(key: K, value: EvalConfig[K]) => {

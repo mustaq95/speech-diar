@@ -1,4 +1,4 @@
-import type { EventItem, ModelRun, Project } from "./types";
+import type { ActiveMap, EventItem, ModelRun, Project } from "./types";
 
 export function fmt(t: number): string {
   const safe = Math.max(0, t);
@@ -54,6 +54,29 @@ export function loadProjects(): Project[] {
 export function saveProjects(projects: Project[]): void {
   try {
     localStorage.setItem("speechdyn_projects", JSON.stringify(projects));
+  } catch {
+    // Local persistence is optional for the static studio.
+  }
+}
+
+/** Which models the user chose to run, from Settings. Null means no saved
+ * preference yet (e.g. first visit) — caller falls back to catalog defaults. */
+export function loadModelActive(): ActiveMap | null {
+  try {
+    const raw = localStorage.getItem("speechdyn_model_active");
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+export function saveModelActive(active: ActiveMap): void {
+  try {
+    localStorage.setItem("speechdyn_model_active", JSON.stringify(active));
   } catch {
     // Local persistence is optional for the static studio.
   }
