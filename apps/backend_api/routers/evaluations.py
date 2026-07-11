@@ -190,18 +190,28 @@ def stream_audio(
 
     Honors an HTTP `Range` request so the browser can seek into a long file
     without re-downloading everything before the seek point, and so it never
-    has to buffer the entire file just to play it."""
+    has to buffer the entire file just to play it.
+
+    Closes the DB session as soon as the lookup is done, rather than leaving
+    it open for `Depends(get_db)`'s usual request-scoped lifetime: a browser
+    aborting an in-flight Range request (routine during timeline seeking)
+    would otherwise hold the session open until FastAPI finishes sending the
+    full StreamingResponse, leaking a pooled DB connection."""
     audio_file = _get_audio_file(db, audio_file_id, current_user)
-    if audio_file.s3_key:
-        total = s3_client.head_object(audio_file.s3_key)
+    s3_key = audio_file.s3_key
+    blob_key = audio_file.blob_key
+    db.close()
+
+    if s3_key:
+        total = s3_client.head_object(s3_key)
 
         def _stream(start: int, length: int | None) -> Generator[bytes, None, None]:
-            yield from _iter_s3_object(audio_file.s3_key, start=start, length=length)
-    elif audio_file.blob_key:
-        total = azure_blob.blob_size(audio_file.blob_key)
+            yield from _iter_s3_object(s3_key, start=start, length=length)
+    elif blob_key:
+        total = azure_blob.blob_size(blob_key)
 
         def _stream(start: int, length: int | None) -> Generator[bytes, None, None]:
-            yield from _iter_blob(audio_file.blob_key, start=start, length=length)
+            yield from _iter_blob(blob_key, start=start, length=length)
     else:
         raise HTTPException(status_code=404, detail="Audio not available for this evaluation")
 
