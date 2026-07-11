@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     # --- Queue (Redis / RQ) ---
     redis_url: str = "redis://localhost:6379/0"
     worker_concurrency: int = 1
+    # RQ's own library default is 180s, which is shorter than several
+    # per-model timeouts below (azure_batch_job_timeout_sec,
+    # nemo_clustering_timeout_sec at 1800s) — those would never get a chance
+    # to fire. This must stay >= the largest per-model timeout.
+    queue_job_timeout_sec: int = 3600
 
     # --- Primary storage lane: MinIO / S3 (local models) ---
     # Port 9010: on DGX Spark hosts running the Parakeet NIM containers, host
@@ -85,6 +90,20 @@ class Settings(BaseSettings):
     # speakers than the Sortformer NIMs above are tuned for.
     nemo_clustering_url: str = "http://localhost:9020"
     nemo_clustering_timeout_sec: int = 1800
+
+    # --- 3D-Speaker CAM++ Clustering Diarizer (custom container, no turnkey NIM) ---
+    # Started via ./deploy/3d-speaker-clustering/3d_speaker_clustering_up.sh;
+    # ASR-free FSMN VAD + CAM++ speaker embeddings + clustering, no
+    # transcription step.
+    speaker3d_clustering_url: str = "http://localhost:9021"
+    speaker3d_clustering_timeout_sec: int = 600
+
+    # --- DiariZen (custom container, no turnkey NIM) ---
+    # Started via ./deploy/diarizen/diarizen_up.sh; WavLM-Large + Conformer
+    # local end-to-end diarization followed by global clustering. Pretrained
+    # weights are CC BY-NC 4.0 (non-commercial/research use only).
+    diarizen_url: str = "http://localhost:9022"
+    diarizen_timeout_sec: int = 600
 
     @property
     def cors_origins_list(self) -> list[str]:

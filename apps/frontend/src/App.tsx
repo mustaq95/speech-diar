@@ -206,41 +206,45 @@ export default function App() {
   }, [playing]);
 
   useEffect(() => {
+    // Only ever scheduled while actually playing -- an idle 60fps loop while
+    // paused wastes CPU for no reason. Restarted by the `playing` dependency
+    // whenever playback resumes; the running loop reschedules itself below.
     let raf = 0;
     const tick = (ts: number) => {
-      if (playingRef.current) {
-        let next: number;
-        const audio = audioRef.current;
-        if (playableUrl && audio) {
-          next = Math.min(duration, audio.currentTime);
-        } else {
-          if (lastTsRef.current == null) lastTsRef.current = ts;
-          const dt = (ts - lastTsRef.current) / 1000;
-          lastTsRef.current = ts;
-          next = Math.min(duration, timeRef.current + dt);
-        }
-        timeRef.current = next;
-        syncDom(next);
-        const sig = speakerSignature(shownModels, next);
-        if (sig !== sigRef.current) {
-          sigRef.current = sig;
-          setSpeakerTick((tick) => tick + 1);
-          setTime(next);
-        }
-        if (next >= duration) {
-          playingRef.current = false;
-          setPlaying(false);
-          audio?.pause();
-          setTime(duration);
-        }
-      } else {
+      if (!playingRef.current) {
         lastTsRef.current = null;
+        return;
+      }
+      let next: number;
+      const audio = audioRef.current;
+      if (playableUrl && audio) {
+        next = Math.min(duration, audio.currentTime);
+      } else {
+        if (lastTsRef.current == null) lastTsRef.current = ts;
+        const dt = (ts - lastTsRef.current) / 1000;
+        lastTsRef.current = ts;
+        next = Math.min(duration, timeRef.current + dt);
+      }
+      timeRef.current = next;
+      syncDom(next);
+      const sig = speakerSignature(shownModels, next);
+      if (sig !== sigRef.current) {
+        sigRef.current = sig;
+        setSpeakerTick((tick) => tick + 1);
+        setTime(next);
+      }
+      if (next >= duration) {
+        playingRef.current = false;
+        setPlaying(false);
+        audio?.pause();
+        setTime(duration);
+        return;
       }
       raf = requestAnimationFrame(tick);
     };
-    raf = requestAnimationFrame(tick);
+    if (playing) raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [playableUrl, duration, shownModels, syncDom]);
+  }, [playing, playableUrl, duration, shownModels, syncDom]);
 
   useEffect(() => {
     timeRef.current = time;
@@ -406,8 +410,13 @@ export default function App() {
         <audio
           ref={audioRef}
           src={playableUrl}
-          preload="auto"
+          preload="metadata"
           onEnded={() => setPlaying(false)}
+          onError={() => {
+            console.error("Audio playback error:", audioRef.current?.error);
+            setPlaying(false);
+            window.alert("Audio playback failed — the stream may have been interrupted.");
+          }}
         />
       )}
       <TopBar nav={nav} onNav={handleNav} />
@@ -473,7 +482,7 @@ export default function App() {
               <span className="eyebrow">Zoom</span>
               <button type="button" onClick={() => setZoom((value) => Math.max(1, value - 1))}>-</button>
               <span className="mono">{zoom}×</span>
-              <button type="button" onClick={() => setZoom((value) => Math.min(6, value + 1))}>+</button>
+              <button type="button" onClick={() => setZoom((value) => Math.min(50, value + 1))}>+</button>
             </div>
           </section>
           <section className="studio-layout">

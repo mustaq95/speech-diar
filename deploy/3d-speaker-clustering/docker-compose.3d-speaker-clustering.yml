@@ -1,0 +1,38 @@
+# 3D-Speaker CAM++ Clustering Diarizer -- ASR-free diarization (FSMN VAD +
+# CAM++ speaker embeddings + clustering, no transcription step). No turnkey
+# NIM or vendor image exists for this pipeline, so this is a custom image
+# built by cloning modelscope/3D-Speaker onto a CUDA PyTorch base.
+#
+# Service: 3d-speaker-clustering -- HTTP :9021 (POST /diarize, GET /health/ready)
+#
+# Prereqs: cp deploy/3d-speaker-clustering/3d-speaker-clustering.env.example deploy/3d-speaker-clustering/3d-speaker-clustering.env
+#          ./deploy/3d-speaker-clustering/3d_speaker_clustering_up.sh
+
+services:
+  3d-speaker-clustering:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: 3d-speaker-clustering:local
+    container_name: 3d-speaker-clustering
+    restart: unless-stopped
+    gpus: all
+    ipc: host
+    shm_size: "8gb"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    env_file:
+      - path: 3d-speaker-clustering.env
+        required: false
+    ports:
+      - "${SPEAKER3D_CLUSTERING_PORT:-9021}:9021"
+    volumes:
+      - speaker3d-clustering-cache:/root/.cache/modelscope
+
+volumes:
+  speaker3d-clustering-cache:
+    name: speaker3d-clustering-cache

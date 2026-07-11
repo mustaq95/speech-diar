@@ -18,6 +18,8 @@ LANE_MAP: dict[str, Lane] = {
     "nim-sortformer-str": "local",
     "nim-sortformer-ofl": "local",
     "nemo-clustering": "local",
+    "3d-speaker-clustering": "local",
+    "diarizen": "local",
 }
 
 

@@ -4,6 +4,8 @@ queued -> running -> done|failed, writing real timing and payload — no
 lane ever touches the other lane's storage function.
 """
 
+import io
+import wave
 from types import SimpleNamespace
 from typing import Any
 
@@ -13,6 +15,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from apps.background_worker.pipelines import azure_pipeline, local_pipeline
 from packages.database.models import AudioFile, EvaluationResult
 from packages.shared_contracts.schemas import DiarizationModelRun, DiarizationSegment
+from tests.conftest import make_wav_bytes
+from tests.test_wav_duration import _corrupt_data_chunk_size
 
 
 class FakeModel:
@@ -166,6 +170,15 @@ def test_local_pipeline_unknown_model_id_marks_failed(db_session_factory: sessio
 # --- azure_pipeline (Blob) -----------------------------------------------
 
 
+def _stub_well_formed_blob(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fixed blob doesn't exist yet, and the source blob's header already
+    matches its real byte count -- the common case, where no repair/reupload
+    should happen and the original key is SASed directly."""
+    monkeypatch.setattr(azure_pipeline.azure_blob, "blob_exists", lambda key: False)
+    monkeypatch.setattr(azure_pipeline.azure_blob, "open_stream", lambda key: SimpleNamespace(readall=lambda: make_wav_bytes(1.0)))
+    monkeypatch.setattr(azure_pipeline.azure_blob, "put_stream", lambda fileobj, key: pytest.fail("must not reupload a well-formed blob"))
+
+
 def test_azure_pipeline_success_prefers_adapter_reported_processing_ms(
     db_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -175,6 +188,7 @@ def test_azure_pipeline_success_prefers_adapter_reported_processing_ms(
     monkeypatch.setattr(azure_pipeline, "SessionLocal", db_session_factory)
     monkeypatch.setattr(azure_pipeline, "REGISTRY", {"fake": fake_model})
     monkeypatch.setattr(azure_pipeline, "read_sas_url", lambda blob_key: f"https://example.test/{blob_key}?sas=1")
+    _stub_well_formed_blob(monkeypatch)
 
     azure_pipeline.run_azure_model(audio_file_id, "fake")
 
@@ -193,6 +207,7 @@ def test_azure_pipeline_falls_back_to_wall_clock_when_adapter_reports_none(
     monkeypatch.setattr(azure_pipeline, "SessionLocal", db_session_factory)
     monkeypatch.setattr(azure_pipeline, "REGISTRY", {"fake": fake_model})
     monkeypatch.setattr(azure_pipeline, "read_sas_url", lambda blob_key: "https://example.test/x")
+    _stub_well_formed_blob(monkeypatch)
 
     azure_pipeline.run_azure_model(audio_file_id, "fake")
 
@@ -210,6 +225,7 @@ def test_azure_pipeline_missing_blob_key_marks_failed_without_calling_azure(
     monkeypatch.setattr(azure_pipeline, "SessionLocal", db_session_factory)
     monkeypatch.setattr(azure_pipeline, "REGISTRY", {"fake": fake_model})
     monkeypatch.setattr(azure_pipeline, "read_sas_url", lambda blob_key: pytest.fail("must not touch Azure Blob"))
+    monkeypatch.setattr(azure_pipeline.azure_blob, "blob_exists", lambda key: pytest.fail("must not touch Azure Blob"))
 
     azure_pipeline.run_azure_model(audio_file_id, "fake")
 
@@ -226,6 +242,7 @@ def test_azure_pipeline_missing_result_row_logs_and_returns_without_crashing(
     monkeypatch.setattr(azure_pipeline, "SessionLocal", db_session_factory)
     monkeypatch.setattr(azure_pipeline, "REGISTRY", {"fake": fake_model})
     monkeypatch.setattr(azure_pipeline, "read_sas_url", lambda blob_key: pytest.fail("must not touch Azure Blob"))
+    monkeypatch.setattr(azure_pipeline.azure_blob, "blob_exists", lambda key: pytest.fail("must not touch Azure Blob"))
 
     azure_pipeline.run_azure_model(9999, "fake")  # no such audio_file_id/result row
 
@@ -239,9 +256,101 @@ def test_azure_pipeline_engine_failure_marks_failed(db_session_factory: sessionm
     monkeypatch.setattr(azure_pipeline, "SessionLocal", db_session_factory)
     monkeypatch.setattr(azure_pipeline, "REGISTRY", {"fake": fake_model})
     monkeypatch.setattr(azure_pipeline, "read_sas_url", lambda blob_key: "https://example.test/x")
+    _stub_well_formed_blob(monkeypatch)
 
     azure_pipeline.run_azure_model(audio_file_id, "fake")
 
     result = _status(db_session_factory, audio_file_id, "fake")
     assert result.status == "failed"
     assert "Azure said no" in result.error
+
+
+# --- azure_pipeline: bad-header repair ------------------------------------
+
+
+def test_azure_pipeline_repairs_bad_header_before_generating_sas(
+    db_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact bug: a blob with a placeholder `data` chunk size (what Azure
+    Batch rejects as InvalidData) gets repaired into a derived key, and the
+    SAS URL points at that repaired key instead of the original."""
+    audio_file_id = _seed(db_session_factory, s3_key=None, blob_key="uploads/bad.wav")
+    fake_model = FakeModel()
+    corrupted = _corrupt_data_chunk_size(make_wav_bytes(1.0), bogus_size=1_000_000_000)
+    put_calls: list[tuple[str, bytes]] = []
+
+    monkeypatch.setattr(azure_pipeline, "SessionLocal", db_session_factory)
+    monkeypatch.setattr(azure_pipeline, "REGISTRY", {"fake": fake_model})
+    monkeypatch.setattr(azure_pipeline, "read_sas_url", lambda blob_key: f"https://example.test/{blob_key}?sas=1")
+    monkeypatch.setattr(azure_pipeline.azure_blob, "blob_exists", lambda key: False)
+    monkeypatch.setattr(azure_pipeline.azure_blob, "open_stream", lambda key: SimpleNamespace(readall=lambda: corrupted))
+    monkeypatch.setattr(azure_pipeline.azure_blob, "put_stream", lambda fileobj, key: put_calls.append((key, fileobj.read())) or key)
+
+    azure_pipeline.run_azure_model(audio_file_id, "fake")
+
+    assert len(put_calls) == 1
+    fixed_key, fixed_bytes = put_calls[0]
+    assert fixed_key == "uploads/bad-fixed.wav"
+    assert azure_pipeline._header_is_valid(fixed_bytes)
+    assert fake_model.received_input == f"https://example.test/{fixed_key}?sas=1"
+    result = _status(db_session_factory, audio_file_id, "fake")
+    assert result.status == "done"
+
+
+def test_azure_pipeline_downmixes_stereo_even_with_a_well_formed_header(
+    db_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Azure Batch diarization rejects stereo audio outright (also surfaced
+    as InvalidData), so a stereo blob must be downmixed to mono even when its
+    header already correctly describes the stereo data."""
+    audio_file_id = _seed(db_session_factory, s3_key=None, blob_key="uploads/stereo.wav")
+    fake_model = FakeModel()
+    stereo_frames = int(1.0 * 16000)
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(2)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"\x00\x00\x00\x00" * stereo_frames)
+    stereo_wav = buffer.getvalue()
+    put_calls: list[tuple[str, bytes]] = []
+
+    monkeypatch.setattr(azure_pipeline, "SessionLocal", db_session_factory)
+    monkeypatch.setattr(azure_pipeline, "REGISTRY", {"fake": fake_model})
+    monkeypatch.setattr(azure_pipeline, "read_sas_url", lambda blob_key: f"https://example.test/{blob_key}?sas=1")
+    monkeypatch.setattr(azure_pipeline.azure_blob, "blob_exists", lambda key: False)
+    monkeypatch.setattr(azure_pipeline.azure_blob, "open_stream", lambda key: SimpleNamespace(readall=lambda: stereo_wav))
+    monkeypatch.setattr(azure_pipeline.azure_blob, "put_stream", lambda fileobj, key: put_calls.append((key, fileobj.read())) or key)
+
+    azure_pipeline.run_azure_model(audio_file_id, "fake")
+
+    assert len(put_calls) == 1
+    fixed_key, fixed_bytes = put_calls[0]
+    assert fixed_key == "uploads/stereo-fixed.wav"
+    with wave.open(io.BytesIO(fixed_bytes), "rb") as fixed_wav:
+        assert fixed_wav.getnchannels() == 1
+    assert fake_model.received_input == f"https://example.test/{fixed_key}?sas=1"
+    result = _status(db_session_factory, audio_file_id, "fake")
+    assert result.status == "done"
+
+
+def test_azure_pipeline_skips_reupload_when_fixed_blob_already_exists(
+    db_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-running against audio that's already been repaired (e.g. a repeat
+    evaluation) must SAS off the existing repaired blob, not reconvert it."""
+    audio_file_id = _seed(db_session_factory, s3_key=None, blob_key="uploads/bad.wav")
+    fake_model = FakeModel()
+
+    monkeypatch.setattr(azure_pipeline, "SessionLocal", db_session_factory)
+    monkeypatch.setattr(azure_pipeline, "REGISTRY", {"fake": fake_model})
+    monkeypatch.setattr(azure_pipeline, "read_sas_url", lambda blob_key: f"https://example.test/{blob_key}?sas=1")
+    monkeypatch.setattr(azure_pipeline.azure_blob, "blob_exists", lambda key: True)
+    monkeypatch.setattr(azure_pipeline.azure_blob, "open_stream", lambda key: pytest.fail("must not redownload an already-repaired blob"))
+    monkeypatch.setattr(azure_pipeline.azure_blob, "put_stream", lambda fileobj, key: pytest.fail("must not re-reupload an already-repaired blob"))
+
+    azure_pipeline.run_azure_model(audio_file_id, "fake")
+
+    assert fake_model.received_input == "https://example.test/uploads/bad-fixed.wav?sas=1"
+    result = _status(db_session_factory, audio_file_id, "fake")
+    assert result.status == "done"

@@ -17,4 +17,6 @@ __pycache__
 *.egg-info
 deploy/parakeet/parakeet-nim.env
 deploy/nemo-clustering/nemo-clustering.env
+deploy/3d-speaker-clustering/3d-speaker-clustering.env
+deploy/diarizen/diarizen.env
 .gstack/

@@ -6,9 +6,10 @@ worker; until then, the model's real `status` (queued/running/failed) is
 all the client gets.
 """
 
+import logging
 from collections.abc import Generator
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -19,6 +20,12 @@ from packages.shared_contracts.schemas import DiarizationEvaluation, Diarization
 from packages.storage import azure_blob, s3_client
 
 router = APIRouter(prefix="/evaluations", tags=["evaluations"])
+logger = logging.getLogger(__name__)
+
+# A single mid-transfer read hiccup shouldn't truncate playback for a large
+# file. Cap retries so a genuinely dead store still surfaces an error instead
+# of looping forever.
+_MAX_STREAM_RETRIES = 5
 
 
 def _get_audio_file(db: Session, audio_file_id: int, current_user: User) -> AudioFile:
@@ -84,28 +91,129 @@ def update_upload_timing(
     return _build_evaluation(db, audio_file)
 
 
-def _iter_stream(stream, chunk_size: int = 65536) -> Generator[bytes, None, None]:
-    while True:
-        chunk = stream.read(chunk_size)
+def _iter_s3_object(key: str, start: int = 0, length: int | None = None, chunk_size: int = 65536) -> Generator[bytes, None, None]:
+    """Stream an S3/MinIO object (or a `start`/`length`-bounded slice of one
+    for an HTTP Range request), resuming from the last delivered byte on a
+    mid-transfer read failure instead of aborting the whole response."""
+    delivered = 0
+    attempts = 0
+    stream = s3_client.open_stream(key, start=start)
+    while length is None or delivered < length:
+        want = chunk_size if length is None else min(chunk_size, length - delivered)
+        try:
+            chunk = stream.read(want)
+        except Exception:
+            attempts += 1
+            if attempts > _MAX_STREAM_RETRIES:
+                raise
+            logger.warning(
+                "S3 stream read failed for %s at offset %d (attempt %d/%d); resuming",
+                key,
+                start + delivered,
+                attempts,
+                _MAX_STREAM_RETRIES,
+            )
+            stream = s3_client.open_stream(key, start=start + delivered)
+            continue
         if not chunk:
             break
+        delivered += len(chunk)
         yield chunk
+
+
+def _iter_blob(blob_key: str, start: int = 0, length: int | None = None) -> Generator[bytes, None, None]:
+    """Stream an Azure blob (or a `start`/`length`-bounded slice of one for
+    an HTTP Range request), resuming from the last delivered byte on a
+    mid-transfer read failure instead of aborting the whole response."""
+    delivered = 0
+    attempts = 0
+    chunks = iter(azure_blob.open_stream(blob_key, start=start).chunks())
+    while length is None or delivered < length:
+        try:
+            chunk = next(chunks)
+        except StopIteration:
+            break
+        except Exception:
+            attempts += 1
+            if attempts > _MAX_STREAM_RETRIES:
+                raise
+            logger.warning(
+                "Blob stream read failed for %s at offset %d (attempt %d/%d); resuming",
+                blob_key,
+                start + delivered,
+                attempts,
+                _MAX_STREAM_RETRIES,
+            )
+            chunks = iter(azure_blob.open_stream(blob_key, start=start + delivered).chunks())
+            continue
+        if length is not None and delivered + len(chunk) > length:
+            chunk = chunk[: length - delivered]
+        delivered += len(chunk)
+        yield chunk
+
+
+def _parse_range(range_header: str | None, total: int) -> tuple[int, int] | None:
+    """Parse a single `Range: bytes=start-end` header into inclusive byte
+    offsets. Returns None (fall back to a full 200 response) when there's no
+    header, it's malformed, or it can't be satisfied — this proxy doesn't
+    need full RFC 7233 compliance (e.g. multi-range, 416 responses), just
+    enough for browsers to seek into a long audio file."""
+    if not range_header or not range_header.startswith("bytes="):
+        return None
+    spec = range_header[len("bytes=") :].split(",")[0].strip()
+    start_str, _, end_str = spec.partition("-")
+    try:
+        if start_str == "":
+            start = max(0, total - int(end_str))  # suffix range: bytes=-500 -> last 500 bytes
+            end = total - 1
+        else:
+            start = int(start_str)
+            end = int(end_str) if end_str else total - 1
+    except ValueError:
+        return None
+    end = min(end, total - 1)
+    if start < 0 or start > end:
+        return None
+    return start, end
 
 
 @router.get("/{audio_file_id}/audio")
 def stream_audio(
     audio_file_id: int,
+    range_header: str | None = Header(default=None, alias="Range"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> StreamingResponse:
     """Stream the audio through the API from whichever lane's store owns
     it — one origin for playback and client-side waveform decoding, no
-    CORS setup, and no lane's storage client is ever exposed to the browser."""
+    CORS setup, and no lane's storage client is ever exposed to the browser.
+
+    Honors an HTTP `Range` request so the browser can seek into a long file
+    without re-downloading everything before the seek point, and so it never
+    has to buffer the entire file just to play it."""
     audio_file = _get_audio_file(db, audio_file_id, current_user)
     if audio_file.s3_key:
-        stream = s3_client.open_stream(audio_file.s3_key)
-        return StreamingResponse(_iter_stream(stream), media_type="audio/wav")
-    if audio_file.blob_key:
-        downloader = azure_blob.open_stream(audio_file.blob_key)
-        return StreamingResponse(downloader.chunks(), media_type="audio/wav")
-    raise HTTPException(status_code=404, detail="Audio not available for this evaluation")
+        total = s3_client.head_object(audio_file.s3_key)
+
+        def _stream(start: int, length: int | None) -> Generator[bytes, None, None]:
+            yield from _iter_s3_object(audio_file.s3_key, start=start, length=length)
+    elif audio_file.blob_key:
+        total = azure_blob.blob_size(audio_file.blob_key)
+
+        def _stream(start: int, length: int | None) -> Generator[bytes, None, None]:
+            yield from _iter_blob(audio_file.blob_key, start=start, length=length)
+    else:
+        raise HTTPException(status_code=404, detail="Audio not available for this evaluation")
+
+    byte_range = _parse_range(range_header, total)
+    if byte_range is None:
+        headers = {"Accept-Ranges": "bytes", "Content-Length": str(total)}
+        return StreamingResponse(_stream(0, None), media_type="audio/wav", headers=headers)
+
+    start, end = byte_range
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Range": f"bytes {start}-{end}/{total}",
+        "Content-Length": str(end - start + 1),
+    }
+    return StreamingResponse(_stream(start, end - start + 1), status_code=206, media_type="audio/wav", headers=headers)

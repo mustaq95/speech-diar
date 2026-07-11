@@ -19,6 +19,13 @@ const ROW_GAP = 8;
  * equally fill any extra vertical space when fewer models are shown. */
 const BAND_H = 104;
 
+/** Minimum horizontal density (pixels per second of audio) at zoom = 1. Keeps
+ * long recordings from being squeezed into one viewport width where every
+ * segment is a sliver — past this density the timeline scrolls instead of
+ * compressing further. Short clips still fill the viewport exactly, since
+ * this is only a floor (see the `max()` in the width below). */
+const MIN_PX_PER_SEC = 6;
+
 interface StudioProps {
   models: ModelRun[];
   active: ActiveMap;
@@ -245,18 +252,19 @@ export function Studio({
               <strong title={model.name}>{model.short}</strong>
             </div>
             <div>
-              <small>Speakers: {model.numSpk} · {modelTimingLabel(model, duration, now)}</small>
+              <small>Speakers: {model.numSpk}</small>
               <span className="speaker-dots">
                 {Array.from({ length: model.numSpk }).map((_, speaker) => <i key={speaker} style={{ background: SPEAKER_COLORS[speaker % SPEAKER_COLORS.length] }} />)}
               </span>
             </div>
+            <small className="model-timing">{modelTimingLabel(model, duration, now)}</small>
           </div>
         ))}
         <div className="studio-scroll" ref={scrollRef}>
           <div
             className="studio-inner"
             ref={(node) => { innerRef(node); outerRef.current = node; }}
-            style={{ width: `${100 * zoom}%`, minWidth: "100%" }}
+            style={{ width: `max(100%, ${duration * MIN_PX_PER_SEC * zoom}px)` }}
             onClick={seek}
           >
             <Ruler duration={duration} />

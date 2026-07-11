@@ -81,12 +81,24 @@ def read_sas_url(blob_key: str) -> str:
     return f"{blob.url}?{sas}"
 
 
-def open_stream(blob_key: str):
+def open_stream(blob_key: str, start: int = 0):
     """Open a readable stream for a blob — used by the API audio proxy.
 
     Returns a `StorageStreamDownloader`; iterate `.chunks()` to stream it.
+    `start` resumes the download from that byte offset instead of from the
+    beginning — used to recover from a mid-transfer read failure without
+    re-sending already-delivered bytes.
     """
     settings = get_settings()
     client = _service()
     blob = client.get_blob_client(settings.azure_storage_container_name, blob_key)
-    return blob.download_blob()
+    return blob.download_blob(offset=start)
+
+
+def blob_size(blob_key: str) -> int:
+    """Total byte size of a blob — lets the API audio proxy answer a
+    browser's HTTP Range request with a correct Content-Range/Content-Length."""
+    settings = get_settings()
+    client = _service()
+    blob = client.get_blob_client(settings.azure_storage_container_name, blob_key)
+    return blob.get_blob_properties().size

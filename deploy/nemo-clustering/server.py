@@ -12,6 +12,7 @@ There is no turnkey NIM for this pipeline (NIM only ships
 NeMo image -- see ../nemo_clustering_up.sh and docker-compose.nemo-clustering.yml.
 """
 
+import audioop
 import shutil
 import tempfile
 import threading
@@ -33,6 +34,44 @@ def _wav_duration_sec(path: Path) -> float | None:
         with wave_open(str(path), "rb") as wav:
             return wav.getnframes() / wav.getframerate()
     return None
+
+
+def _repair_audio_for_diarizer(path: Path) -> None:
+    """The diarizer config (diar_infer.yaml) assumes mono input, and a WAV
+    header whose declared frame count doesn't match the actual bytes on disk
+    (a streamed/live-recorded placeholder size) is the likely cause of a 500
+    on a real recording -- e.g. a ~1-billion-frame declared duration instead
+    of the real ~32 minutes. Rewrites the file in place with a correct
+    header and, if needed, a mono downmix; skipped entirely when the file is
+    already good, which is the common case.
+    """
+    with open(path, "rb") as raw, wave_open(raw) as wav:
+        n_channels = wav.getnchannels()
+        sampwidth = wav.getsampwidth()
+        framerate = wav.getframerate()
+        header_frames = wav.getnframes()
+        data_start = raw.tell()
+
+    bytes_per_frame = n_channels * sampwidth
+    file_size = path.stat().st_size
+    max_frames_in_buffer = max(0, file_size - data_start) // bytes_per_frame if bytes_per_frame else 0
+    header_ok = header_frames == max_frames_in_buffer
+
+    if n_channels <= 1 and header_ok:
+        return  # already good -- skip rewriting the file
+
+    with open(path, "rb") as raw, wave_open(raw) as wav:
+        frames = wav.readframes(wav.getnframes())
+
+    if n_channels > 1:
+        frames = audioop.tomono(frames, sampwidth, 0.5, 0.5)
+        n_channels = 1
+
+    with wave_open(str(path), "wb") as fixed:
+        fixed.setnchannels(n_channels)
+        fixed.setsampwidth(sampwidth)
+        fixed.setframerate(framerate)
+        fixed.writeframes(frames)
 
 
 def _load_diarizer():
@@ -79,6 +118,7 @@ async def diarize(file: UploadFile) -> dict[str, object]:
     try:
         audio_path = work_dir / (file.filename or "audio.wav")
         audio_path.write_bytes(await file.read())
+        _repair_audio_for_diarizer(audio_path)
 
         out_dir = work_dir / "out"
         with _lock:

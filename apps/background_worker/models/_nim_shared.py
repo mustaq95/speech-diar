@@ -18,7 +18,10 @@ label is genuinely speaker 0, not "unknown" — there is no missing case to
 handle.
 """
 
-from contextlib import suppress
+import audioop
+import os
+import tempfile
+from contextlib import contextmanager, suppress
 from typing import Any
 from wave import open as wave_open
 
@@ -35,6 +38,39 @@ def wav_duration_sec(audio_path: str) -> float | None:
         with wave_open(audio_path, "rb") as wav:
             return wav.getnframes() / wav.getframerate()
     return None
+
+
+@contextmanager
+def _mono_audio_path(audio_path: str):
+    """Yield a path to mono audio for NIM to read — the original file
+    untouched if it's already mono, or a downmixed temp copy otherwise.
+
+    Riva's ASR service rejects multi-channel audio outright ("Audio channel
+    count greater than 1 is currently not supported"), so this is the one
+    conversion these engines need. Sample rate is left untouched — NIM never
+    flagged it, so resampling here would be more than the actual bug calls for.
+    """
+    with wave_open(audio_path, "rb") as wav:
+        n_channels = wav.getnchannels()
+        if n_channels <= 1:
+            yield audio_path
+            return
+        sampwidth = wav.getsampwidth()
+        framerate = wav.getframerate()
+        frames = wav.readframes(wav.getnframes())
+
+    mono_frames = audioop.tomono(frames, sampwidth, 0.5, 0.5)
+    fd, mono_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        with wave_open(mono_path, "wb") as mono_wav:
+            mono_wav.setnchannels(1)
+            mono_wav.setsampwidth(sampwidth)
+            mono_wav.setframerate(framerate)
+            mono_wav.writeframes(mono_frames)
+        yield mono_path
+    finally:
+        os.remove(mono_path)
 
 
 def _build_config(sample_rate_hertz: int, num_channels: int) -> Any:
@@ -80,21 +116,22 @@ def recognize_offline(audio_path: str, grpc_endpoint: str) -> NimRawOutput:
     import riva.client
 
     settings = get_settings()
-    wav_params = riva.client.get_wav_file_parameters(audio_path)
-    config = _build_config(wav_params["framerate"], wav_params["nchannels"])
+    with _mono_audio_path(audio_path) as mono_path:
+        wav_params = riva.client.get_wav_file_parameters(mono_path)
+        config = _build_config(wav_params["framerate"], wav_params["nchannels"])
 
-    auth = riva.client.Auth(uri=grpc_endpoint, use_ssl=False)
-    asr_service = riva.client.ASRService(auth)
-    with open(audio_path, "rb") as f:
-        audio_bytes = f.read()
+        auth = riva.client.Auth(uri=grpc_endpoint, use_ssl=False)
+        asr_service = riva.client.ASRService(auth)
+        with open(mono_path, "rb") as f:
+            audio_bytes = f.read()
 
-    future = asr_service.offline_recognize(audio_bytes, config, future=True)
-    response = future.result(timeout=settings.nim_grpc_timeout_sec)
+        future = asr_service.offline_recognize(audio_bytes, config, future=True)
+        response = future.result(timeout=settings.nim_grpc_timeout_sec)
 
-    return {
-        "audio_duration_sec": wav_duration_sec(audio_path),
-        "words": _words_from_alternative_results(response.results),
-    }
+        return {
+            "audio_duration_sec": wav_duration_sec(mono_path),
+            "words": _words_from_alternative_results(response.results),
+        }
 
 
 def recognize_streaming(audio_path: str, grpc_endpoint: str) -> NimRawOutput:
@@ -106,25 +143,26 @@ def recognize_streaming(audio_path: str, grpc_endpoint: str) -> NimRawOutput:
     import riva.client
 
     settings = get_settings()
-    wav_params = riva.client.get_wav_file_parameters(audio_path)
-    config = _build_config(wav_params["framerate"], wav_params["nchannels"])
-    streaming_config = riva.client.StreamingRecognitionConfig(config=config, interim_results=False)
+    with _mono_audio_path(audio_path) as mono_path:
+        wav_params = riva.client.get_wav_file_parameters(mono_path)
+        config = _build_config(wav_params["framerate"], wav_params["nchannels"])
+        streaming_config = riva.client.StreamingRecognitionConfig(config=config, interim_results=False)
 
-    auth = riva.client.Auth(uri=grpc_endpoint, use_ssl=False)
-    asr_service = riva.client.ASRService(auth)
+        auth = riva.client.Auth(uri=grpc_endpoint, use_ssl=False)
+        asr_service = riva.client.ASRService(auth)
 
-    words: list[dict[str, Any]] = []
-    deadline = time.monotonic() + settings.nim_grpc_timeout_sec
-    with riva.client.AudioChunkFileIterator(audio_path, chunk_n_frames=_STREAM_CHUNK_N_FRAMES) as audio_chunk_iterator:
-        for response in asr_service.streaming_response_generator(audio_chunk_iterator, streaming_config):
-            if time.monotonic() > deadline:
-                raise RuntimeError(f"NIM streaming recognize timed out after {settings.nim_grpc_timeout_sec}s")
-            words.extend(_words_from_alternative_results(r for r in response.results if r.is_final))
+        words: list[dict[str, Any]] = []
+        deadline = time.monotonic() + settings.nim_grpc_timeout_sec
+        with riva.client.AudioChunkFileIterator(mono_path, chunk_n_frames=_STREAM_CHUNK_N_FRAMES) as audio_chunk_iterator:
+            for response in asr_service.streaming_response_generator(audio_chunk_iterator, streaming_config):
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f"NIM streaming recognize timed out after {settings.nim_grpc_timeout_sec}s")
+                words.extend(_words_from_alternative_results(r for r in response.results if r.is_final))
 
-    return {
-        "audio_duration_sec": wav_duration_sec(audio_path),
-        "words": words,
-    }
+        return {
+            "audio_duration_sec": wav_duration_sec(mono_path),
+            "words": words,
+        }
 
 
 def group_words_into_turns(words: list[dict[str, Any]]) -> list[tuple[int, float, float]]:

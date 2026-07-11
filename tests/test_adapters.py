@@ -5,10 +5,12 @@ raw phrase/turn the engine actually reported."""
 from apps.background_worker.models import _nim_shared
 from apps.background_worker.models.azure_batch.adapter import AzureBatchAdapter
 from apps.background_worker.models.azure_speech.adapter import AzureSpeechAdapter
+from apps.background_worker.models.diarizen.adapter import DiarizenAdapter
 from apps.background_worker.models.nemo_clustering.adapter import NemoClusteringAdapter
 from apps.background_worker.models.nim_sortformer_ofl.adapter import NimSortformerOflAdapter
 from apps.background_worker.models.nim_sortformer_str.adapter import NimSortformerStrAdapter
 from apps.background_worker.models.pyannote.adapter import PyAnnoteAdapter
+from apps.background_worker.models.speaker3d_clustering.adapter import Speaker3dClusteringAdapter
 from apps.background_worker.models.whisperx.adapter import WhisperXAdapter
 
 
@@ -116,6 +118,8 @@ def test_static_metadata_present_for_get_models_registry() -> None:
         NimSortformerOflAdapter(),
         NimSortformerStrAdapter(),
         NemoClusteringAdapter(),
+        Speaker3dClusteringAdapter(),
+        DiarizenAdapter(),
     ):
         assert adapter.name and adapter.short and adapter.description
 
@@ -217,5 +221,73 @@ def test_nemo_clustering_adapter_no_merging_of_adjacent_same_speaker_lines() -> 
 
 def test_nemo_clustering_adapter_empty_rttm_yields_no_segments() -> None:
     run = NemoClusteringAdapter().adapt({"rttm": ""})
+    assert run.segs == []
+    assert run.num_spk == 0
+
+
+def test_speaker3d_clustering_adapter_parses_rttm_and_rebases_speakers_by_first_appearance() -> None:
+    raw = {
+        "audio_duration_sec": 10.0,
+        "rttm": (
+            "SPEAKER rec 0 0.00 2.00 <NA> <NA> 3 <NA> <NA>\n"
+            "SPEAKER rec 0 2.00 3.00 <NA> <NA> 1 <NA> <NA>\n"
+            "SPEAKER rec 0 5.00 1.50 <NA> <NA> 3 <NA> <NA>\n"
+        ),
+    }
+    run = Speaker3dClusteringAdapter().adapt(raw)
+    assert run.id == "3d-speaker-clustering"
+    assert run.num_spk == 2
+    assert [seg.spk for seg in run.segs] == [0, 1, 0]  # cluster "3" seen first, despite label "1" < "3"
+    assert run.segs[0].s == 0.0 and run.segs[0].e == 2.0
+    assert Speaker3dClusteringAdapter().audio_duration_sec(raw) == 10.0
+
+
+def test_speaker3d_clustering_adapter_no_merging_of_adjacent_same_speaker_lines() -> None:
+    raw = {
+        "rttm": (
+            "SPEAKER rec 0 0.00 1.00 <NA> <NA> 0 <NA> <NA>\n"
+            "SPEAKER rec 0 1.00 1.00 <NA> <NA> 0 <NA> <NA>\n"
+        )
+    }
+    run = Speaker3dClusteringAdapter().adapt(raw)
+    assert len(run.segs) == 2
+
+
+def test_speaker3d_clustering_adapter_empty_rttm_yields_no_segments() -> None:
+    run = Speaker3dClusteringAdapter().adapt({"rttm": ""})
+    assert run.segs == []
+    assert run.num_spk == 0
+
+
+def test_diarizen_adapter_parses_rttm_and_rebases_speakers_by_first_appearance() -> None:
+    raw = {
+        "audio_duration_sec": 10.0,
+        "rttm": (
+            "SPEAKER rec 1 0.00 2.00 <NA> <NA> speaker_3 <NA> <NA>\n"
+            "SPEAKER rec 1 2.00 3.00 <NA> <NA> speaker_1 <NA> <NA>\n"
+            "SPEAKER rec 1 5.00 1.50 <NA> <NA> speaker_3 <NA> <NA>\n"
+        ),
+    }
+    run = DiarizenAdapter().adapt(raw)
+    assert run.id == "diarizen"
+    assert run.num_spk == 2
+    assert [seg.spk for seg in run.segs] == [0, 1, 0]  # speaker_3 seen first, despite label ">" speaker_1
+    assert run.segs[0].s == 0.0 and run.segs[0].e == 2.0
+    assert DiarizenAdapter().audio_duration_sec(raw) == 10.0
+
+
+def test_diarizen_adapter_no_merging_of_adjacent_same_speaker_lines() -> None:
+    raw = {
+        "rttm": (
+            "SPEAKER rec 1 0.00 1.00 <NA> <NA> speaker_0 <NA> <NA>\n"
+            "SPEAKER rec 1 1.00 1.00 <NA> <NA> speaker_0 <NA> <NA>\n"
+        )
+    }
+    run = DiarizenAdapter().adapt(raw)
+    assert len(run.segs) == 2
+
+
+def test_diarizen_adapter_empty_rttm_yields_no_segments() -> None:
+    run = DiarizenAdapter().adapt({"rttm": ""})
     assert run.segs == []
     assert run.num_spk == 0

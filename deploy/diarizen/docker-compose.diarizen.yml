@@ -1,0 +1,38 @@
+# DiariZen -- WavLM-Large + Conformer local end-to-end diarization followed
+# by global clustering. No turnkey NIM or vendor image exists for this
+# pipeline, so this is a custom image built by cloning BUTSpeechFIT/DiariZen
+# onto a CUDA PyTorch base.
+#
+# Service: diarizen -- HTTP :9022 (POST /diarize, GET /health/ready)
+#
+# Prereqs: cp deploy/diarizen/diarizen.env.example deploy/diarizen/diarizen.env
+#          ./deploy/diarizen/diarizen_up.sh
+
+services:
+  diarizen:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: diarizen:local
+    container_name: diarizen
+    restart: unless-stopped
+    gpus: all
+    ipc: host
+    shm_size: "8gb"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    env_file:
+      - path: diarizen.env
+        required: false
+    ports:
+      - "${DIARIZEN_PORT:-9022}:9022"
+    volumes:
+      - diarizen-cache:/root/.cache/huggingface
+
+volumes:
+  diarizen-cache:
+    name: diarizen-cache
