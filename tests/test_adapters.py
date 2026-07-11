@@ -328,3 +328,22 @@ def test_vibevoice_adapter_empty_segments_yields_no_segments() -> None:
     run = VibeVoiceAdapter().adapt({"segments": []})
     assert run.segs == []
     assert run.num_spk == 0
+
+
+def test_vibevoice_adapter_skips_speakerless_non_speech_events() -> None:
+    # Verbatim tail of a real run against tests/samples/katiesteve.wav: the
+    # model tags non-speech intervals ([Silence], [Music], [Noise], ...) rather
+    # than hallucinating words over them, and those entries carry no "Speaker"
+    # key at all. They are not speech turns, so they produce no segment — and
+    # must not mint a speaker index.
+    raw = {
+        "audio_duration_sec": 29.4875,
+        "segments": [
+            {"Start": 0.0, "End": 1.5, "Speaker": 0, "Content": "Good morning, Steve."},
+            {"Start": 1.0, "End": 11.41, "Speaker": 1, "Content": "Good morning, Katie."},
+            {"Start": 24.09, "End": 29.49, "Content": "[Silence]"},
+        ],
+    }
+    run = VibeVoiceAdapter().adapt(raw)
+    assert len(run.segs) == 2
+    assert run.num_spk == 2  # the [Silence] event is not a third speaker

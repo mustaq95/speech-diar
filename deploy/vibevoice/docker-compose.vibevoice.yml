@@ -25,6 +25,14 @@ services:
     dns:
       - 8.8.8.8
       - 1.1.1.1
+    environment:
+      # The weights are ~16GB across 8 shards and the Hub throttles hard per
+      # connection (measured on this host: ~20 KB/s on a single stream vs
+      # ~580 KB/s across four). This turns on Xet's parallel chunked transfer,
+      # which is the difference between a first startup measured in minutes
+      # and one measured in hours. (The older HF_HUB_ENABLE_HF_TRANSFER knob
+      # is deprecated -- huggingface_hub uses Xet now and ignores it.)
+      HF_XET_HIGH_PERFORMANCE: "1"
     env_file:
       - path: vibevoice.env
         required: false

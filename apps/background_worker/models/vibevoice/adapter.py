@@ -5,6 +5,13 @@ Native segment shape: `{"Start": float, "End": float, "Speaker": int,
 is diarization-only, the same call every other ASR-backed engine in this
 platform makes (azure, azure-batch, nim-sortformer-*).
 
+Non-speech segments carry NO `Speaker` key at all: the model was trained to
+tag intervals it hears as `[Silence]`, `[Music]`, `[Noise]`, `[Human Sounds]`,
+`[Environmental Sounds]` or `[Unintelligible Speech]` instead of hallucinating
+words over them, and those entries are speaker-less. They are skipped here.
+Nothing else is honest: they are not speech turns, and minting a speaker index
+for silence would fabricate a speaker the model never reported.
+
 `Speaker` is already an int, but it is re-based to a zero-based index by first
 appearance anyway: the model emits speaker ids as generated *text*, so nothing
 guarantees they start at 0 or run contiguously. One segment per entry -- no
@@ -30,6 +37,8 @@ class VibeVoiceAdapter(ModelAdapter[VibeVoiceRawOutput]):
         segs: list[DiarizationSegment] = []
 
         for entry in raw.get("segments", []):
+            if "Speaker" not in entry:
+                continue  # non-speech event ([Silence], [Music], ...) -- no speaker to report
             spk = speaker_index.setdefault(entry["Speaker"], len(speaker_index))
             segs.append(
                 DiarizationSegment(spk=spk, s=float(entry["Start"]), e=float(entry["End"]))

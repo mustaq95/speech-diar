@@ -29,9 +29,14 @@ Two consequences worth knowing before reading its output:
 
 Greedy decoding, 32768 max_new_tokens, and bf16 all come from the model's own
 generation_config.json / config.json; nothing is overridden here.
+
+The model's output is generated text that only *looks* like JSON, and it does
+not always parse -- see `_parse_segments`.
 """
 
+import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -52,6 +57,59 @@ _processor = None
 _model = None
 
 
+_OBJECT_RE = re.compile(r"\{[^{}]*\}")
+_START_RE = re.compile(r'"Start"\s*:\s*(-?\d+(?:\.\d+)?)')
+_END_RE = re.compile(r'"End"\s*:\s*(-?\d+(?:\.\d+)?)')
+_SPEAKER_RE = re.compile(r'"Speaker"\s*:\s*(\d+)')
+
+
+def _parse_segments(raw_text: str) -> list[dict] | None:
+    """Recover the segment list from the model's generated text.
+
+    VibeVoice-ASR does not emit JSON, it emits a *string that resembles* JSON,
+    and that string is not always valid: an apostrophe or quote inside the
+    transcribed `Content` is enough to break it (json.JSONDecodeError from
+    transformers' own `extract_speaker_dict`, which does not catch it despite
+    what the model card claims). Because generation is autoregressive on a GPU,
+    the same audio can parse on one run and fail on the next.
+
+    So: try strict JSON first. If that fails, fall back to reading the numeric
+    fields straight out of each object with a regex. That is deliberately
+    limited to `Start`, `End` and `Speaker` -- the fields the diarization
+    contract actually needs -- and skips `Content` entirely, which is both the
+    field that breaks the parse and the field this platform discards anyway.
+    Nothing is invented: every number returned was emitted by the model.
+    """
+    body = raw_text.split("<|im_start|>assistant", 1)[-1]
+    for marker in ("<|im_end|>", "<|endoftext|>"):
+        body = body.split(marker, 1)[0]
+    body = body.strip()
+
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        pass
+    else:
+        return parsed if isinstance(parsed, list) else None
+
+    segments: list[dict] = []
+    for match in _OBJECT_RE.finditer(body):
+        chunk = match.group(0)
+        start = _START_RE.search(chunk)
+        end = _END_RE.search(chunk)
+        if not (start and end):
+            continue
+        segment: dict = {"Start": float(start.group(1)), "End": float(end.group(1))}
+        # Absent on non-speech events ([Silence], [Music], ...) -- leave it out
+        # rather than inventing a speaker for them.
+        speaker = _SPEAKER_RE.search(chunk)
+        if speaker:
+            segment["Speaker"] = int(speaker.group(1))
+        segments.append(segment)
+
+    return segments or None
+
+
 def _wav_duration_sec(path: Path) -> float | None:
     with suppress(Exception):
         with wave_open(str(path), "rb") as wav:
@@ -65,12 +123,16 @@ async def lifespan(app: FastAPI):
     from transformers import AutoProcessor, VibeVoiceAsrForConditionalGeneration
 
     _processor = AutoProcessor.from_pretrained(_MODEL_ID)
-    # sdpa, not flash_attention_2 -- see the Dockerfile note on aarch64.
+    # eager, not sdpa and not flash_attention_2. Flash-attn has no aarch64
+    # wheel (see the Dockerfile). SDPA looks like the obvious fallback but is
+    # not an option either: attn_implementation applies to every submodule,
+    # and VibeVoiceAcousticTokenizerEncoderModel has no SDPA path --
+    # from_pretrained hard-raises a ValueError naming eager as the workaround.
     _model = VibeVoiceAsrForConditionalGeneration.from_pretrained(
         _MODEL_ID,
         device_map="auto",
         dtype=torch.bfloat16,
-        attn_implementation="sdpa",
+        attn_implementation="eager",
     )
     _model.eval()
     yield
@@ -102,17 +164,13 @@ async def diarize(file: UploadFile) -> dict[str, object]:
             ).to(_model.device, _model.dtype)
             output_ids = _model.generate(**inputs)
             generated_ids = output_ids[:, inputs["input_ids"].shape[1] :]
-            parsed = _processor.decode(generated_ids, return_format="parsed")[0]
+            raw_text = _processor.decode(generated_ids)[0]
 
-        # The model generates a *string that resembles* JSON; `return_format=
-        # "parsed"` returns the raw string as-is when that string doesn't
-        # parse. Surfacing that as a failure is deliberate: a silent fallback
-        # would hand the worker something it would read as zero segments, and
-        # a fabricated empty result is worse than a visible error.
-        if not isinstance(parsed, list):
+        parsed = _parse_segments(raw_text)
+        if parsed is None:
             raise HTTPException(
                 status_code=500,
-                detail=f"model output did not parse as segments: {parsed!r}",
+                detail=f"model output did not parse as segments: {raw_text!r}",
             )
 
         return {
