@@ -21,20 +21,20 @@ from .pyannote.adapter import PyAnnoteAdapter
 from .pyannote.runner import PyAnnoteRunner
 from .speaker3d_clustering.adapter import Speaker3dClusteringAdapter
 from .speaker3d_clustering.runner import Speaker3dClusteringRunner
-from .whisperx.adapter import WhisperXAdapter
-from .whisperx.runner import WhisperXRunner
+from .vibevoice.adapter import VibeVoiceAdapter
+from .vibevoice.runner import VibeVoiceRunner
 
 REGISTRY: dict[str, DiarizationModel] = {
     model.model_id: model
     for model in (
         DiarizationModel(AzureSpeechRunner(), AzureSpeechAdapter()),
         DiarizationModel(AzureBatchRunner(), AzureBatchAdapter()),
-        DiarizationModel(WhisperXRunner(), WhisperXAdapter()),
         DiarizationModel(PyAnnoteRunner(), PyAnnoteAdapter()),
         DiarizationModel(NimSortformerStrRunner(), NimSortformerStrAdapter()),
         DiarizationModel(NimSortformerOflRunner(), NimSortformerOflAdapter()),
         DiarizationModel(NemoClusteringRunner(), NemoClusteringAdapter()),
         DiarizationModel(Speaker3dClusteringRunner(), Speaker3dClusteringAdapter()),
         DiarizationModel(DiarizenRunner(), DiarizenAdapter()),
+        DiarizationModel(VibeVoiceRunner(), VibeVoiceAdapter()),
     )
 }

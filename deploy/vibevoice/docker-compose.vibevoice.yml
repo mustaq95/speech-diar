@@ -1,0 +1,38 @@
+# VibeVoice-ASR -- Microsoft's 8B single-pass joint ASR + diarization +
+# timestamping model. No vendor NIM exists for it, so this is a custom image:
+# an NGC CUDA PyTorch base plus transformers>=5.3.0, which is the only thing
+# needed to load it (the architecture ships in transformers itself).
+#
+# Service: vibevoice -- HTTP :9023 (POST /diarize, GET /health/ready)
+#
+# Prereqs: cp deploy/vibevoice/vibevoice.env.example deploy/vibevoice/vibevoice.env
+#          ./deploy/vibevoice/vibevoice_up.sh
+
+services:
+  vibevoice:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vibevoice:local
+    container_name: vibevoice
+    restart: unless-stopped
+    gpus: all
+    ipc: host
+    shm_size: "8gb"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    env_file:
+      - path: vibevoice.env
+        required: false
+    ports:
+      - "${VIBEVOICE_PORT:-9023}:9023"
+    volumes:
+      - vibevoice-cache:/root/.cache/huggingface
+
+volumes:
+  vibevoice-cache:
+    name: vibevoice-cache

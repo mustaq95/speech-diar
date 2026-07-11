@@ -13,7 +13,7 @@ A speaker-diarization evaluation platform: upload audio, fan it out to multiple 
 
 ```bash
 uv sync                       # Python env (pins 3.12, installs api+worker+dev; NOT the heavy models)
-uv sync --extra models        # additionally installs torch + pyannote.audio + whisperx (CUDA hosts only)
+uv sync --extra models        # additionally installs torch + pyannote.audio (CUDA hosts only)
 docker compose up -d          # local infra: postgres, redis, minio
 
 uv run honcho start           # run API + worker pool together (Procfile); Ctrl+C stops both
@@ -39,7 +39,7 @@ There is no lint/format step for the Python side.
 **Nothing is fabricated.** No synthetic progress, waveform, or timing. Status/timing come from the DB; the waveform is decoded from the real uploaded audio.
 
 **Two storage lanes, chosen per model, never mixed** (`apps/background_worker/lanes.py` `LANE_MAP` is the single source of truth):
-- `local` lane → MinIO/S3, run by `pipelines/local_pipeline.py` — used by `pyannote`, `whisperx`, and `azure` (real-time, needs a local file to stream).
+- `local` lane → MinIO/S3, run by `pipelines/local_pipeline.py` — used by every model except `azure-batch`, including `azure` (real-time, needs a local file to stream).
 - `azure` lane → Azure Blob, run by `pipelines/azure_pipeline.py` — used **only** by `azure-batch` (URL/SAS-based). No model belongs to both; no code copies bytes between stores.
 
 **One RQ job per model.** `upload.py` enqueues one job per requested model; `worker.py:run_model` just dispatches by lane. Each model's `EvaluationResult` row tracks its own `queued → running → done|failed` independently, so a slow model never blocks a fast one. Concurrency comes from N separate `rq.SimpleWorker` OS processes (SimpleWorker never forks — required on macOS), not from forking.
@@ -50,7 +50,7 @@ There is no lint/format step for the Python side.
 
 - **Config is centralized.** Every service imports `get_settings()` from `packages/config/settings.py` — never read `os.environ` directly. All settings load from `.env` at repo root; moving environments (staging/prod/DGX) is `.env`-only, no code changes. Set `DIARIZATION_DEVICE=cuda` on GPU hosts.
 - **The contract lives in three files that must stay in sync:** `packages/shared_contracts/schemas.py` (Python), `packages/shared_contracts/types.ts`, and the frontend working copy `apps/frontend/src/types/diarization.ts`. Change one → change all three. Wire format is camelCase.
-- **`pyannote` and `whisperx` are stubs** — `available = false`, their `run()` raises `NotImplementedError`. `GET /models` uses the flag so the UI lists-but-disables them rather than hiding or faking output.
+- **Every registered model is implemented.** The `available = false` flag still exists on `ModelRunner` for engines that land registered but not yet runnable (`run()` raising `NotImplementedError`); `GET /models` uses it so the UI lists-but-disables them rather than hiding or faking output. Nothing currently sets it.
 - **No real auth.** Every request is attributed to a seeded dev user (`dev@example.com`, created on API startup) via `get_current_user` in `apps/backend_api/dependencies.py`.
 - **Tests never touch real infra.** `conftest.py` gives each test a fresh in-memory SQLite DB + fakeredis queue, and deliberately does *not* fire the app's `startup` event (which would call `init_db()` against real Postgres). The SQLite session uses `expire_on_commit=False` to dodge a naive-vs-aware datetime artifact — production always runs on Postgres.
 

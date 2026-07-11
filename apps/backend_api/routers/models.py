@@ -1,7 +1,8 @@
 """GET /models — the honest engine registry.
 
-Unimplemented engines (pyannote, whisperx) are listed but `available: false`;
-the frontend disables them instead of hiding them or faking output.
+Every registered engine is currently implemented. An engine that lands
+unimplemented is listed with `available: false` rather than hidden, and the
+frontend disables it instead of faking output.
 """
 
 from fastapi import APIRouter

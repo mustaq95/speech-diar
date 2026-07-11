@@ -11,7 +11,7 @@ from apps.background_worker.models.nim_sortformer_ofl.adapter import NimSortform
 from apps.background_worker.models.nim_sortformer_str.adapter import NimSortformerStrAdapter
 from apps.background_worker.models.pyannote.adapter import PyAnnoteAdapter
 from apps.background_worker.models.speaker3d_clustering.adapter import Speaker3dClusteringAdapter
-from apps.background_worker.models.whisperx.adapter import WhisperXAdapter
+from apps.background_worker.models.vibevoice.adapter import VibeVoiceAdapter
 
 
 def test_azure_speech_adapter_maps_speaker_ids_by_first_appearance() -> None:
@@ -114,12 +114,12 @@ def test_static_metadata_present_for_get_models_registry() -> None:
         AzureSpeechAdapter(),
         AzureBatchAdapter(),
         PyAnnoteAdapter(),
-        WhisperXAdapter(),
         NimSortformerOflAdapter(),
         NimSortformerStrAdapter(),
         NemoClusteringAdapter(),
         Speaker3dClusteringAdapter(),
         DiarizenAdapter(),
+        VibeVoiceAdapter(),
     ):
         assert adapter.name and adapter.short and adapter.description
 
@@ -289,5 +289,42 @@ def test_diarizen_adapter_no_merging_of_adjacent_same_speaker_lines() -> None:
 
 def test_diarizen_adapter_empty_rttm_yields_no_segments() -> None:
     run = DiarizenAdapter().adapt({"rttm": ""})
+    assert run.segs == []
+    assert run.num_spk == 0
+
+
+def test_vibevoice_adapter_drops_transcript_and_rebases_speakers_by_first_appearance() -> None:
+    # VibeVoice emits speaker ids as generated *text*, so they need not start
+    # at 0 or run contiguously — hence the rebasing, and hence a fixture that
+    # starts at 2. `Content` is dropped: the contract is diarization-only.
+    raw = {
+        "audio_duration_sec": 10.0,
+        "segments": [
+            {"Start": 0.0, "End": 2.0, "Speaker": 2, "Content": "Hello there."},
+            {"Start": 2.0, "End": 5.0, "Speaker": 1, "Content": "Hi Alex."},
+            {"Start": 5.0, "End": 6.5, "Speaker": 2, "Content": "Shall we begin?"},
+        ],
+    }
+    run = VibeVoiceAdapter().adapt(raw)
+    assert run.id == "vibevoice"
+    assert run.num_spk == 2
+    assert [seg.spk for seg in run.segs] == [0, 1, 0]  # Speaker 2 seen first, so it becomes 0
+    assert run.segs[0].s == 0.0 and run.segs[0].e == 2.0
+    assert VibeVoiceAdapter().audio_duration_sec(raw) == 10.0
+
+
+def test_vibevoice_adapter_no_merging_of_adjacent_same_speaker_segments() -> None:
+    raw = {
+        "segments": [
+            {"Start": 0.0, "End": 1.0, "Speaker": 0, "Content": "One."},
+            {"Start": 1.0, "End": 2.0, "Speaker": 0, "Content": "Two."},
+        ],
+    }
+    run = VibeVoiceAdapter().adapt(raw)
+    assert len(run.segs) == 2
+
+
+def test_vibevoice_adapter_empty_segments_yields_no_segments() -> None:
+    run = VibeVoiceAdapter().adapt({"segments": []})
     assert run.segs == []
     assert run.num_spk == 0

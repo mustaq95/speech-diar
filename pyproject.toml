@@ -29,7 +29,6 @@ dependencies = [
 models = [
     "torch>=2.3",
     "pyannote.audio>=4.0",
-    "whisperx",
 ]
 
 # Installed by default with `uv sync` (uv treats "dev" as a default group).

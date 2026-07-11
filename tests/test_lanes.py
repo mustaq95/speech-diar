@@ -5,7 +5,7 @@ from apps.background_worker.lanes import lane_for, split_by_lane
 
 
 def test_local_models_map_to_local_lane() -> None:
-    for model_id in ("pyannote", "whisperx", "azure", "nim-sortformer-str", "nim-sortformer-ofl", "nemo-clustering"):
+    for model_id in ("pyannote", "vibevoice", "azure", "nim-sortformer-str", "nim-sortformer-ofl", "nemo-clustering"):
         assert lane_for(model_id) == "local"
 
 
@@ -18,8 +18,8 @@ def test_unknown_model_has_no_lane() -> None:
 
 
 def test_split_by_lane_separates_and_preserves_order() -> None:
-    local_ids, azure_ids = split_by_lane(["pyannote", "azure-batch", "azure", "whisperx"])
-    assert local_ids == ["pyannote", "azure", "whisperx"]
+    local_ids, azure_ids = split_by_lane(["pyannote", "azure-batch", "azure", "vibevoice"])
+    assert local_ids == ["pyannote", "azure", "vibevoice"]
     assert azure_ids == ["azure-batch"]
 
 

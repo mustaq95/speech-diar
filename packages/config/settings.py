@@ -105,6 +105,15 @@ class Settings(BaseSettings):
     diarizen_url: str = "http://localhost:9022"
     diarizen_timeout_sec: int = 600
 
+    # --- VibeVoice-ASR (custom container, no turnkey NIM) ---
+    # Started via ./deploy/vibevoice/vibevoice_up.sh; Microsoft's 8B
+    # decoder-only model doing ASR + diarization + timestamping in one
+    # autoregressive pass. Autoregressive decoding over long audio is slow
+    # (it generates a token per output word, not a fixed-cost forward pass),
+    # hence the wider timeout -- still under queue_job_timeout_sec.
+    vibevoice_url: str = "http://localhost:9023"
+    vibevoice_timeout_sec: int = 1800
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_allow_origins.split(",") if origin.strip()]

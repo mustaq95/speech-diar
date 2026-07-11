@@ -38,8 +38,8 @@ Browser ──poll──▶ GET /evaluations/{id} ──▶ Postgres
 Browser ──▶ GET /evaluations/{id}/audio ──▶ API streams from whichever lane owns the file
 ```
 
-- **Local lane (MinIO)** — the primary lane, used by every local diarization
-  model (`pyannote`, `whisperx`) and the real-time `azure` model (which just
+- **Local lane (MinIO)** — the primary lane, used by every diarization model
+  except `azure-batch`, including the real-time `azure` model (which just
   needs a local file to stream from).
 - **Azure lane (Blob)** — used **only** by `azure-batch`, and only when it's
   requested. Uploading the same file's content twice reuses the already
@@ -76,8 +76,13 @@ Browser ──▶ GET /evaluations/{id}/audio ──▶ API streams from whichev
 │           ├── base_model.py      # Abstract Runner + Adapter every model follows
 │           ├── azure_speech/      # Real-time ConversationTranscriber (local file)
 │           ├── azure_batch/       # Batch v3.2 transcription + diarization (URL-based)
-│           ├── pyannote/          # Stub — not implemented yet (available=false)
-│           └── whisperx/          # Stub — not implemented yet (available=false)
+│           ├── pyannote/          # In-process: pyannote community-1
+│           ├── nim_sortformer_str/ # NVIDIA Parakeet + Sortformer NIM (streaming, gRPC)
+│           ├── nim_sortformer_ofl/ # NVIDIA Parakeet + Sortformer NIM (offline, gRPC)
+│           ├── nemo_clustering/   # NeMo VAD + TitaNet + spectral clustering (HTTP)
+│           ├── speaker3d_clustering/ # 3D-Speaker CAM++ clustering (HTTP)
+│           ├── diarizen/          # DiariZen WavLM + Conformer EEND (HTTP)
+│           └── vibevoice/         # VibeVoice-ASR 8B, joint ASR+diarization (HTTP)
 │
 ├── packages/
 │   ├── config/
@@ -112,9 +117,10 @@ cp .env.example .env
 ```
 
 `uv sync --extra models` additionally installs the heavy, CUDA-oriented local
-engines (`torch`, `pyannote.audio`, `whisperx`) — skip this on a machine
-without a GPU; the platform runs fine without it (those two models just show
-up as `available: false`).
+engines (`torch`, `pyannote.audio`) — skip this on a machine without a GPU.
+The containerized models (`deploy/`) are unaffected either way: they run
+their own GPU inference out of process and the worker only speaks HTTP to
+them.
 
 ## Running
 
@@ -269,7 +275,7 @@ GPU-backed local models — is `.env`-only, no code changes:
 
 ```bash
 git clone <repo> && cd <repo>
-uv sync --extra models        # pulls CUDA torch + pyannote/whisperx too
+uv sync --extra models        # pulls CUDA torch + pyannote too
 cp .env.example .env          # set DATABASE_URL/REDIS_URL/S3_*/AZURE_* for that environment
 docker compose up -d          # or point at already-managed Postgres/Redis/S3
 ```

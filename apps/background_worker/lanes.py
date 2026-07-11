@@ -12,7 +12,6 @@ Lane = Literal["local", "azure"]
 
 LANE_MAP: dict[str, Lane] = {
     "pyannote": "local",
-    "whisperx": "local",
     "azure": "local",
     "azure-batch": "azure",
     "nim-sortformer-str": "local",
@@ -20,6 +19,7 @@ LANE_MAP: dict[str, Lane] = {
     "nemo-clustering": "local",
     "3d-speaker-clustering": "local",
     "diarizen": "local",
+    "vibevoice": "local",
 }
 
 
