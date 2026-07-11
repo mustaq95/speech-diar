@@ -5,7 +5,7 @@ import { Insights } from "./components/Insights";
 import { ProcessingScreen } from "./components/ProcessingScreen";
 import { ProjectsView } from "./components/ProjectsView";
 import { SettingsView } from "./components/SettingsView";
-import { Studio } from "./components/Studio";
+import { MIN_PX_PER_SEC, Studio } from "./components/Studio";
 import { TopBar } from "./components/TopBar";
 import { UploadingScreen } from "./components/UploadingScreen";
 import { boundsFor, buildEvents, fmt, loadProjects, saveProjects } from "./utils";
@@ -29,6 +29,12 @@ import type { ActiveMap, AvailableMap, DiarizationEvaluation, EvalConfig, ModelI
 
 const FLAT_WAVE_PEAKS = Array.from({ length: 210 }, () => 0.3);
 const DEFAULT_POLL_INTERVAL_MS = 1500;
+// Aim for a waveform bar roughly every few px of the zoom=1 timeline (Studio's
+// MIN_PX_PER_SEC), so long recordings don't stretch a fixed bar count into a
+// blocky bar chart. Floor keeps short clips unchanged; cap bounds DOM nodes.
+const TARGET_PX_PER_BAR = 3;
+const MIN_WAVE_BARS = 210;
+const MAX_WAVE_BARS = 3000;
 
 export default function App() {
   // All diarization data enters the UI through the adapter layer as the
@@ -80,6 +86,7 @@ export default function App() {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const innerRef = useRef<HTMLDivElement | null>(null);
   const openRequestRef = useRef(0);
+  const seekCommitTimer = useRef<number | null>(null);
 
   const playableUrl = evaluation && !isDemo ? audioStreamUrl(evaluation.audioFileId) : null;
   const hasInFlight = useMemo(() => models.some(isInFlight), [models]);
@@ -160,14 +167,15 @@ export default function App() {
       return;
     }
     let cancelled = false;
-    decodeWaveformPeaks(playableUrl)
+    const bars = Math.min(MAX_WAVE_BARS, Math.max(MIN_WAVE_BARS, Math.round((duration * MIN_PX_PER_SEC) / TARGET_PX_PER_BAR)));
+    decodeWaveformPeaks(playableUrl, bars)
       .then((peaks) => { if (!cancelled) setWavePeaks(peaks); })
       .catch((error: Error) => {
         console.error("Waveform decode failed:", error);
         if (!cancelled) setWavePeaks(FLAT_WAVE_PEAKS);
       });
     return () => { cancelled = true; };
-  }, [playableUrl]);
+  }, [playableUrl, duration]);
 
   const syncDom = useCallback((nextTime = timeRef.current) => {
     const pct = duration > 0 ? nextTime / duration : 0;
@@ -192,13 +200,24 @@ export default function App() {
       const delta = Math.abs(audioRef.current.currentTime - clamped);
       if (delta > 0.05) audioRef.current.currentTime = clamped;
     }
+    // Audio position and the playhead/wave-fill/clock (all DOM refs, via
+    // syncDom) update immediately on every call, so a seek always feels
+    // instant. The expensive part -- re-rendering every model's segment
+    // list to update the active-segment highlight -- is coalesced below,
+    // so a burst of rapid clicks commits once instead of once per click.
     syncDom(clamped);
-    const sig = speakerSignature(shownModels, clamped);
-    if (sig !== sigRef.current) {
-      sigRef.current = sig;
-      setSpeakerTick((tick) => tick + 1);
-    }
-    if (commit) setTime(clamped);
+    if (!commit) return;
+    if (seekCommitTimer.current != null) window.clearTimeout(seekCommitTimer.current);
+    seekCommitTimer.current = window.setTimeout(() => {
+      seekCommitTimer.current = null;
+      const finalTime = timeRef.current;
+      const sig = speakerSignature(shownModels, finalTime);
+      if (sig !== sigRef.current) {
+        sigRef.current = sig;
+        setSpeakerTick((tick) => tick + 1);
+      }
+      setTime(finalTime);
+    }, 60);
   }, [playableUrl, duration, shownModels, syncDom]);
 
   useEffect(() => {

@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { memo, useRef } from "react";
 import type { ActiveMap, ModelRun } from "../types";
 import { SPEAKER_COLORS } from "../data";
 import { activeSpeakers, fmt, hexA, overlapsFor } from "../utils";
@@ -24,7 +24,7 @@ const BAND_H = 104;
  * segment is a sliver — past this density the timeline scrolls instead of
  * compressing further. Short clips still fill the viewport exactly, since
  * this is only a floor (see the `max()` in the width below). */
-const MIN_PX_PER_SEC = 6;
+export const MIN_PX_PER_SEC = 6;
 
 interface StudioProps {
   models: ModelRun[];
@@ -101,18 +101,31 @@ function Ruler({ duration }: Pick<StudioProps, "duration">) {
   );
 }
 
-function Wave({ waveFillRef, time, duration, wavePeaks }: Pick<StudioProps, "waveFillRef" | "time" | "duration" | "wavePeaks">) {
-  return (
-    <div className="waveform">
-      <div className="wave-bars">
-        {wavePeaks.map((height, index) => <i key={index} style={{ height: `${height * 74 + 6}%` }} />)}
+// Memoized against `wavePeaks` only: `time`/`duration` here just seed the
+// initial fill width, since the live position is kept in sync via
+// `waveFillRef` (a direct DOM write in App's `syncDom`), not through a
+// re-render. Without this, every seek re-creates up to 3000 bar elements
+// even though the bars themselves never change.
+const Wave = memo(
+  function Wave({ waveFillRef, time, duration, wavePeaks }: Pick<StudioProps, "waveFillRef" | "time" | "duration" | "wavePeaks">) {
+    return (
+      <div className="waveform">
+        <div className="wave-bars">
+          {wavePeaks.map((height, index) => <i key={index} style={{ height: `${height * 74 + 6}%` }} />)}
+        </div>
+        <div className="wave-fill" ref={waveFillRef} style={{ width: `${pct(time, duration)}%` }} />
       </div>
-      <div className="wave-fill" ref={waveFillRef} style={{ width: `${pct(time, duration)}%` }} />
-    </div>
-  );
-}
+    );
+  },
+  (prev, next) => prev.wavePeaks === next.wavePeaks,
+);
 
-function Band({
+// Memoized (default shallow prop comparison) so a Band only re-renders when
+// its own model's props actually change, instead of every model's segment
+// list re-rendering on every Studio update (e.g. a zoom change touches none
+// of these props). Still re-renders on every `time` change, since that's
+// what drives the active-segment highlight.
+const Band = memo(function Band({
   model,
   glow,
   time,
@@ -190,7 +203,7 @@ function Band({
       })}
     </div>
   );
-}
+});
 
 export function Studio({
   models,
