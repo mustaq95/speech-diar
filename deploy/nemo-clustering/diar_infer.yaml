@@ -13,8 +13,19 @@
 # and .sparse_search_volume are raised above the telephonic profile's default
 # max_num_speakers (8) to keep the wider speaker-count search this model
 # exists for: meetings with more speakers than the Sortformer NIMs are tuned
-# for. Not validated above ~2 speakers (no 8+-speaker sample available) --
-# revisit if a real many-speaker recording shows problems.
+# for.
+#
+# 2026-07-11: validated against tests/samples/youtube_ar_32min_8spk.wav (real
+# 32min/8spk Arabic recording). Baseline (5-scale/1.5s-max embeddings, as
+# above) under-detected at 4 of 8 speakers with good segment coverage per
+# detected speaker (not one dominant blob) -- consistent with embeddings not
+# discriminative enough between similar-sounding speakers, not a VAD/coverage
+# problem, so the VAD block above is left untouched. Added the meeting
+# profile's 3.0s top scale (keeping telephonic's finer 5 scales beneath it
+# rather than replacing them) for more discriminative embeddings on a file
+# long enough to afford wider windows; short-clip callers keep the same
+# 1.5s-and-under scales that were validated above. Revisit if this
+# regresses the katiesteve.wav short-clip case.
 #
 # manifest_filepath / out_dir are left as `???`: server.py sets out_dir per
 # request and passes audio paths straight to `diarize(paths2audio_files=...)`,
@@ -53,9 +64,9 @@ diarizer:
   speaker_embeddings:
     model_path: titanet_large
     parameters:
-      window_length_in_sec: [1.5, 1.25, 1.0, 0.75, 0.5]
-      shift_length_in_sec: [0.75, 0.625, 0.5, 0.375, 0.25]
-      multiscale_weights: [1, 1, 1, 1, 1]
+      window_length_in_sec: [3.0, 1.5, 1.25, 1.0, 0.75, 0.5]
+      shift_length_in_sec: [1.5, 0.75, 0.625, 0.5, 0.375, 0.25]
+      multiscale_weights: [1, 1, 1, 1, 1, 1]
       save_embeddings: False # stateless container; nothing else reads these
 
   clustering:

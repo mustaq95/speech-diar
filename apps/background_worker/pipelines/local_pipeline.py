@@ -6,6 +6,13 @@ that model's status/result/timing to its own `EvaluationResult` row.
 
 This module NEVER touches Azure Blob — see `azure_pipeline.py` for the Azure
 lane, which is entirely separate and only ever handles `azure-batch`.
+
+The DB session is deliberately not held open across `model.runner.run()`:
+that call is GPU inference and can run for many minutes on real audio, well
+past the `idle_in_transaction_session_timeout` Postgres backstop (see
+`packages/database/session.py`) that guards against a session leaking a
+pooled connection. Each phase (initial lookup, `mark_running`, the final
+`mark_done`/`mark_failed`) gets its own short-lived session instead.
 """
 
 import logging
@@ -38,20 +45,27 @@ def run_local_model(audio_file_id: int, model_id: str) -> None:
             mark_failed(session, result, "Audio was not stored in MinIO for the local lane")
             return
 
+        s3_key = audio_file.s3_key
+        suffix = Path(audio_file.filename).suffix or ".wav"
         mark_running(session, result)
 
-        suffix = Path(audio_file.filename).suffix or ".wav"
-        try:
-            with tempfile.NamedTemporaryFile(suffix=suffix) as scratch:
-                download_to(audio_file.s3_key, Path(scratch.name))
-                raw = model.runner.run(scratch.name)
-                run = normalize_model_run(model.adapter.adapt(raw))
-        except NotImplementedError:
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix) as scratch:
+            download_to(s3_key, Path(scratch.name))
+            raw = model.runner.run(scratch.name)
+            run = normalize_model_run(model.adapter.adapt(raw))
+    except NotImplementedError:
+        with SessionLocal() as session:
+            result = get_result_row(session, audio_file_id, model_id)
             mark_failed(session, result, f"{model_id} has no runner implementation yet")
-            return
-        except Exception as exc:
-            logger.exception("Local model %r failed on audio_file_id=%s", model_id, audio_file_id)
+        return
+    except Exception as exc:
+        logger.exception("Local model %r failed on audio_file_id=%s", model_id, audio_file_id)
+        with SessionLocal() as session:
+            result = get_result_row(session, audio_file_id, model_id)
             mark_failed(session, result, str(exc))
-            return
+        return
 
+    with SessionLocal() as session:
+        result = get_result_row(session, audio_file_id, model_id)
         mark_done(session, result, run.model_dump(by_alias=True, mode="json"))
