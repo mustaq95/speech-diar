@@ -83,14 +83,18 @@ class AzureBatchRunner(ModelRunner[AzureBatchRawOutput]):
         try:
             deadline = time.monotonic() + settings.azure_batch_job_timeout_sec
             while True:
+                # Deadline check comes BEFORE the GET: this is a paid API, so
+                # once the timeout expires no further calls go out (the
+                # `finally` DELETE below is the one exception — it cancels the
+                # server-side job so Azure stops billing it).
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"Batch job timed out after {settings.azure_batch_job_timeout_sec}s")
                 job = requests.get(job_url, headers=headers, timeout=60).json()
                 status = job.get("status")
                 if status == "Succeeded":
                     break
                 if status == "Failed":
                     raise RuntimeError(f"Batch job failed: {job.get('properties', {}).get('error')}")
-                if time.monotonic() > deadline:
-                    raise RuntimeError(f"Batch job timed out after {settings.azure_batch_job_timeout_sec}s")
                 time.sleep(settings.azure_batch_poll_interval_sec)
 
             files = requests.get(f"{job_url}/files", headers=headers, timeout=60).json()

@@ -15,6 +15,9 @@ export type ModelId = string;
 /** The real, true state of one model's run — never fabricated. */
 export type ModelStatus = "queued" | "running" | "done" | "failed";
 
+/** A model's real-time GPU-residency lifecycle state, platform-wide (not tied to one evaluation). */
+export type ModelLifecycleState = "unloaded" | "starting" | "ready" | "in_use" | "stopping" | "unhealthy";
+
 /** One contiguous stretch of speech attributed to a single speaker. */
 export interface DiarizationSegment {
   /** Zero-based speaker index, stable within one model run. */
@@ -42,7 +45,11 @@ export interface DiarizationModelRun {
   status?: ModelStatus;
   /** Failure reason when status === "failed". */
   error?: string;
-  /** When the worker started running this model. */
+  /** When the GPU supervisor granted a slot and began waiting for the model's container
+   * to become healthy. Undefined for models that never needed a cold start. The interval
+   * [loadingStartedAt, startedAt) is cold-start wait, not inference. */
+  loadingStartedAt?: string;
+  /** When inference actually began (container confirmed healthy). */
   startedAt?: string;
   /** When the worker finished running this model. */
   finishedAt?: string;
@@ -82,4 +89,19 @@ export interface ModelMetadata {
   description: string;
   /** False for engines that are pluggable stubs (report failed, never fake segments). */
   available: boolean;
+}
+
+/** One entry in `GET /models/status` — a model's real-time GPU-residency lifecycle
+ * state, platform-wide (shared across every evaluation, not scoped to one upload).
+ * Models with no container to manage (e.g. pyannote, which runs in-process) have no
+ * entry — never fabricate a state for them. */
+export interface ModelContainerStatus {
+  modelId: ModelId;
+  state: ModelLifecycleState;
+  /** In-flight jobs on this model; > 0 means untouchable by eviction/idle-unload. */
+  activeJobCount: number;
+  /** Jobs waiting on this model because the residency cap is full. */
+  queuedJobCount: number;
+  /** Most recent failure reason, if any (e.g. a failed cold start). */
+  lastError?: string;
 }

@@ -24,6 +24,25 @@ def mark_running(session: Session, result: EvaluationResult) -> None:
     session.commit()
 
 
+def mark_loading(session: Session, result: EvaluationResult) -> None:
+    """Local-lane, GPU-supervisor-managed models only: status becomes
+    "running" (the contract's ModelStatus is unchanged — the UI's existing
+    running/queued/done/failed vocabulary still applies) but `started_at`
+    stays unset. `loading_started_at` marks the start of the cold-start
+    wait, kept OUT of `started_at`->`finished_at` (and therefore out of
+    `processing_ms`) by construction. Call `mark_inference_started` once the
+    container is confirmed healthy and inference is actually about to
+    begin."""
+    result.status = "running"
+    result.loading_started_at = datetime.now(timezone.utc)
+    session.commit()
+
+
+def mark_inference_started(session: Session, result: EvaluationResult) -> None:
+    result.started_at = datetime.now(timezone.utc)
+    session.commit()
+
+
 def _as_aware_utc(value: datetime) -> datetime:
     """SQLite (unlike Postgres TIMESTAMPTZ) hands back naive datetimes for
     any row fetched by a session that didn't itself set the column — e.g. a

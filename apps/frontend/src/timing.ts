@@ -21,7 +21,14 @@ export function modelTimingLabel(model: ModelRun, durationSec: number, now: numb
       return "Queued";
     case "running": {
       const ms = elapsedMs(model.startedAt, now);
-      return ms == null ? "Running" : `Running · ${fmtSeconds(ms)} elapsed`;
+      if (ms != null) return `Running · ${fmtSeconds(ms)} elapsed`;
+      // started_at isn't set yet: either the GPU supervisor hasn't granted a
+      // slot yet, or it has and the container is still cold-starting
+      // (loadingStartedAt is set). Either way this is not inference time —
+      // see apps/background_worker/supervisor/ for why the two intervals
+      // are kept separate on the wire.
+      const loadingMs = elapsedMs(model.loadingStartedAt, now);
+      return loadingMs == null ? "Running" : `Loading model · ${fmtSeconds(loadingMs)}`;
     }
     case "failed": {
       const ms = model.processingMs;

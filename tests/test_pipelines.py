@@ -155,6 +155,35 @@ def test_local_pipeline_missing_result_row_logs_and_returns_without_crashing(
     assert fake_model.received_input is None
 
 
+def test_local_pipeline_segment_far_past_duration_marks_failed(
+    db_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A model that reports a segment ending far past the audio's real
+    duration (e.g. an autoregressive engine that hallucinates past the end
+    of the input, as observed with VibeVoice) must not be shown as a valid
+    'done' result -- the run is discarded and marked failed instead."""
+    audio_file_id = _seed(db_session_factory, s3_key="audio/overrun.wav", blob_key=None)
+    fake_model = FakeModel()
+    fake_model.adapter.adapt = lambda raw: DiarizationModelRun(
+        id="fake",
+        name="Fake Model",
+        short="Fake",
+        description="test double",
+        segs=[DiarizationSegment(spk=0, s=0.0, e=100.0)],  # duration_sec=10.0 in _seed
+    )
+
+    monkeypatch.setattr(local_pipeline, "SessionLocal", db_session_factory)
+    monkeypatch.setattr(local_pipeline, "REGISTRY", {"fake": fake_model})
+    monkeypatch.setattr(local_pipeline, "download_to", lambda key, path: None)
+
+    local_pipeline.run_local_model(audio_file_id, "fake")
+
+    result = _status(db_session_factory, audio_file_id, "fake")
+    assert result.status == "failed"
+    assert "100.00s" in result.error
+    assert "10.00s" in result.error
+
+
 def test_local_pipeline_unknown_model_id_marks_failed(db_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch) -> None:
     audio_file_id = _seed(db_session_factory, s3_key="audio/4.wav", blob_key=None, model_id="ghost")
     monkeypatch.setattr(local_pipeline, "SessionLocal", db_session_factory)

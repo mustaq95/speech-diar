@@ -33,8 +33,15 @@ class Settings(BaseSettings):
     # RQ's own library default is 180s, which is shorter than several
     # per-model timeouts below (azure_batch_job_timeout_sec,
     # nemo_clustering_timeout_sec at 1800s) — those would never get a chance
-    # to fire. This must stay >= the largest per-model timeout.
-    queue_job_timeout_sec: int = 3600
+    # to fire. This must stay >= the largest per-model timeout... AND, since
+    # the supervisor (see "GPU container lifecycle" below) can now make a
+    # job wait out a container cold-start before its own inference timeout
+    # even starts counting, it must stay >= the largest (cold-start +
+    # inference) SUM across managed models, not just the largest single
+    # timeout. Worst case today: vibevoice at
+    # vibevoice_cold_start_timeout_sec (600) + vibevoice_timeout_sec (5400)
+    # = 6000 is the floor; padded here for margin.
+    queue_job_timeout_sec: int = 6600
 
     # --- Primary storage lane: MinIO / S3 (local models) ---
     # Port 9010: on DGX Spark hosts running the Parakeet NIM containers, host
@@ -74,15 +81,29 @@ class Settings(BaseSettings):
     # conditions at https://huggingface.co/pyannote/speaker-diarization-community-1
     # then set this to a HuggingFace access token.
     huggingface_token: str | None = None
+    # Directory holding sherpa-onnx's segmentation.onnx and embedding.onnx;
+    # downloaded here on first use if missing (ungated, no token needed).
+    sherpa_model_dir: str = "~/.cache/sherpa-onnx-diarization"
 
     # --- NVIDIA Parakeet-Sortformer NIM (DGX Spark local Triton/Riva containers) ---
     # Started via ./deploy/parakeet_nim_up.sh; gRPC only (speaker tags are not
     # exposed by the plain HTTP /v1/audio/transcriptions route).
     nim_str_grpc: str = "localhost:50051"
     nim_ofl_grpc: str = "localhost:50052"
+    # HTTP health-check port only (used by the GPU supervisor's
+    # /v1/health/ready poll — inference itself only ever uses the gRPC ports
+    # above). Must match deploy/parakeet/parakeet-nim.env's
+    # PARAKEET_NIM_HTTP_PORT / PARAKEET_NIM_OFL_HTTP_PORT — change both
+    # together if 9000/9001 are taken by something else on the host.
+    nim_str_health_port: int = 9000
+    nim_ofl_health_port: int = 9001
     nim_language: str = "multi"
     nim_max_speakers: int = 8
     nim_grpc_timeout_sec: int = 600
+    # Separate from nim_grpc_timeout_sec (which bounds one ASR call): this is
+    # the GPU supervisor's cold-start budget while waiting for the
+    # container's own /v1/health/ready to pass after a `docker start`.
+    nim_cold_start_timeout_sec: int = 1800
 
     # --- NeMo Clustering Diarizer (custom container, no turnkey NIM ships this) ---
     # Started via ./deploy/nemo-clustering/nemo_clustering_up.sh; cascaded
@@ -110,9 +131,61 @@ class Settings(BaseSettings):
     # decoder-only model doing ASR + diarization + timestamping in one
     # autoregressive pass. Autoregressive decoding over long audio is slow
     # (it generates a token per output word, not a fixed-cost forward pass),
-    # hence the wider timeout -- still under queue_job_timeout_sec.
+    # hence the wide timeout -- a 32-minute file genuinely needs more than
+    # 30 minutes of decode time (observed live: cut off at exactly 1800s),
+    # so this must stay under queue_job_timeout_sec but well above realtime.
+    # The timeout applies to BOTH the local container call and the remote
+    # proxy call below.
     vibevoice_url: str = "http://localhost:9023"
-    vibevoice_timeout_sec: int = 1800
+    vibevoice_timeout_sec: int = 5400
+    # Cold-start budget for the local container (health-ready wait after
+    # `docker start`), separate from the inference timeout above -- measured
+    # ~2 minutes live; mirrors nim_cold_start_timeout_sec's pattern.
+    vibevoice_cold_start_timeout_sec: int = 600
+    # Optional remote inference proxy (OpenAI-style chat-completions URL).
+    # When set, the vibevoice runner calls this endpoint instead of the
+    # local container, and vibevoice is EXCLUDED from the GPU residency
+    # cap/supervisor entirely -- no docker start/stop, no local GPU slot,
+    # exactly like the cloud-lane models. Leave unset to run locally.
+    vibevoice_baseurl: str | None = None
+    vibevoice_api_key: str | None = None
+    # TLS verification for the remote proxy call above only. Defaults to
+    # secure; set false only if the proxy sits behind a cert this host
+    # doesn't trust (internal CA / self-signed).
+    vibevoice_ssl_verify: bool = True
+
+    # --- GPU container lifecycle supervisor (DGX Spark residency cap) ---
+    # Hard cap on how many of the local-lane model containers above may be
+    # GPU-resident (started) at once. A request for a model beyond this cap
+    # waits (re-enqueued) instead of proceeding or erroring. DGX Spark has
+    # ~120GB unified memory and no MIG/MPS isolation; running all of them at
+    # once caused OOM kills of unrelated infra containers — start
+    # conservative and raise only after confirming headroom.
+    max_resident_models: int = 2
+    # How long a model may sit idle (zero active/queued jobs) before the
+    # supervisor daemon stops its container to free the slot. An idle model
+    # can still be evicted sooner than this if a competing request needs
+    # the slot right away — this setting only governs unforced cleanup.
+    idle_unload_timeout_sec: int = 600
+    # Delay before a job denied a GPU slot (cap already full) is re-enqueued
+    # to try again.
+    admission_requeue_delay_sec: int = 10
+    # Minimum time between retry attempts against a model stuck "unhealthy"
+    # (its last cold-start attempt failed) — without this, a burst of
+    # requests queued behind a genuinely broken container would hammer
+    # `docker start` on every retry cycle.
+    unhealthy_retry_backoff_sec: int = 120
+    # apps/background_worker/supervisor/daemon.py sweep cadence: idle-unload
+    # and staleness checks.
+    supervisor_sweep_interval_sec: int = 15
+    # Grace period passed to `docker stop --time` before Docker SIGKILLs a
+    # container that hasn't exited on its own.
+    container_stop_grace_sec: int = 30
+    # Added on top of a model's own cold-start budget (reused from its
+    # *_timeout_sec field above) as a floor for detecting a "starting" row
+    # stuck past its deadline — covers the case where the supervisor daemon
+    # itself was down when the deadline passed and only catches up later.
+    supervisor_stale_grace_sec: int = 60
 
     @property
     def cors_origins_list(self) -> list[str]:

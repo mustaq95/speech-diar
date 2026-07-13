@@ -1,9 +1,11 @@
 import { memo, useRef } from "react";
 import type { ActiveMap, ModelRun } from "../types";
+import type { ModelContainerStatus } from "../types/diarization";
 import { SPEAKER_COLORS } from "../data";
 import { activeSpeakers, fmt, hexA, overlapsFor } from "../utils";
 import { isInFlight, modelTimingLabel } from "../timing";
 import { IconButton } from "./controls";
+import { LifecycleChip } from "./LifecycleChip";
 
 /** Percent along the timeline, safe when there's no duration yet (nothing loaded). */
 function pct(value: number, duration: number): number {
@@ -29,6 +31,7 @@ export const MIN_PX_PER_SEC = 6;
 interface StudioProps {
   models: ModelRun[];
   active: ActiveMap;
+  modelStatus: ModelContainerStatus[];
   duration: number;
   wavePeaks: number[];
   glow: boolean;
@@ -208,6 +211,7 @@ const Band = memo(function Band({
 export function Studio({
   models,
   active,
+  modelStatus,
   duration,
   wavePeaks,
   glow,
@@ -226,6 +230,7 @@ export function Studio({
   innerRef,
 }: StudioProps) {
   const shown = models.filter((model) => active[model.id]);
+  const statusById = new Map(modelStatus.map((entry) => [entry.modelId, entry]));
   const outerRef = useRef<HTMLDivElement | null>(null);
   const rulerH = 30;
   const waveH = 104;
@@ -263,6 +268,18 @@ export function Studio({
             <div>
               <span className="mono">{String(index + 1).padStart(2, "0")}</span>
               <strong title={model.name}>{model.short}</strong>
+              {(() => {
+                const entry = statusById.get(model.id);
+                // No entry means this model isn't GPU-supervisor-managed
+                // (e.g. pyannote runs in-process) — the per-evaluation
+                // status line below already covers it, nothing extra to add.
+                return entry ? (
+                  <LifecycleChip
+                    state={entry.state}
+                    detail={entry.queuedJobCount > 0 ? `${entry.queuedJobCount} waiting` : undefined}
+                  />
+                ) : null;
+              })()}
             </div>
             <div>
               <small>Speakers: {model.numSpk}</small>

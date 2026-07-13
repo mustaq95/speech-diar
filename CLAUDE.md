@@ -30,6 +30,8 @@ npm run build                 # tsc -b && vite build   (lint: npx oxlint, config
 
 There is no lint/format step for the Python side.
 
+When running Python directly (not via `uv run`), `source .venv/bin/activate` first. This venv has no `pip` module installed — use `uv pip install <pkg>` instead of bare `pip install`.
+
 ### Architecture — the rules that constrain every change
 
 **Raw model output never crosses a service boundary.** Every engine emits a different native shape. Each model has a `runner.py` (executes the engine, returns native output untouched) and an `adapter.py` (the *only* code allowed to understand that shape; translates it to `DiarizationModelRun`). API, DB, and frontend speak only the unified contract. Same split exists on the frontend (`apps/frontend/src/adapters/`).
@@ -60,6 +62,15 @@ There is no lint/format step for the Python side.
 2. `apps/background_worker/models/<name>/adapter.py` — translate to `DiarizationModelRun` (one segment per turn, never merge).
 3. Register in `apps/background_worker/models/__init__.py` (one line in `REGISTRY`).
 4. Add to `LANE_MAP` in `apps/background_worker/lanes.py` (`local` or `azure`).
+
+An in-process model (pyannote-style, weights loaded in the worker) stops here. A **containerized GPU model** also needs:
+
+5. An entry in `apps/background_worker/supervisor/registry.py` `_registry()` — without it the model is silently treated as in-process: no container start, no health check, no GPU residency cap. `container_name` and the `health_url` port must match the `deploy/<model>/` compose file exactly.
+6. Its settings fields (endpoint URL, timeout, cold-start timeout) in `packages/config/settings.py` plus `.env.example` entries — the supervisor registry reads them at import time and crashes with `AttributeError` if missing.
+7. The `deploy/<model>/` folder (see "Deploying a GPU model" below).
+8. Check `QUEUE_JOB_TIMEOUT_SEC` still exceeds the new model's cold-start + inference sum, or RQ kills the job mid-run.
+
+`tests/test_model_registration.py` cross-checks REGISTRY, LANE_MAP, and the supervisor registry, so `uv run pytest` catches a forgotten step 3–5. The frontend needs no changes: it renders whatever `GET /models` returns.
 
 ### Deploying a GPU model
 GPU inference runs outside the API/worker, in `deploy/<model>/`.

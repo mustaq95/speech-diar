@@ -33,15 +33,21 @@ if [ -f "$PIDFILE" ]; then
   rm -f "$PIDFILE"
 fi
 
-echo "Clearing stale queued jobs..."
-uv run rq empty diarization
+echo "Flushing stale jobs and reconciling interrupted runs..."
+uv run python -m apps.background_worker.flush
 
 CONCURRENCY="${WORKER_CONCURRENCY:-1}"
 echo "Starting $CONCURRENCY worker process(es) on the 'diarization' queue..."
 
 pids=()
 for _ in $(seq 1 "$CONCURRENCY"); do
-  uv run rq worker --worker-class rq.SimpleWorker diarization &
+  # --with-scheduler: a job denied a GPU slot (see
+  # apps/background_worker/supervisor/admission.py) is re-enqueued via
+  # queue.enqueue_in(), which lands in RQ's ScheduledJobRegistry, not the
+  # live queue -- nothing promotes it back without this flag. RQ's scheduler
+  # takes a Redis lock so only one of these N processes is ever active as
+  # the scheduler; the rest still just dequeue and run jobs as before.
+  uv run rq worker --worker-class rq.SimpleWorker --with-scheduler diarization &
   pids+=("$!")
 done
 printf '%s\n' "${pids[@]}" > "$PIDFILE"

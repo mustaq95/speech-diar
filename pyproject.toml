@@ -28,7 +28,11 @@ dependencies = [
 [project.optional-dependencies]
 models = [
     "torch>=2.3",
+    "torchaudio",
+    "torchcodec>=0.7.0",
     "pyannote.audio>=4.0",
+    "sherpa-onnx>=1.13",
+    "numpy>=1.26",
 ]
 
 # Installed by default with `uv sync` (uv treats "dev" as a default group).
@@ -51,3 +55,19 @@ packages = ["apps", "packages"]
 markers = [
     "live: hits a real external service (e.g. Azure); skipped unless RUN_LIVE_TESTS=1",
 ]
+
+# Plain PyPI has no CUDA-enabled torch/torchaudio/torchcodec wheels for Linux
+# aarch64 (e.g. DGX Spark). PyTorch's own index publishes them under cu130
+# (CUDA 13.0) for this exact platform + Python 3.12, so redirect just these
+# three packages there; everything else (pyannote.audio, etc.) keeps resolving
+# from PyPI as normal. `explicit = true` keeps this index from being consulted
+# for any package not listed in [tool.uv.sources].
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
+torchcodec = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

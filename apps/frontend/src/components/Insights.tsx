@@ -46,7 +46,7 @@ export function Insights({ models, active, time, events, feed, clockRef }: Insig
             ) : speakers.length ? (
               <span className="speaker-tags">
                 {speakers.map((speaker) => {
-                  const color = SPEAKER_COLORS[speaker];
+                  const color = SPEAKER_COLORS[speaker % SPEAKER_COLORS.length];
                   return (
                     <span key={speaker} style={{ borderColor: hexA(color, 0.55), background: hexA(color, 0.16) }}>
                       <i style={{ background: color }} /> Speaker {speaker + 1}
@@ -66,7 +66,7 @@ export function Insights({ models, active, time, events, feed, clockRef }: Insig
           <div className="eyebrow feed-title">Event feed</div>
           <div className="event-feed" ref={feedRef}>
             {feedItems.length ? feedItems.map((event, index) => {
-              const color = SPEAKER_COLORS[event.spk];
+              const color = SPEAKER_COLORS[event.spk % SPEAKER_COLORS.length];
               return (
                 <div key={`${event.id}-${event.t}-${index}`} className="feed-row">
                   <span className="mono">{fmt(event.t)}</span>

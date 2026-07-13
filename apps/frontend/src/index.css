@@ -65,6 +65,16 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .drop-zone small { color: var(--faint); font-size: 11.5px; font-family: "IBM Plex Mono", ui-monospace, monospace; }
 .demo-caveat { font-family: inherit; font-style: italic; margin-top: 2px; }
 .catalog-error { background: rgba(240,90,90,.12); border-bottom: 1px solid rgba(240,90,90,.35); color: #f05a5a; font-size: 12.5px; padding: 8px 20px; text-align: center; }
+.model-status-strip { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 22px; border-bottom: 1px solid #1a2130; background: #0d111a; }
+.model-status-chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line-2); background: var(--panel-2); font-size: 11.5px; }
+.model-status-chip .model-status-name { color: var(--text); }
+.model-status-chip .model-status-state { color: var(--dim); }
+.model-status-chip.is-good .status-dot { background: var(--good); box-shadow: 0 0 6px var(--good); }
+.model-status-chip.is-warn .status-dot { background: var(--warn); box-shadow: 0 0 6px var(--warn); }
+.model-status-chip.is-bad .status-dot { background: var(--bad); box-shadow: 0 0 6px var(--bad); }
+.model-status-chip.is-unloaded .status-dot { background: var(--faint); }
+.model-status-chip.is-in-process { border-style: dashed; opacity: 0.85; }
+.model-status-chip.is-in-process .model-status-state { color: var(--faint); font-style: italic; }
 .models-summary, .upload-card, .processing-card, .settings-section, .insights, .studio-shell, .config-bar, .file-bar { background: var(--panel); border: 1px solid var(--line); }
 .models-summary { border-radius: 16px; padding: 18px 20px; }
 .summary-head, .recent-head, .processing-card-head, .insights-head, .config-bar, .file-bar, .settings-row, .model-card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }

@@ -66,6 +66,10 @@ _SPEAKER_RE = re.compile(r'"Speaker"\s*:\s*(\d+)')
 def _parse_segments(raw_text: str) -> list[dict] | None:
     """Recover the segment list from the model's generated text.
 
+    Duplicated in apps/background_worker/models/vibevoice/runner.py for the
+    remote-proxy path (this image COPYs only server.py, so no shared
+    import) -- keep the two in sync.
+
     VibeVoice-ASR does not emit JSON, it emits a *string that resembles* JSON,
     and that string is not always valid: an apostrophe or quote inside the
     transcribed `Content` is enough to break it (json.JSONDecodeError from

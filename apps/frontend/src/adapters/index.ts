@@ -12,6 +12,7 @@ export {
   audioStreamUrl,
   fetchEvaluation,
   fetchModelCatalog,
+  fetchModelStatus,
   fetchRuntimeConfig,
   patchUploadTiming,
   uploadAudio,

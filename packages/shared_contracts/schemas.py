@@ -14,6 +14,8 @@ from pydantic.alias_generators import to_camel
 
 ModelStatus = Literal["queued", "running", "done", "failed"]
 
+ModelLifecycleState = Literal["unloaded", "starting", "ready", "in_use", "stopping", "unhealthy"]
+
 
 class ContractModel(BaseModel):
     """Base for all shared contracts: camelCase on the wire, snake_case in Python."""
@@ -40,7 +42,17 @@ class DiarizationModelRun(ContractModel):
     num_spk: int = Field(default=0, ge=0, description="Distinct speakers detected (max spk + 1)")
     status: ModelStatus | None = Field(default=None, description="queued|running|done|failed; the real, true state")
     error: str | None = Field(default=None, description="Failure reason when status == 'failed'")
-    started_at: datetime | None = Field(default=None, description="When the worker started running this model")
+    loading_started_at: datetime | None = Field(
+        default=None,
+        description=(
+            "When the GPU supervisor granted a slot and began waiting for the model's "
+            "container to become healthy. None for models that never needed a cold start. "
+            "The interval [loadingStartedAt, startedAt) is cold-start wait, not inference."
+        ),
+    )
+    started_at: datetime | None = Field(
+        default=None, description="When inference actually began (container confirmed healthy)"
+    )
     finished_at: datetime | None = Field(default=None, description="When the worker finished running this model")
     processing_ms: int | None = Field(
         default=None,
@@ -90,6 +102,21 @@ class ModelMetadata(ContractModel):
     short: str
     description: str
     available: bool = Field(description="False for engines that are pluggable stubs (report failed, never fake segments)")
+
+
+class ModelContainerStatus(ContractModel):
+    """One entry in `GET /models/status` — a model's real-time GPU-residency
+    lifecycle state, platform-wide (shared across every evaluation, not
+    scoped to one upload), derived fresh from Docker + RQ at request time
+    rather than read from a stored mirror. Models with no container to
+    manage (pyannote runs in-process) have no entry — never fabricate a
+    state for them."""
+
+    model_id: str
+    state: ModelLifecycleState
+    active_job_count: int = Field(ge=0, description="In-flight jobs on this model; >0 means untouchable by eviction/idle-unload")
+    queued_job_count: int = Field(ge=0, description="Jobs waiting on this model because the residency cap is full")
+    last_error: str | None = Field(default=None, description="Most recent failure reason, if any (e.g. a failed cold start)")
 
 
 def normalize_model_run(run: DiarizationModelRun) -> DiarizationModelRun:

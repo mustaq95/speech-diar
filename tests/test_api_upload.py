@@ -122,7 +122,8 @@ def test_upload_same_content_twice_reuses_existing_blob(client: TestClient, stub
     assert first.json()["audioFileId"] != second.json()["audioFileId"]  # still two distinct evaluation rows
 
 
-def test_upload_unknown_and_known_model_ids_keeps_only_known_ones(client: TestClient, stub_s3: list[str], fake_queue: Queue) -> None:
+def test_upload_rejects_unknown_model_ids_by_name(client: TestClient, stub_s3: list[str], fake_queue: Queue) -> None:
     response = client.post("/upload?models=pyannote,not-a-model", files={"file": ("clip.wav", make_wav_bytes(), "audio/wav")})
-    assert response.status_code == 200
-    assert [m["id"] for m in response.json()["models"]] == ["pyannote"]
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Unknown model id(s): not-a-model"
+    assert fake_queue.count == 0  # nothing enqueued, including the known model

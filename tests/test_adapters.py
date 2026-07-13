@@ -10,6 +10,7 @@ from apps.background_worker.models.nemo_clustering.adapter import NemoClustering
 from apps.background_worker.models.nim_sortformer_ofl.adapter import NimSortformerOflAdapter
 from apps.background_worker.models.nim_sortformer_str.adapter import NimSortformerStrAdapter
 from apps.background_worker.models.pyannote.adapter import PyAnnoteAdapter
+from apps.background_worker.models.sherpa.adapter import SherpaAdapter
 from apps.background_worker.models.speaker3d_clustering.adapter import Speaker3dClusteringAdapter
 from apps.background_worker.models.vibevoice.adapter import VibeVoiceAdapter
 
@@ -109,11 +110,34 @@ def test_pyannote_adapter_no_merging_of_adjacent_same_speaker_tracks() -> None:
     assert len(run.segs) == 2
 
 
+def test_sherpa_adapter_maps_segments_and_rebases_speakers_by_first_appearance() -> None:
+    raw = [
+        {"start": 0.0, "end": 0.4, "speaker": 1},
+        {"start": 0.5, "end": 0.7, "speaker": 0},
+        {"start": 0.8, "end": 1.0, "speaker": 1},
+    ]
+    run = SherpaAdapter().adapt(raw)
+    assert run.id == "sherpa"
+    assert run.num_spk == 2
+    assert [seg.spk for seg in run.segs] == [0, 1, 0]  # first-appearance order, not label sort order
+    assert run.segs[0].s == 0.0 and run.segs[0].e == 0.4
+
+
+def test_sherpa_adapter_no_merging_of_adjacent_same_speaker_segments() -> None:
+    raw = [
+        {"start": 0.0, "end": 1.0, "speaker": 0},
+        {"start": 1.0, "end": 2.0, "speaker": 0},
+    ]
+    run = SherpaAdapter().adapt(raw)
+    assert len(run.segs) == 2
+
+
 def test_static_metadata_present_for_get_models_registry() -> None:
     for adapter in (
         AzureSpeechAdapter(),
         AzureBatchAdapter(),
         PyAnnoteAdapter(),
+        SherpaAdapter(),
         NimSortformerOflAdapter(),
         NimSortformerStrAdapter(),
         NemoClusteringAdapter(),

@@ -81,7 +81,7 @@ async def upload_audio(
     valid_ids = local_ids + azure_ids
     unknown_ids = [m for m in requested_ids if m not in valid_ids]
     if unknown_ids:
-        logger.warning("Unknown model id(s) %r — skipping", unknown_ids)
+        raise HTTPException(status_code=422, detail=f"Unknown model id(s): {', '.join(unknown_ids)}")
     if not valid_ids:
         raise HTTPException(status_code=422, detail="No valid model ids requested")
     if azure_ids and not azure_blob.storage_configured():

@@ -1,5 +1,5 @@
 /// <reference types="vite/client" />
-import type { DiarizationEvaluation, ModelMetadata, UploadAck } from "../types/diarization";
+import type { DiarizationEvaluation, ModelContainerStatus, ModelMetadata, UploadAck } from "../types/diarization";
 import { normalizeModelRun, type DiarizationAdapter } from "./DiarizationAdapter";
 
 /**
@@ -39,6 +39,20 @@ export async function fetchRuntimeConfig(): Promise<{ pollIntervalMs: number }> 
 /** The honest model registry: real engines, real availability — no fabricated capability. */
 export async function fetchModelCatalog(): Promise<ModelMetadata[]> {
   const response = await fetch(`${API_BASE_URL}/models`);
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return response.json();
+}
+
+/**
+ * Real-time GPU-residency lifecycle state for every supervisor-managed
+ * model, platform-wide (not scoped to one evaluation). Polled continuously
+ * by App.tsx on its own loop — unlike the evaluation poll, this doesn't
+ * stop just because the currently-loaded evaluation has no in-flight
+ * models, since a model's residency can change from a different
+ * evaluation's job entirely.
+ */
+export async function fetchModelStatus(): Promise<ModelContainerStatus[]> {
+  const response = await fetch(`${API_BASE_URL}/models/status`);
   if (!response.ok) throw new Error(await errorDetail(response));
   return response.json();
 }

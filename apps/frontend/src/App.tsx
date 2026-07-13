@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ConfigBar } from "./components/ConfigBar";
 import { EmptyDashboard } from "./components/EmptyDashboard";
 import { Insights } from "./components/Insights";
+import { ModelStatusStrip } from "./components/ModelStatusStrip";
 import { ProcessingScreen } from "./components/ProcessingScreen";
 import { ProjectsView } from "./components/ProjectsView";
 import { SettingsView } from "./components/SettingsView";
@@ -16,6 +17,7 @@ import {
   deriveDefaultParams,
   fetchEvaluation,
   fetchModelCatalog,
+  fetchModelStatus,
   fetchRuntimeConfig,
   getDiarizationEvaluation,
   mergeActiveWithCatalog,
@@ -26,6 +28,7 @@ import {
 import { speakerSignature, decodeWaveformPeaks } from "./playback";
 import { isInFlight } from "./timing";
 import type { ActiveMap, AvailableMap, DiarizationEvaluation, EvalConfig, ModelId, ModelMetadata, ModelRun, Nav, ParamMap, Project, Workflow } from "./types";
+import type { ModelContainerStatus } from "./types/diarization";
 
 const FLAT_WAVE_PEAKS = Array.from({ length: 210 }, () => 0.3);
 const DEFAULT_POLL_INTERVAL_MS = 1500;
@@ -48,6 +51,7 @@ export default function App() {
   const [catalog, setCatalog] = useState<ModelMetadata[]>([]);
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [pollIntervalMs, setPollIntervalMs] = useState(DEFAULT_POLL_INTERVAL_MS);
+  const [modelStatus, setModelStatus] = useState<ModelContainerStatus[]>([]);
   const catalogModels = useMemo(() => catalog.map(modelRunFromMetadata), [catalog]);
   const availableMap: AvailableMap = useMemo(
     () => Object.fromEntries(catalog.map((meta) => [meta.id, meta.available])),
@@ -141,6 +145,18 @@ export default function App() {
     }, pollIntervalMs);
     return () => window.clearInterval(id);
   }, [evaluation, isDemo, hasInFlight, pollIntervalMs]);
+
+  // Model GPU-residency status is platform-wide, not tied to any one
+  // evaluation's in-flight state — a model can start loading or unloading
+  // because of a completely different evaluation's job. Poll continuously,
+  // independent of `hasInFlight`, starting immediately rather than waiting
+  // out the first interval tick.
+  useEffect(() => {
+    const poll = () => fetchModelStatus().then(setModelStatus).catch((error: Error) => console.error("Model status poll failed:", error));
+    void poll();
+    const id = window.setInterval(poll, pollIntervalMs);
+    return () => window.clearInterval(id);
+  }, [pollIntervalMs]);
 
   // Auto-advance from the dedicated processing screen once every model has settled.
   // Navigation is intentionally left untouched here: when "open dashboard on upload"
@@ -455,6 +471,7 @@ export default function App() {
         />
       )}
       <TopBar nav={nav} onNav={handleNav} />
+      <ModelStatusStrip catalog={catalog} status={modelStatus} />
 
       {nav === "projects" && <ProjectsView projects={projects} onOpenProject={openProject} onNew={startNewUpload} />}
       {nav === "settings" && (
@@ -524,6 +541,7 @@ export default function App() {
             <Studio
               models={dashboardModels}
               active={active}
+              modelStatus={modelStatus}
               duration={duration}
               wavePeaks={wavePeaks}
               glow={glow}

@@ -19,6 +19,8 @@ from .nim_sortformer_str.adapter import NimSortformerStrAdapter
 from .nim_sortformer_str.runner import NimSortformerStrRunner
 from .pyannote.adapter import PyAnnoteAdapter
 from .pyannote.runner import PyAnnoteRunner
+from .sherpa.adapter import SherpaAdapter
+from .sherpa.runner import SherpaRunner
 from .speaker3d_clustering.adapter import Speaker3dClusteringAdapter
 from .speaker3d_clustering.runner import Speaker3dClusteringRunner
 from .vibevoice.adapter import VibeVoiceAdapter
@@ -30,6 +32,7 @@ REGISTRY: dict[str, DiarizationModel] = {
         DiarizationModel(AzureSpeechRunner(), AzureSpeechAdapter()),
         DiarizationModel(AzureBatchRunner(), AzureBatchAdapter()),
         DiarizationModel(PyAnnoteRunner(), PyAnnoteAdapter()),
+        DiarizationModel(SherpaRunner(), SherpaAdapter()),
         DiarizationModel(NimSortformerStrRunner(), NimSortformerStrAdapter()),
         DiarizationModel(NimSortformerOflRunner(), NimSortformerOflAdapter()),
         DiarizationModel(NemoClusteringRunner(), NemoClusteringAdapter()),
