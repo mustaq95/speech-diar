@@ -32,6 +32,12 @@ models = [
     "torchcodec>=0.7.0",
     "pyannote.audio>=4.0",
     "sherpa-onnx>=1.13",
+    # sherpa-onnx's linux_armv7l wheel declares no Requires-Dist at all (unlike
+    # its other platform wheels, which require sherpa-onnx-core), and uv's
+    # cross-platform lock resolution treats that wheel's metadata as canonical
+    # for the whole version -- so sherpa-onnx-core silently never gets locked
+    # for any platform unless pinned here directly.
+    "sherpa-onnx-core>=1.13",
     "numpy>=1.26",
 ]
 

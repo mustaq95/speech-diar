@@ -21,6 +21,7 @@ LANE_MAP: dict[str, Lane] = {
     "3d-speaker-clustering": "local",
     "diarizen": "local",
     "vibevoice": "local",
+    "pyannote-3-1": "local",
 }
 
 

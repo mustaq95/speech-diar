@@ -4,48 +4,69 @@
 # its own container, outside the API/worker process -- the worker calls it
 # over HTTP.
 #
-# Containerized rather than pip-installed into the worker because it needs
-# transformers>=5.3.0, while this platform's `pyannote` model pins
-# pyannote.audio>=4.0 with its own transformers floor -- and because a
-# resident 16GB BF16 model has no business being loaded and evicted per RQ
-# job. Same reasoning as deploy/nemo-clustering and deploy/diarizen.
+# Served through vLLM (Microsoft's official recipe, see
+# https://github.com/microsoft/VibeVoice/blob/main/docs/vibevoice-vllm-asr.md)
+# rather than plain transformers.generate(): vLLM's continuous batching and
+# CUDA-graph-captured decode are substantially faster than the eager-mode
+# transformers path this container used to run, which is what let a 32-minute
+# meeting take over 30 minutes to decode.
 #
-# Uses the NGC PyTorch container (multi-arch: amd64 + arm64) rather than the
-# Docker Hub pytorch/pytorch image, which only publishes amd64 -- this
-# platform also runs on DGX Spark (Grace, aarch64). 24.10-py3 predates GB10
-# (Grace Blackwell) support and fails at runtime with "No supported GPU(s)
-# detected"; 26.06-py3 is built against a newer driver (610.43+) than this
-# host has (580.159.03) and refuses to run. 26.02-py3 is the tag
-# deploy/diarizen already runs successfully against this exact host driver.
-FROM nvcr.io/nvidia/pytorch:26.02-py3
+# vllm/vllm-openai publishes a multi-arch (amd64 + arm64) image, so this also
+# runs on DGX Spark (Grace, aarch64) without swapping base images the way the
+# other deploy/*/Dockerfiles have to (NGC pytorch tag hunting).
+#
+# This host's GPU is `sm_121a` (GB10/DGX Spark Blackwell Ultra). Any
+# Triton/torch.compile kernel -- which vLLM's CUDA-graph capture always
+# triggers -- must be assembled by a `ptxas` new enough to know that arch,
+# or the engine core dies at startup with `ptxas fatal: Value 'sm_121a' is
+# not defined for option 'gpu-name'`. This needs BOTH halves, which is easy
+# to get wrong (an earlier pass here thought the base image alone sufficed):
+#
+#   1. The `-cu130` base (CUDA 13.0, matching this host's driver CUDA
+#      version) so the TOOLKIT ptxas at /usr/local/cuda/bin/ptxas (V13.0.88)
+#      supports sm_121a. The plain `v0.14.1` tag's CUDA 12.x toolkit ptxas
+#      does not. Verified live: `ptxas --gpu-name=sm_121a` succeeds with the
+#      cu130 toolkit binary, fails with the 12.x one.
+#   2. Pointing Triton AT that toolkit ptxas. vLLM does not use the toolkit
+#      ptxas -- Triton ships its OWN bundled `ptxas` (V12.8.93, at
+#      triton/backends/nvidia/bin/ptxas) and uses it by default, so the
+#      cu130 base is necessary but NOT sufficient. The override
+#      `TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas` (set in
+#      docker-compose.vibevoice.yml) makes Triton use the sm_121a-capable
+#      toolkit binary. Verified live: an identical Triton kernel that fails
+#      with the bundled ptxas compiles clean with the override.
+#
+# See vllm-project/vllm#33313 and triton-lang/triton#8539.
+FROM vllm/vllm-openai:v0.14.1-cu130
 
-WORKDIR /app
-
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && \
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libsndfile1 git && \
     rm -rf /var/lib/apt/lists/*
 
-# VibeVoiceAsrForConditionalGeneration landed in transformers 5.3.0; there is
-# no earlier version that can load this architecture. --no-deps on torch's
-# transitive pull is not needed here (transformers floors torch but doesn't
-# pin it), but keep an eye on this if a future base image ships a torch that
-# transformers wants to replace: the NGC libtorch is custom-patched and a
-# PyPI torch build must never evict it.
-RUN pip install --no-cache-dir \
-    "transformers>=5.3.0" \
-    accelerate \
-    soundfile \
-    "fastapi>=0.115" \
-    "uvicorn[standard]>=0.30" \
-    "python-multipart>=0.0.9"
+# Pinned commit, not `main` -- so a rebuild months from now doesn't silently
+# pick up upstream changes to the vLLM plugin or the request/response format
+# this platform's runner.py depends on.
+ARG VIBEVOICE_COMMIT=303b2833e01cff4578ec278bbfe536da54bd19fe
+RUN git clone https://github.com/microsoft/VibeVoice /app && \
+    git -C /app checkout "$VIBEVOICE_COMMIT"
 
-# Deliberately NOT installing flash-attn: PyPI ships no aarch64 wheel for it
-# (this image is multi-arch for DGX Spark/Grace), and building it from source
-# takes the better part of an hour. server.py asks for attn_implementation
-# ="sdpa" instead -- PyTorch's built-in scaled_dot_product_attention, which is
-# available on every arch and is a supported path for this model.
+# Upstream's own launcher (vllm_plugin/scripts/start_server.py) re-runs this
+# install on every container start, which is fine for a one-off demo but not
+# for a container the supervisor cold-starts repeatedly against a tight
+# budget. Do it once, at build time, instead -- see serve.py for the launcher
+# this image actually runs. (The `[vllm]` extra that script references
+# doesn't exist in VibeVoice's pyproject.toml; plain `-e .` installs the same
+# dependencies.)
+RUN python3 -m pip install --no-cache-dir -e /app
 
-COPY server.py ./
+# Fails the build (not a 3am cold start) if installing VibeVoice's deps moved
+# a package vLLM itself needs pinned -- see the Dockerfile comment in
+# deploy/diarizen for why this class of transitive-dependency breakage is
+# worth guarding against explicitly here.
+RUN python3 -c "import vllm, transformers, torch, vibevoice, vllm_plugin; \
+    print('vllm', vllm.__version__, 'transformers', transformers.__version__, 'torch', torch.__version__)"
 
-EXPOSE 9023
+COPY serve.py /opt/vibevoice/serve.py
 
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "9023"]
+EXPOSE 8000
+
+ENTRYPOINT ["python3", "/opt/vibevoice/serve.py"]

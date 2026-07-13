@@ -10,9 +10,11 @@ Two execution paths, selected by configuration (`.env`, read via
 `packages/config/settings.py`):
 
   Local (default):
-    VIBEVOICE_URL -- base URL of the container (POST {url}/diarize); the
-    container is GPU-supervisor-managed (residency cap, cold start, idle
-    unload -- see apps/background_worker/supervisor/).
+    VIBEVOICE_URL -- base URL of the container's OpenAI-compatible vLLM
+    server (POST {url}/v1/chat/completions); the container is
+    GPU-supervisor-managed (residency cap, cold start, idle unload -- see
+    apps/background_worker/supervisor/) and runs Microsoft's official vLLM
+    deployment (deploy/vibevoice/), not plain transformers.generate().
   Remote (VIBEVOICE_BASEURL set):
     VIBEVOICE_BASEURL -- OpenAI-style chat-completions proxy fronting the
     same model off-host; audio goes up base64-encoded as an `input_audio`
@@ -25,8 +27,9 @@ Two execution paths, selected by configuration (`.env`, read via
     true; set false if the proxy sits behind a cert this host doesn't
     trust.
 
-  VIBEVOICE_TIMEOUT_SEC -- request timeout, both paths. Autoregressive
-  decoding over long audio is slow: a 32-minute file needs >30 minutes.
+  VIBEVOICE_TIMEOUT_SEC -- request timeout, both paths. vLLM's continuous
+  batching decodes long audio well under realtime, but the timeout is kept
+  wide as headroom for a cold model or an unusually long meeting.
 """
 
 import base64
@@ -44,11 +47,9 @@ from ..base_model import ModelRunner
 
 VibeVoiceRawOutput = dict[str, Any]
 
-# Duplicated from deploy/vibevoice/server.py::_parse_segments (the container
-# image COPYs only server.py, so the two sides cannot share an import). The
-# local path parses inside the container; the remote proxy hands back the
-# model's raw generated text, so the same recovery has to happen here. Keep
-# the two in sync if the model's output format ever changes.
+# Both the local (vLLM container) and remote (proxy) paths hand back the
+# model's raw generated text over an OpenAI-compatible chat-completions
+# response, so this one parser covers both.
 _OBJECT_RE = re.compile(r"\{[^{}]*\}")
 _START_RE = re.compile(r'"Start"\s*:\s*(-?\d+(?:\.\d+)?)')
 _END_RE = re.compile(r'"End"\s*:\s*(-?\d+(?:\.\d+)?)')
@@ -109,14 +110,49 @@ class VibeVoiceRunner(ModelRunner[VibeVoiceRawOutput]):
         return self._run_local(audio_path, settings)
 
     def _run_local(self, audio_path: str, settings: Any) -> VibeVoiceRawOutput:
+        duration = _wav_duration_sec(audio_path)
+        if duration is None:
+            raise RuntimeError(f"could not read WAV duration for {audio_path}")
         with open(audio_path, "rb") as f:
-            response = httpx.post(
-                f"{settings.vibevoice_url}/diarize",
-                files={"file": (audio_path, f, "audio/wav")},
-                timeout=settings.vibevoice_timeout_sec,
-            )
+            audio_b64 = base64.b64encode(f.read()).decode("ascii")
+        response = httpx.post(
+            f"{settings.vibevoice_url}/v1/chat/completions",
+            json={
+                "model": "vibevoice",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a helpful assistant that transcribes audio "
+                        "input into text output in JSON format.",
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "audio_url",
+                                "audio_url": {"url": f"data:audio/wav;base64,{audio_b64}"},
+                            },
+                            {
+                                "type": "text",
+                                "text": f"This is a {duration:.2f} seconds audio, please "
+                                "transcribe it with these keys: Start time, End time, "
+                                "Speaker ID, Content",
+                            },
+                        ],
+                    },
+                ],
+                "max_tokens": 32768,
+                "temperature": 0.0,
+                "top_p": 1.0,
+            },
+            timeout=settings.vibevoice_timeout_sec,
+        )
         response.raise_for_status()
-        return response.json()
+        raw_text = response.json()["choices"][0]["message"]["content"]
+        parsed = _parse_segments(raw_text)
+        if parsed is None:
+            raise RuntimeError(f"local vibevoice output did not parse as segments: {raw_text!r}")
+        return {"audio_duration_sec": duration, "segments": parsed}
 
     def _run_remote(self, audio_path: str, settings: Any) -> VibeVoiceRawOutput:
         with open(audio_path, "rb") as f:

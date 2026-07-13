@@ -1,9 +1,11 @@
 # VibeVoice-ASR -- Microsoft's 8B single-pass joint ASR + diarization +
-# timestamping model. No vendor NIM exists for it, so this is a custom image:
-# an NGC CUDA PyTorch base plus transformers>=5.3.0, which is the only thing
-# needed to load it (the architecture ships in transformers itself).
+# timestamping model, served through vLLM (docs/vibevoice-vllm-asr.md in the
+# upstream repo). See Dockerfile for why: continuous batching + CUDA-graph
+# decode instead of the eager-mode transformers.generate() this container
+# used to run.
 #
-# Service: vibevoice -- HTTP :9023 (POST /diarize, GET /health/ready)
+# Service: vibevoice -- HTTP :9023 (OpenAI-compatible /v1/chat/completions,
+# GET /health)
 #
 # Prereqs: cp deploy/vibevoice/vibevoice.env.example deploy/vibevoice/vibevoice.env
 #          ./deploy/vibevoice/vibevoice_up.sh
@@ -26,21 +28,42 @@ services:
       - 8.8.8.8
       - 1.1.1.1
     environment:
-      # The weights are ~16GB across 8 shards and the Hub throttles hard per
-      # connection (measured on this host: ~20 KB/s on a single stream vs
-      # ~580 KB/s across four). This turns on Xet's parallel chunked transfer,
-      # which is the difference between a first startup measured in minutes
-      # and one measured in hours. (The older HF_HUB_ENABLE_HF_TRANSFER knob
-      # is deprecated -- huggingface_hub uses Xet now and ignores it.)
-      HF_XET_HIGH_PERFORMANCE: "1"
+      # Xet's chunked parallel transfer (cas-bridge.xethub.hf.co) was
+      # observed on this host silently producing truncated/corrupt
+      # safetensors shards under this network's high-latency conditions:
+      # snapshot_download() reported success while several multi-GB blobs
+      # were actually empty/sparse past a certain offset (caught by
+      # safetensors failing to parse the header on load). Disabling Xet
+      # falls back to plain sequential HTTP GET, which is slower per-byte
+      # but fails loudly (ChunkedEncodingError) and resumes correctly
+      # instead of silently corrupting.
+      HF_HUB_DISABLE_XET: "1"
+      # vLLM's own recommended allocator setting for long-running audio
+      # requests (docs/vibevoice-vllm-asr.md).
+      PYTORCH_ALLOC_CONF: "expandable_segments:True"
+      # Triton bundles its OWN ptxas (CUDA 12.8, V12.8.93) which does not
+      # know this host's GPU arch (sm_121a, GB10/DGX Spark Blackwell):
+      # every vLLM torch.compile / CUDA-graph kernel dies with
+      # `ptxas fatal: Value 'sm_121a' is not defined for option 'gpu-name'`.
+      # The cu130 base image's TOOLKIT ptxas (/usr/local/cuda/bin/ptxas,
+      # V13.0.88) does support sm_121a -- point Triton at it. Verified live:
+      # the same Triton kernel that fails with the bundled ptxas compiles
+      # clean with this override. Without it vLLM crashes at engine start.
+      TRITON_PTXAS_PATH: "/usr/local/cuda/bin/ptxas"
     env_file:
       - path: vibevoice.env
         required: false
     ports:
-      - "${VIBEVOICE_PORT:-9023}:9023"
+      - "${VIBEVOICE_PORT:-9023}:8000"
     volumes:
       - vibevoice-cache:/root/.cache/huggingface
+      # torch.compile / CUDA-graph capture artifacts -- without this the
+      # supervisor's repeated cold starts would each pay the compile cost
+      # again, eating into the 600s cold-start budget.
+      - vibevoice-vllm-cache:/root/.cache/vllm
 
 volumes:
   vibevoice-cache:
     name: vibevoice-cache
+  vibevoice-vllm-cache:
+    name: vibevoice-vllm-cache

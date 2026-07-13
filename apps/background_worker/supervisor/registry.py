@@ -47,7 +47,7 @@ def _registry() -> dict[str, ManagedContainer]:
         "vibevoice": ManagedContainer(
             model_id="vibevoice",
             container_name="vibevoice",
-            health_url="http://localhost:9023/health/ready",
+            health_url="http://localhost:9023/health",
             cold_start_timeout_sec=settings.vibevoice_cold_start_timeout_sec,
         ),
         "nim-sortformer-str": ManagedContainer(

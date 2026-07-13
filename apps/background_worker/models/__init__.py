@@ -19,6 +19,8 @@ from .nim_sortformer_str.adapter import NimSortformerStrAdapter
 from .nim_sortformer_str.runner import NimSortformerStrRunner
 from .pyannote.adapter import PyAnnoteAdapter
 from .pyannote.runner import PyAnnoteRunner
+from .pyannote_3_1.adapter import Pyannote31Adapter
+from .pyannote_3_1.runner import Pyannote31Runner
 from .sherpa.adapter import SherpaAdapter
 from .sherpa.runner import SherpaRunner
 from .speaker3d_clustering.adapter import Speaker3dClusteringAdapter
@@ -39,5 +41,6 @@ REGISTRY: dict[str, DiarizationModel] = {
         DiarizationModel(Speaker3dClusteringRunner(), Speaker3dClusteringAdapter()),
         DiarizationModel(DiarizenRunner(), DiarizenAdapter()),
         DiarizationModel(VibeVoiceRunner(), VibeVoiceAdapter()),
+        DiarizationModel(Pyannote31Runner(), Pyannote31Adapter()),
     )
 }

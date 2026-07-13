@@ -1,16 +1,19 @@
-"""The remote-vibevoice path: VIBEVOICE_BASEURL set => the runner calls the
-OpenAI-style chat-completions proxy instead of the local container, and
-vibevoice drops out of the GPU supervisor entirely (no managed container, no
-residency slot, absent from /models/status so the UI renders it as
-In-process).
+"""The vibevoice runner's two execution paths: local (the vLLM container at
+VIBEVOICE_URL, deploy/vibevoice/) and remote (VIBEVOICE_BASEURL set, an
+OpenAI-style chat-completions proxy fronting the same model off-host —
+vibevoice then drops out of the GPU supervisor entirely: no managed
+container, no residency slot, absent from /models/status so the UI renders
+it as In-process).
 
-The remote endpoint itself is stubbed everywhere here — at the time this
-landed the proxy's hostname did not even resolve from the DGX host, so the
-wire format (input_audio content part in, generated text in
-choices[0].message.content out) is the standard OpenAI shape, verified
-against these tests but NOT yet against the real service.
+Both paths speak the same OpenAI chat-completions wire format (audio in as
+an *_url content part, generated text out in choices[0].message.content),
+so they share one `_parse_segments`. The remote endpoint itself is stubbed
+everywhere here — at the time this landed the proxy's hostname did not even
+resolve from the DGX host, so that shape is verified against these tests
+but NOT yet against the real service.
 """
 
+import base64
 import json
 from types import SimpleNamespace
 
@@ -18,6 +21,7 @@ import pytest
 
 from apps.background_worker.models.vibevoice import runner as vibevoice_runner
 from apps.background_worker.supervisor import registry
+from tests.conftest import make_wav_bytes
 
 
 def _fake_settings(**overrides):
@@ -139,24 +143,66 @@ def test_remote_path_raises_clearly_when_output_is_unparseable(monkeypatch: pyte
         vibevoice_runner.VibeVoiceRunner().run(str(wav))
 
 
-def test_local_path_is_untouched_when_no_baseurl(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+def test_local_path_posts_chat_completions_to_the_vllm_container(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """No VIBEVOICE_BASEURL => the runner calls the local vLLM container's
+    OpenAI-compatible /v1/chat/completions endpoint (deploy/vibevoice/), the
+    same wire format the remote proxy path already uses."""
     wav = tmp_path / "clip.wav"
-    wav.write_bytes(b"RIFFfakewavbytes")
+    wav.write_bytes(make_wav_bytes(duration_sec=0.10))
     settings = _fake_settings()  # baseurl None
     monkeypatch.setattr(vibevoice_runner, "get_settings", lambda: settings)
 
     seen: dict = {}
 
-    def fake_post(url, files=None, timeout=None, **kwargs):
-        seen.update(url=url, timeout=timeout)
-        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"segments": []})
+    def fake_post(url, json=None, timeout=None, **kwargs):
+        seen.update(url=url, body=json, timeout=timeout)
+        content = '[{"Start": 0.0, "End": 0.10, "Speaker": 0}]'
+        return SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {"choices": [{"message": {"content": content}}]},
+        )
 
     monkeypatch.setattr(vibevoice_runner.httpx, "post", fake_post)
 
-    vibevoice_runner.VibeVoiceRunner().run(str(wav))
+    raw = vibevoice_runner.VibeVoiceRunner().run(str(wav))
 
-    assert seen["url"] == "http://localhost:9023/diarize"
+    assert seen["url"] == "http://localhost:9023/v1/chat/completions"
     assert seen["timeout"] == 5400
+    body = seen["body"]
+    assert body["model"] == "vibevoice"
+    assert "stream" not in body
+    assert body["max_tokens"] == 32768
+    assert body["temperature"] == 0.0
+    assert body["top_p"] == 1.0
+    system_msg, user_msg = body["messages"]
+    assert system_msg["role"] == "system"
+    audio_part, text_part = user_msg["content"]
+    assert audio_part["type"] == "audio_url"
+    assert audio_part["audio_url"]["url"].startswith("data:audio/wav;base64,")
+    b64 = audio_part["audio_url"]["url"].removeprefix("data:audio/wav;base64,")
+    assert base64.b64decode(b64) == wav.read_bytes()
+    assert text_part["type"] == "text"
+    assert "0.10 seconds audio" in text_part["text"]
+    assert raw["audio_duration_sec"] == pytest.approx(0.10)
+    assert raw["segments"] == [{"Start": 0.0, "End": 0.10, "Speaker": 0}]
+
+
+def test_local_path_raises_clearly_when_output_is_unparseable(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    wav = tmp_path / "clip.wav"
+    wav.write_bytes(make_wav_bytes(duration_sec=0.10))
+    settings = _fake_settings()  # baseurl None
+    monkeypatch.setattr(vibevoice_runner, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        vibevoice_runner.httpx,
+        "post",
+        lambda *a, **k: SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {"choices": [{"message": {"content": "I could not process this audio."}}]},
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="did not parse as segments"):
+        vibevoice_runner.VibeVoiceRunner().run(str(wav))
 
 
 def test_vibevoice_leaves_the_managed_set_when_remote(monkeypatch: pytest.MonkeyPatch) -> None:

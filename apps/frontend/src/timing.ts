@@ -37,10 +37,7 @@ export function modelTimingLabel(model: ModelRun, durationSec: number, now: numb
     }
     case "done": {
       if (model.processingMs == null) return "Done";
-      const rtf = durationSec > 0 ? model.processingMs / 1000 / durationSec : null;
-      return rtf == null
-        ? `Done · ${fmtSeconds(model.processingMs)}`
-        : `Done · ${fmtSeconds(model.processingMs)} · ${rtf.toFixed(2)}x realtime`;
+      return `Done · ${fmtSeconds(model.processingMs)} · ${model.numSpk} speakers`;
     }
     default:
       // No status at all (the synthetic demo source): already-complete canned output.

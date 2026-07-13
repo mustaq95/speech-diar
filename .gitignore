@@ -11,6 +11,7 @@ apps/frontend/*.tsbuildinfo
 .claude/
 .cursor/
 .gstack/
+test/samples/
 
 # Python
 .venv

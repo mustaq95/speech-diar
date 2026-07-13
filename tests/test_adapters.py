@@ -10,6 +10,7 @@ from apps.background_worker.models.nemo_clustering.adapter import NemoClustering
 from apps.background_worker.models.nim_sortformer_ofl.adapter import NimSortformerOflAdapter
 from apps.background_worker.models.nim_sortformer_str.adapter import NimSortformerStrAdapter
 from apps.background_worker.models.pyannote.adapter import PyAnnoteAdapter
+from apps.background_worker.models.pyannote_3_1.adapter import Pyannote31Adapter
 from apps.background_worker.models.sherpa.adapter import SherpaAdapter
 from apps.background_worker.models.speaker3d_clustering.adapter import Speaker3dClusteringAdapter
 from apps.background_worker.models.vibevoice.adapter import VibeVoiceAdapter
@@ -132,6 +133,28 @@ def test_sherpa_adapter_no_merging_of_adjacent_same_speaker_segments() -> None:
     assert len(run.segs) == 2
 
 
+def test_pyannote_3_1_adapter_maps_tracks_and_rebases_speakers_by_first_appearance() -> None:
+    raw = [
+        {"start": 0.5, "end": 2.0, "label": "SPEAKER_01"},
+        {"start": 2.5, "end": 4.0, "label": "SPEAKER_00"},
+        {"start": 4.5, "end": 6.0, "label": "SPEAKER_01"},
+    ]
+    run = Pyannote31Adapter().adapt(raw)
+    assert run.id == "pyannote-3-1"
+    assert run.num_spk == 2
+    assert [seg.spk for seg in run.segs] == [0, 1, 0]  # first-appearance order, not label sort order
+    assert run.segs[0].s == 0.5 and run.segs[0].e == 2.0
+
+
+def test_pyannote_3_1_adapter_no_merging_of_adjacent_same_speaker_tracks() -> None:
+    raw = [
+        {"start": 0.0, "end": 1.0, "label": "SPEAKER_00"},
+        {"start": 1.0, "end": 2.0, "label": "SPEAKER_00"},
+    ]
+    run = Pyannote31Adapter().adapt(raw)
+    assert len(run.segs) == 2
+
+
 def test_static_metadata_present_for_get_models_registry() -> None:
     for adapter in (
         AzureSpeechAdapter(),
@@ -144,6 +167,7 @@ def test_static_metadata_present_for_get_models_registry() -> None:
         Speaker3dClusteringAdapter(),
         DiarizenAdapter(),
         VibeVoiceAdapter(),
+        Pyannote31Adapter(),
     ):
         assert adapter.name and adapter.short and adapter.description
 
