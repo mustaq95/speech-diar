@@ -40,7 +40,7 @@ export function EmptyDashboard({ models, available, active, projects, onFile, on
         <input
           ref={fileInputRef}
           type="file"
-          accept="audio/wav,.wav"
+          accept="audio/*,.wav,.mp3,.m4a,.aac,.flac,.ogg,.opus,.wma"
           style={{ display: "none" }}
           onChange={(event) => {
             const file = event.target.files?.[0];
@@ -65,7 +65,7 @@ export function EmptyDashboard({ models, available, active, projects, onFile, on
             <button type="button" className="action-fill" onClick={(event) => { event.stopPropagation(); fileInputRef.current?.click(); }}>Browse files</button>
             <button type="button" className="action-outline" onClick={(event) => { event.stopPropagation(); onLoadDemo(); }}>Load demo</button>
           </span>
-          <small>WAV · up to 2 hours</small>
+          <small>Audio (WAV, MP3, M4A, FLAC…) · up to 2 hours</small>
           <small className="demo-caveat">Demo uses synthetic data — not real model results</small>
         </div>
 

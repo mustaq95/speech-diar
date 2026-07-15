@@ -10,10 +10,14 @@ enqueues one RQ job per model. It returns immediately; the browser polls
 import hashlib
 import io
 import logging
+import os
+import shutil
+import subprocess
+import tempfile
 import wave
-from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
 from apps.background_worker.lanes import split_by_lane
@@ -30,38 +34,93 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/upload", tags=["upload"])
 
 
-def _wav_duration_sec(content: bytes) -> float | None:
-    """Read the WAV header — no transcode, no temp file on disk.
+def _wav_duration_file(path: str) -> float | None:
+    """Read the WAV header from a file on disk — no full read into memory.
 
     Some encoders (e.g. streamed/live-recorded WAV) write a placeholder or
     otherwise inaccurate `data` chunk size, which `wave.getnframes()` trusts
     blindly and can report a duration many times longer than the real audio.
-    The frame count is capped by what could actually fit in the uploaded
-    bytes to guard against that.
+    The frame count is capped by what could actually fit in the file's bytes
+    to guard against that.
     """
-    buffer = io.BytesIO(content)
-    try:
-        with wave.open(buffer, "rb") as wav:
-            n_channels = wav.getnchannels()
-            sampwidth = wav.getsampwidth()
-            framerate = wav.getframerate()
-            header_frames = wav.getnframes()
-            data_start = buffer.tell()  # wave.open() leaves the position at the start of the PCM payload
-    except (wave.Error, EOFError):
-        return None
+    with open(path, "rb") as fh:
+        try:
+            with wave.open(fh, "rb") as wav:
+                n_channels = wav.getnchannels()
+                sampwidth = wav.getsampwidth()
+                framerate = wav.getframerate()
+                header_frames = wav.getnframes()
+                data_start = fh.tell()  # wave.open() leaves the position at the start of the PCM payload
+        except (wave.Error, EOFError):
+            return None
     if not framerate or not n_channels or not sampwidth:
         return None
     bytes_per_frame = n_channels * sampwidth
-    max_frames_in_buffer = max(0, len(content) - data_start) // bytes_per_frame
-    n_frames = min(header_frames, max_frames_in_buffer) if header_frames else max_frames_in_buffer
+    max_frames_in_file = max(0, os.path.getsize(path) - data_start) // bytes_per_frame
+    n_frames = min(header_frames, max_frames_in_file) if header_frames else max_frames_in_file
     return n_frames / framerate if n_frames else None
 
 
-def _content_hash(content: bytes) -> str:
+def _is_canonical_wav(content: bytes) -> bool:
+    """Fast path: already 16-bit PCM, 16 kHz, mono — the canonical form we
+    store — so skip ffmpeg."""
+    buffer = io.BytesIO(content)
+    try:
+        with wave.open(buffer, "rb") as wav:
+            return (
+                wav.getsampwidth() == 2
+                and wav.getcomptype() == "NONE"
+                and wav.getframerate() == 16000
+                and wav.getnchannels() == 1
+            )
+    except (wave.Error, EOFError):
+        return False
+
+
+def _transcode_to_wav_file(content: bytes) -> str | None:
+    """Decode any ffmpeg-supported format (MP3, M4A, FLAC, ...) to a 16 kHz mono
+    16-bit PCM WAV on disk, returning the temp file's path (the caller deletes it).
+
+    Returns None if ffmpeg is missing or can't decode the bytes (corrupt / non-audio).
+
+    Downmixed to 16 kHz mono: every diarizer resamples to this internally, so model
+    output is unchanged, and it keeps a multi-hour file to a few hundred MB on disk
+    instead of multiple GB held in memory.
+
+    ffmpeg must write to a seekable file, not a pipe: on a non-seekable pipe it can't
+    backfill the RIFF/data chunk sizes and emits a placeholder max size, which the
+    frontend waveform parser and the stdlib-`wave` runners would misread. Input is
+    still streamed via stdin.
+    """
+    if shutil.which("ffmpeg") is None:
+        return None
+    fd, path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+             "-i", "pipe:0", "-vn", "-ar", "16000", "-ac", "1", "-acodec", "pcm_s16le", path],
+            input=content, capture_output=True, timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        os.unlink(path)
+        return None
+    if proc.returncode != 0:
+        os.unlink(path)
+        return None
+    return path
+
+
+def _content_hash_file(path: str) -> str:
     """Content-address the audio bytes so re-uploading the same file (e.g. while
     repeatedly testing against Azure) reuses the blob already staged there
-    instead of uploading it again."""
-    return hashlib.sha256(content).hexdigest()[:32]
+    instead of uploading it again. Streams the file in chunks so a multi-hour WAV
+    never lands in memory just to be hashed."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()[:32]
 
 
 @router.post("", response_model=UploadAck, response_model_by_alias=True)
@@ -71,11 +130,8 @@ async def upload_audio(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> UploadAck:
-    content = await file.read()
-    duration_sec = _wav_duration_sec(content)
-    if duration_sec is None:
-        raise HTTPException(status_code=415, detail="Only WAV uploads are supported (could not read duration)")
-
+    # Validate the requested models first — a bad request must never pay for a
+    # (possibly multi-hour) transcode.
     requested_ids = [m.strip() for m in models.split(",") if m.strip()]
     local_ids, azure_ids = split_by_lane(requested_ids)
     valid_ids = local_ids + azure_ids
@@ -93,26 +149,51 @@ async def upload_audio(
             ),
         )
 
-    suffix = Path(file.filename or "audio.wav").suffix or ".wav"
-    audio_file = AudioFile(owner_id=current_user.id, filename=file.filename or "audio.wav", duration_sec=duration_sec)
-    db.add(audio_file)
-    db.commit()
+    content = await file.read()
+    # Canonicalize to a 16 kHz mono 16-bit PCM WAV on disk so every downstream consumer
+    # sees one shape and a multi-hour file never lands wholesale in memory. The blocking
+    # ffmpeg call runs off the event loop so it can't freeze the API.
+    if _is_canonical_wav(content):
+        fd, canonical_path = tempfile.mkstemp(suffix=".wav")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(content)
+    else:
+        canonical_path = await run_in_threadpool(_transcode_to_wav_file, content)
+        if canonical_path is None:
+            raise HTTPException(status_code=415, detail="Unsupported or unreadable audio file")
 
-    # Two independent writes, one per selected lane — never copied lane-to-lane.
-    if local_ids:
-        key = f"audio/{audio_file.id}{suffix}"
-        s3_client.put_stream(io.BytesIO(content), key)
-        audio_file.s3_key = key
-    if azure_ids:
-        # Keyed by content hash, not audio_file.id: uploading the same file
-        # again (e.g. repeated Azure test runs) reuses the existing blob
-        # instead of re-uploading it.
-        blob_key = f"uploads/{_content_hash(content)}{suffix}"
-        if not azure_blob.blob_exists(blob_key):
-            azure_blob.put_stream(io.BytesIO(content), blob_key)
-        audio_file.blob_key = blob_key
-        audio_file.blob_url = azure_blob.blob_url(blob_key)
-    db.commit()
+    try:
+        duration_sec = _wav_duration_file(canonical_path)
+        if duration_sec is None:
+            raise HTTPException(status_code=415, detail="Could not read audio duration")
+
+        # The stored object is always canonical .wav regardless of the uploaded filename
+        # (which is kept only for display).
+        audio_file = AudioFile(owner_id=current_user.id, filename=file.filename or "audio.wav", duration_sec=duration_sec)
+        db.add(audio_file)
+        db.commit()
+
+        # Two independent writes, one per selected lane — never copied lane-to-lane.
+        # Each streams the canonical file from disk; nothing re-buffers it in memory.
+        if local_ids:
+            key = f"audio/{audio_file.id}.wav"
+            with open(canonical_path, "rb") as fh:
+                s3_client.put_stream(fh, key)
+            audio_file.s3_key = key
+        if azure_ids:
+            # Keyed by content hash, not audio_file.id: uploading the same file
+            # again (e.g. repeated Azure test runs) reuses the existing blob
+            # instead of re-uploading it.
+            blob_key = f"uploads/{_content_hash_file(canonical_path)}.wav"
+            if not azure_blob.blob_exists(blob_key):
+                with open(canonical_path, "rb") as fh:
+                    azure_blob.put_stream(fh, blob_key)
+            audio_file.blob_key = blob_key
+            audio_file.blob_url = azure_blob.blob_url(blob_key)
+        db.commit()
+    finally:
+        if os.path.exists(canonical_path):
+            os.unlink(canonical_path)
 
     queued: list[QueuedModel] = []
     for model_id in valid_ids:

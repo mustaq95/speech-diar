@@ -24,9 +24,6 @@ services:
     ulimits:
       memlock: -1
       stack: 67108864
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
     environment:
       # Xet's chunked parallel transfer (cas-bridge.xethub.hf.co) was
       # observed on this host silently producing truncated/corrupt

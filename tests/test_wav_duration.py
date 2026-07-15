@@ -1,13 +1,23 @@
-"""Regression tests for `_wav_duration_sec` — some encoders (streamed/live
+"""Regression tests for `_wav_duration_file` — some encoders (streamed/live
 recordings in particular) write a placeholder or otherwise inaccurate
 `data` chunk size in the WAV header. Trusting it blindly can report a
 duration many times longer than the real audio (observed: a real ~5s
 recording reported as ~37 hours)."""
 
 import struct
+import tempfile
 
-from apps.backend_api.routers.upload import _wav_duration_sec
+from apps.backend_api.routers.upload import _wav_duration_file
 from tests.conftest import make_wav_bytes
+
+
+def _wav_duration_sec(wav_bytes: bytes) -> float | None:
+    """Write bytes to a temp WAV and read its duration from disk, the way the
+    upload handler does."""
+    with tempfile.NamedTemporaryFile(suffix=".wav") as f:
+        f.write(wav_bytes)
+        f.flush()
+        return _wav_duration_file(f.name)
 
 
 def _corrupt_data_chunk_size(wav_bytes: bytes, bogus_size: int) -> bytes:

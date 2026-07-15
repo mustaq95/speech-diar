@@ -118,6 +118,11 @@ class Settings(BaseSettings):
     # transcription step.
     speaker3d_clustering_url: str = "http://localhost:9021"
     speaker3d_clustering_timeout_sec: int = 600
+    # Budget for the container's /health/ready to pass after a `docker start`;
+    # the first start downloads CAM++/FSMN-VAD checkpoints from ModelScope, so
+    # this is separate from (and larger than) the per-request timeout above.
+    # Mirrors nim_cold_start_timeout_sec's pattern.
+    speaker3d_clustering_cold_start_timeout_sec: int = 1800
 
     # --- DiariZen (custom container, no turnkey NIM) ---
     # Started via ./deploy/diarizen/diarizen_up.sh; WavLM-Large + Conformer

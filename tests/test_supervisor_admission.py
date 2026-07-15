@@ -103,7 +103,7 @@ def test_try_acquire_grants_immediately_under_cap(db_session_factory: sessionmak
         decision = admission.try_acquire(session, "nemo-clustering")
 
     assert decision.granted is True
-    assert decision.evicted_model_id is None
+    assert decision.evicted_model_ids == ()
     # Every grant takes the cold-start claim -- it's what protects the model
     # from eviction until mark_job_started converts it to an active count.
     assert _row(db_session_factory, "nemo-clustering").starting_since is not None
@@ -141,22 +141,102 @@ def test_try_acquire_denies_when_cap_full_and_no_idle_victim(db_session_factory:
 def test_try_acquire_evicts_idle_model_when_cap_full(db_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch) -> None:
     """An idle-resident model (container running, zero jobs, no claims) is
     fair game for eviction under contention, even before its idle-unload
-    timeout -- deliberate policy, not a bug."""
+    timeout -- deliberate policy, not a bug. Uses diarizen (a non-exclusive
+    model) as the acquirer so this exercises the plain cap path, not the
+    exclusive-GPU path."""
     stopped = _stub_stop(monkeypatch)
     _snapshots(monkeypatch, busy={"3d-speaker-clustering"}, running={"nemo-clustering", "3d-speaker-clustering"})
     _seed_row(db_session_factory, "nemo-clustering", active_job_count=0)  # idle-resident
     _seed_row(db_session_factory, "3d-speaker-clustering", active_job_count=1)
+    _seed_row(db_session_factory, "diarizen")
+
+    with db_session_factory() as session:
+        decision = admission.try_acquire(session, "diarizen")
+
+    assert decision.granted is True
+    assert decision.evicted_model_ids == ("nemo-clustering",)
+    assert stopped == ["nemo-clustering"]
+    victim = _row(db_session_factory, "nemo-clustering")
+    assert victim.evicting_since is None  # cleared after the stop completed
+    assert _row(db_session_factory, "diarizen").starting_since is not None
+
+
+def test_try_acquire_exclusive_model_evicts_every_idle_co_resident(
+    db_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """vibevoice needs the whole GPU: admitting it evicts ALL other idle
+    residents, not just enough to satisfy the cap."""
+    stopped = _stub_stop(monkeypatch)
+    _snapshots(monkeypatch, running={"nemo-clustering", "3d-speaker-clustering"})
+    _seed_row(db_session_factory, "nemo-clustering", active_job_count=0)  # idle-resident
+    _seed_row(db_session_factory, "3d-speaker-clustering", active_job_count=0)  # idle-resident
     _seed_row(db_session_factory, "vibevoice")
 
     with db_session_factory() as session:
         decision = admission.try_acquire(session, "vibevoice")
 
     assert decision.granted is True
-    assert decision.evicted_model_id == "nemo-clustering"
-    assert stopped == ["nemo-clustering"]
-    victim = _row(db_session_factory, "nemo-clustering")
-    assert victim.evicting_since is None  # cleared after the stop completed
+    assert set(decision.evicted_model_ids) == {"nemo-clustering", "3d-speaker-clustering"}
+    assert set(stopped) == {"nemo-clustering", "3d-speaker-clustering"}
     assert _row(db_session_factory, "vibevoice").starting_since is not None
+
+
+def test_try_acquire_exclusive_model_denied_when_a_co_resident_is_busy(
+    db_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exclusive model cannot force out a model that is mid-inference, so
+    it waits (denied, nothing stopped) until that model finishes."""
+    stopped = _stub_stop(monkeypatch)
+    _snapshots(monkeypatch, busy={"3d-speaker-clustering"}, running={"nemo-clustering", "3d-speaker-clustering"})
+    _seed_row(db_session_factory, "nemo-clustering", active_job_count=0)  # idle-resident
+    _seed_row(db_session_factory, "3d-speaker-clustering", active_job_count=1)  # busy
+    _seed_row(db_session_factory, "vibevoice")
+
+    with db_session_factory() as session:
+        decision = admission.try_acquire(session, "vibevoice")
+
+    assert decision.granted is False
+    assert stopped == []
+    assert _row(db_session_factory, "vibevoice").starting_since is None  # never claimed
+
+
+def test_try_acquire_evicts_an_idle_exclusive_holder_even_with_cap_room(
+    db_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exclusivity is mutual: a non-exclusive model cannot coexist with an
+    idle-resident vibevoice, so vibevoice is evicted to admit it even though
+    the cap (2) has an open slot."""
+    stopped = _stub_stop(monkeypatch)
+    _snapshots(monkeypatch, running={"vibevoice"})
+    _seed_row(db_session_factory, "vibevoice", active_job_count=0)  # idle-resident, sole holder
+    _seed_row(db_session_factory, "diarizen")
+
+    with db_session_factory() as session:
+        decision = admission.try_acquire(session, "diarizen")
+
+    assert decision.granted is True
+    assert decision.evicted_model_ids == ("vibevoice",)
+    assert stopped == ["vibevoice"]
+
+
+def test_try_acquire_non_exclusive_sheds_only_one_of_two_idle_co_residents(
+    db_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression guard for the plain cap path: a non-exclusive model with two
+    idle non-exclusive co-residents evicts exactly one (enough to fit the cap),
+    not all of them."""
+    stopped = _stub_stop(monkeypatch)
+    _snapshots(monkeypatch, running={"nemo-clustering", "3d-speaker-clustering"})
+    _seed_row(db_session_factory, "nemo-clustering", active_job_count=0)  # idle-resident
+    _seed_row(db_session_factory, "3d-speaker-clustering", active_job_count=0)  # idle-resident
+    _seed_row(db_session_factory, "diarizen")
+
+    with db_session_factory() as session:
+        decision = admission.try_acquire(session, "diarizen")
+
+    assert decision.granted is True
+    assert len(decision.evicted_model_ids) == 1
+    assert len(stopped) == 1
 
 
 def test_try_acquire_never_evicts_a_model_that_is_still_cold_starting(
@@ -334,17 +414,19 @@ def test_try_acquire_denies_and_releases_its_claim_when_the_victim_stop_fails(
 
     monkeypatch.setattr(admission.containers, "stop_container", _slow_stop)
     # running_containers() returns CONTAINER names -- nim-sortformer-str's
-    # container is "parakeet-nim-str" (see registry.py).
+    # container is "parakeet-nim-str" (see registry.py). diarizen (a
+    # non-exclusive model) is the acquirer so a single idle victim is evicted
+    # through the plain cap path.
     _snapshots(monkeypatch, busy={"3d-speaker-clustering"}, running={"parakeet-nim-str", "3d-speaker-clustering"})
     _seed_row(db_session_factory, "nim-sortformer-str", active_job_count=0)  # idle-resident victim
     _seed_row(db_session_factory, "3d-speaker-clustering", active_job_count=1)
-    _seed_row(db_session_factory, "vibevoice")
+    _seed_row(db_session_factory, "diarizen")
 
     with db_session_factory() as session:
-        decision = admission.try_acquire(session, "vibevoice")
+        decision = admission.try_acquire(session, "diarizen")
 
     assert decision.granted is False
-    assert _row(db_session_factory, "vibevoice").starting_since is None  # own claim released
+    assert _row(db_session_factory, "diarizen").starting_since is None  # own claim released
     assert _row(db_session_factory, "nim-sortformer-str").evicting_since is not None  # left to TTL-expire
 
 

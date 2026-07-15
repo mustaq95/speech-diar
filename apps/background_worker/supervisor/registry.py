@@ -21,6 +21,13 @@ class ManagedContainer:
     container_name: str
     health_url: str
     cold_start_timeout_sec: int
+    # A model that needs the whole GPU to itself: admission evicts every other
+    # resident before granting it a slot, and never admits anything else
+    # alongside it. vibevoice's 8B vLLM engine sizes its KV cache against the
+    # device's total free memory, so a co-resident model's footprint pushes it
+    # negative ("No available memory for the cache blocks") and its container
+    # never becomes healthy.
+    requires_exclusive_gpu: bool = False
 
 
 def _registry() -> dict[str, ManagedContainer]:
@@ -36,7 +43,7 @@ def _registry() -> dict[str, ManagedContainer]:
             model_id="3d-speaker-clustering",
             container_name="3d-speaker-clustering",
             health_url="http://localhost:9021/health/ready",
-            cold_start_timeout_sec=settings.speaker3d_clustering_timeout_sec,
+            cold_start_timeout_sec=settings.speaker3d_clustering_cold_start_timeout_sec,
         ),
         "diarizen": ManagedContainer(
             model_id="diarizen",
@@ -49,6 +56,7 @@ def _registry() -> dict[str, ManagedContainer]:
             container_name="vibevoice",
             health_url="http://localhost:9023/health",
             cold_start_timeout_sec=settings.vibevoice_cold_start_timeout_sec,
+            requires_exclusive_gpu=True,
         ),
         "nim-sortformer-str": ManagedContainer(
             model_id="nim-sortformer-str",

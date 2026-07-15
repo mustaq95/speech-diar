@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class AdmissionDecision:
     granted: bool
-    evicted_model_id: str | None = None
+    evicted_model_ids: tuple[str, ...] = ()
 
 
 def _as_aware_utc(value: datetime) -> datetime:
@@ -109,61 +109,81 @@ def try_acquire(session: Session, model_id: str) -> AdmissionDecision:
         if row.model_id != model_id and state.holds_slot(row, busy_model_ids, running_names, now)
     ]
 
-    evicted_model_id: str | None = None
-    if not target_holds and len(other_holders) >= settings.max_resident_models:
-        # Victim = idle-resident only: container running, no cold-start
-        # claim (never evict a model mid-cold-start — reproduced live once),
-        # no real active jobs (never evict mid-inference — hard rule).
-        victim = next(
-            (
-                row
-                for row in other_holders
-                if state.real_active_jobs(row, busy_model_ids) == 0
-                and not state.starting_claim_valid(row, busy_model_ids, now)
-            ),
-            None,
+    def _requires_exclusive(mid: str) -> bool:
+        cfg = managed_container(mid)
+        return cfg is not None and cfg.requires_exclusive_gpu
+
+    def _evictable(row: ModelContainerState) -> bool:
+        # Idle-resident only: never evict a model mid-inference (real active
+        # jobs) or mid-cold-start (valid starting claim). Both are hard rules
+        # reproduced live.
+        return (
+            state.real_active_jobs(row, busy_model_ids) == 0
+            and not state.starting_claim_valid(row, busy_model_ids, now)
         )
-        if victim is None:
+
+    victims: list[ModelContainerState] = []
+    if not target_holds:
+        target_exclusive = _requires_exclusive(model_id)
+        # Holders that can never coexist with the target: everyone if the
+        # target demands the GPU alone, otherwise any exclusive-GPU model
+        # already resident (it, too, refuses company).
+        forced_ids = {
+            row.model_id
+            for row in other_holders
+            if target_exclusive or _requires_exclusive(row.model_id)
+        }
+        forced = [row for row in other_holders if row.model_id in forced_ids]
+        remaining = [row for row in other_holders if row.model_id not in forced_ids]
+        # Plain cap shedding among the rest: after admitting the target,
+        # residents = (kept remaining) + 1 must fit under the cap.
+        overflow = (len(remaining) + 1) - settings.max_resident_models
+        extra = [row for row in remaining if _evictable(row)]
+        if any(not _evictable(row) for row in forced) or (overflow > 0 and len(extra) < overflow):
             session.commit()  # persist the opportunistic repair even on deny
             return AdmissionDecision(granted=False)
-        # Claim the eviction and our own slot in ONE transaction, so no
-        # competitor can slip between "victim freed" and "we claimed".
-        victim.evicting_since = now
-        evicted_model_id = victim.model_id
+        victims = forced + (extra[:overflow] if overflow > 0 else [])
 
+    # Claim every eviction and our own slot in ONE transaction, so no
+    # competitor can slip between "victims freed" and "we claimed".
+    for victim in victims:
+        victim.evicting_since = now
     target.starting_since = now
     session.commit()
 
-    if evicted_model_id is not None:
-        victim_container = managed_container(evicted_model_id)
+    for victim in victims:
+        victim_container = managed_container(victim.model_id)
         try:
             if victim_container is not None:
                 containers.stop_container(victim_container.container_name)
         except Exception:
-            # The victim's memory was NOT freed — proceeding with the grant
+            # A victim's memory was NOT freed — proceeding with the grant
             # anyway would risk exactly the OOM this system exists to
             # prevent. Release our own claim and deny; the caller re-enqueues
-            # and retries. The victim's eviction claim is deliberately left
-            # in place (we can't know how far the stop got) to TTL-expire on
-            # its own; the next acquirer re-stops idempotently.
+            # and retries. Every eviction claim (this victim's and any already
+            # stopped) is deliberately left in place to TTL-expire on its own;
+            # the next acquirer re-stops idempotently.
             logger.exception(
-                "Evicting %s to admit %s: docker stop failed; denying this attempt", evicted_model_id, model_id
+                "Evicting %s to admit %s: docker stop failed; denying this attempt", victim.model_id, model_id
             )
             unclaimed = session.get(ModelContainerState, model_id, with_for_update=True)
             if unclaimed is not None:
                 unclaimed.starting_since = None
             session.commit()
             return AdmissionDecision(granted=False)
-        # Clear the eviction claim in a follow-up transaction. If we die
-        # before this line, the claim TTL-expires on its own and the next
-        # acquirer simply re-stops the container (docker stop is idempotent).
-        cleared = session.get(ModelContainerState, evicted_model_id, with_for_update=True)
-        if cleared is not None:
-            cleared.evicting_since = None
-        session.commit()
-        logger.info("Evicted idle %s to admit %s", evicted_model_id, model_id)
 
-    return AdmissionDecision(granted=True, evicted_model_id=evicted_model_id)
+    # Clear the eviction claims in a follow-up transaction. If we die before
+    # this line, they TTL-expire on their own and the next acquirer simply
+    # re-stops the containers (docker stop is idempotent).
+    if victims:
+        for victim in victims:
+            cleared = session.get(ModelContainerState, victim.model_id, with_for_update=True)
+            if cleared is not None:
+                cleared.evicting_since = None
+        session.commit()
+        logger.info("Evicted idle %s to admit %s", ", ".join(v.model_id for v in victims), model_id)
+
+    return AdmissionDecision(granted=True, evicted_model_ids=tuple(v.model_id for v in victims))
 
 
 def mark_job_started(session: Session, model_id: str) -> None:

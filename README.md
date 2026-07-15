@@ -102,7 +102,10 @@ Browser ──▶ GET /evaluations/{id}/audio ──▶ API streams from whichev
 
 ## Setup
 
-Requires [`uv`](https://docs.astral.sh/uv/) and Docker.
+Requires [`uv`](https://docs.astral.sh/uv/), Docker, and `ffmpeg` on the
+`PATH`. Uploads in any format other than 16-bit PCM WAV (MP3, M4A, FLAC, …)
+are transcoded to WAV at ingest via the `ffmpeg` CLI; install it with
+`apt install ffmpeg` (or your platform's equivalent).
 
 ```bash
 # 1. Python env (pins Python 3.12, installs api+worker+dev deps from uv.lock)
@@ -136,6 +139,23 @@ Ctrl+C stops both. Logs are prefixed `web |` / `worker |`. Under the hood
 this is just running the two commands below as siblings — honcho doesn't
 know anything about the API or the queue, it only starts/stops processes and
 forwards signals.
+
+> **These are host processes, not containers.** `docker ps` shows postgres,
+> redis, minio, and the model inference containers — it does **not** show the
+> API, workers, or GPU supervisor, which honcho runs directly on the host.
+> "All containers green" does not mean the API is up; check with
+> `ss -ltnp | grep 8010`.
+>
+> **honcho runs them as one group: if any one exits, it terminates all the
+> others**, including the API. So a crash in a worker or the supervisor takes
+> the whole stack down and uploads start failing with `ECONNREFUSED` on
+> `:8010`. On this DGX box the most likely trigger is a **GPU out-of-memory**
+> in a model container (kernel log: `NVRM ... NV_ERR_NO_MEMORY`) — tune
+> `MAX_RESIDENT_MODELS` / `IDLE_UNLOAD_TIMEOUT_SEC` in `.env` if it recurs.
+> Restart cleanly with `uv run honcho start`. To make a model crash unable to
+> take the API down, run the API in its own process
+> (`uv run uvicorn apps.backend_api.main:app --port 8010`) separately from
+> `honcho start` (workers + supervisor).
 
 Or run them separately in two terminals, which is also exactly what you'd do
 in production (see [Deploying elsewhere](#deploying-elsewhere-eg-dgx-spark)):

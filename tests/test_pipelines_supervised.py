@@ -136,7 +136,7 @@ def test_managed_model_denied_admission_re_enqueues_without_running(
     monkeypatch.setattr(local_pipeline, "SessionLocal", db_session_factory)
     monkeypatch.setattr(local_pipeline, "REGISTRY", {"fake-managed": fake_model})
     monkeypatch.setattr(local_pipeline, "download_to", lambda key, path: pytest.fail("must not download when denied a slot"))
-    monkeypatch.setattr(local_pipeline.admission, "try_acquire", lambda session, model_id: type("D", (), {"granted": False, "evicted_model_id": None})())
+    monkeypatch.setattr(local_pipeline.admission, "try_acquire", lambda session, model_id: type("D", (), {"granted": False, "evicted_model_ids": ()})())
     monkeypatch.setattr(local_pipeline.queue, "enqueue_in", lambda delay, func, *args: enqueued.append(args))
 
     local_pipeline.run_local_model(audio_file_id, "fake-managed")

@@ -12,7 +12,12 @@ const withSpeakerCount = (model: Omit<ModelRun, "numSpk">): ModelRun => ({
 
 export const DURATION = 255;
 
-export const SPEAKER_COLORS = ["#4C9AFF", "#2DD4BF", "#F5A623", "#B57BFF", "#F471B5", "#34D399"];
+export const SPEAKER_COLORS = [
+  "#4C9AFF", "#F5A623", "#2DD4BF", "#F471B5", "#A3E635",
+  "#B57BFF", "#FF6B6B", "#22D3EE", "#FACC15", "#34D399",
+  "#E879F9", "#FB923C", "#38BDF8", "#C084FC", "#4ADE80",
+  "#FB7185", "#818CF8", "#D6A76A", "#F87171", "#94A3B8",
+];
 
 export const MODELS: ModelRun[] = [
   withSpeakerCount({

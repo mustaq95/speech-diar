@@ -14,9 +14,6 @@
 x-parakeet-nim-common: &parakeet-nim-common
   image: nvcr.io/nim/nvidia/parakeet-1-1b-rnnt-multilingual:latest
   restart: unless-stopped
-  dns:
-    - 8.8.8.8
-    - 1.1.1.1
   gpus: all
   ipc: host
   shm_size: "8gb"
