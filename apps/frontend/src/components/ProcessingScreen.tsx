@@ -1,13 +1,15 @@
 import type { ModelRun } from "../types";
 import { isInFlight, modelTimingLabel } from "../timing";
+import { RetryControls } from "./controls";
 
 interface ProcessingScreenProps {
   models: ModelRun[];
   durationSec: number;
   now: number;
+  onRetry: (modelId: string) => Promise<void>;
 }
 
-export function ProcessingScreen({ models, durationSec, now }: ProcessingScreenProps) {
+export function ProcessingScreen({ models, durationSec, now, onRetry }: ProcessingScreenProps) {
   return (
     <main className="center-screen">
       <section className="processing-wrap">
@@ -26,6 +28,7 @@ export function ProcessingScreen({ models, durationSec, now }: ProcessingScreenP
                     {busy ? <span className="spinner" /> : <span className={failed ? "fail-mark" : "done-mark"}>{failed ? "✕" : "✓"}</span>}
                     <strong>{model.name}</strong>
                   </div>
+                  {!busy && <RetryControls modelId={model.id} onRetry={onRetry} />}
                 </div>
                 <p>{modelTimingLabel(model, durationSec, now)}</p>
               </article>

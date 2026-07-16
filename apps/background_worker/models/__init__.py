@@ -11,6 +11,8 @@ from .azure_speech.runner import AzureSpeechRunner
 from .base_model import DiarizationModel
 from .diarizen.adapter import DiarizenAdapter
 from .diarizen.runner import DiarizenRunner
+from .moss_transcribe.adapter import MossTranscribeAdapter
+from .moss_transcribe.runner import MossTranscribeRunner
 from .nemo_clustering.adapter import NemoClusteringAdapter
 from .nemo_clustering.runner import NemoClusteringRunner
 from .nim_sortformer_ofl.adapter import NimSortformerOflAdapter
@@ -42,5 +44,6 @@ REGISTRY: dict[str, DiarizationModel] = {
         DiarizationModel(DiarizenRunner(), DiarizenAdapter()),
         DiarizationModel(VibeVoiceRunner(), VibeVoiceAdapter()),
         DiarizationModel(Pyannote31Runner(), Pyannote31Adapter()),
+        DiarizationModel(MossTranscribeRunner(), MossTranscribeAdapter()),
     )
 }

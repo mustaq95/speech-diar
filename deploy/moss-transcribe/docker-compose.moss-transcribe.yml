@@ -1,0 +1,143 @@
+# MOSS-Transcribe-Diarize (OpenMOSS, Apache-2.0) -- a 0.9B end-to-end model
+# performing ASR, speaker diarization and timestamping jointly in a single
+# autoregressive pass over up to ~90 minutes of audio. Served through vLLM's
+# OpenAI-compatible transcription API.
+#
+# Service: moss-transcribe -- HTTP :9024 (POST /v1/audio/transcriptions,
+# GET /health)
+#
+# Much lighter than deploy/vibevoice/: MOSS is registered in vLLM upstream, so
+# there is no plugin to install and no launcher script -- the Dockerfile only
+# adds vLLM's optional audio-decode deps on top of the stock image, and every
+# serve flag lives below, appended to the inherited ["vllm", "serve"]
+# entrypoint. See the Dockerfile for why the base tag is what it is.
+#
+# Prereqs: cp deploy/moss-transcribe/moss-transcribe.env.example \
+#             deploy/moss-transcribe/moss-transcribe.env
+#          ./deploy/moss-transcribe/moss_transcribe_up.sh
+
+services:
+  moss-transcribe:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: moss-transcribe:local
+    container_name: moss-transcribe
+    restart: unless-stopped
+    gpus: all
+    ipc: host
+    shm_size: "8gb"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    environment:
+      # See deploy/vibevoice/docker-compose.vibevoice.yml: Xet's chunked
+      # parallel transfer was observed on this host silently producing
+      # truncated safetensors shards. Plain sequential HTTP fails loudly and
+      # resumes instead.
+      HF_HUB_DISABLE_XET: "1"
+      PYTORCH_ALLOC_CONF: "expandable_segments:True"
+      # This host's GPU is sm_121a (GB10/DGX Spark Blackwell). Triton ships
+      # its OWN bundled ptxas (V12.8.93) and uses it by default, which does
+      # not know that arch -- every torch.compile / CUDA-graph kernel dies
+      # with `ptxas fatal: Value 'sm_121a' is not defined for option
+      # 'gpu-name'` and the engine never starts. The cu130 base image's
+      # TOOLKIT ptxas does support it, so point Triton at that one. The base
+      # image alone is necessary but NOT sufficient -- both halves are
+      # required. See deploy/vibevoice/Dockerfile:18-39 for the full
+      # investigation, and vllm-project/vllm#33313.
+      TRITON_PTXAS_PATH: "/usr/local/cuda/bin/ptxas"
+      # vLLM's transcription endpoint rejects audio on BOTH size and duration
+      # before the model ever sees it, and its defaults are sized for OpenAI's
+      # API (25MB), not for a 90-minute diarization model. Both were caught live:
+      # a 32-minute upload died in 0.5s with a bare 400, because the filesize
+      # check is a plain len(bytes) comparison that runs before any decode.
+      #
+      # Sized to this platform's stated ceiling ("up to 2 hours" in the upload
+      # UI), not MOSS's ~90-minute one, deliberately: past this point the real
+      # constraint is the model's own context window, and vLLM reports that as
+      # "Input length (N) exceeds model's maximum context length (65536)" --
+      # an actionable message. A 25MB/600s gate would mask it with an arbitrary
+      # one. Uploads reach here as 16kHz mono s16 (upload.py), so 2h = ~220MB.
+      VLLM_MAX_AUDIO_CLIP_FILESIZE_MB: "256"
+      VLLM_MAX_AUDIO_DECODE_DURATION_S: "7200"
+    env_file:
+      - path: moss-transcribe.env
+        required: false
+    # Appended to the image's ["vllm", "serve"] entrypoint.
+    command:
+      - ${MOSS_TRANSCRIBE_MODEL_ID:-OpenMOSS-Team/MOSS-Transcribe-Diarize}
+      # The worker addresses the model by this name, not by the HF repo id --
+      # keeps apps/background_worker/models/moss_transcribe/runner.py stable
+      # if MOSS_TRANSCRIBE_MODEL_ID is ever repointed (e.g. at the Pro model).
+      - --served-model-name=moss-transcribe
+      # vLLM has a native implementation of the architecture, but AutoProcessor
+      # still loads the repo's custom feature-extractor code.
+      - --trust-remote-code
+      - --dtype=bfloat16
+      # The model's real ceiling: config.json has
+      # text.max_position_embeddings=131072, matching the README's "128k
+      # long-context transcription". Do not copy vibevoice's 65536 here (an
+      # earlier pass did): audio costs 12.5 tokens/sec, so 65536 is filled by
+      # ~87 minutes of audio alone, leaving nothing for the transcript and
+      # putting MOSS's documented ~90-minute ceiling out of reach.
+      - --max-model-len=${MOSS_TRANSCRIBE_MAX_MODEL_LEN:-131072}
+      # This is the multimodal ENCODER CACHE, despite its name. vLLM sets
+      # `encoder_cache_size = max_num_batched_tokens` (config/scheduler.py,
+      # marked "not currently configurable"), and an audio item cannot be split
+      # across batches -- the whole file's embeddings must fit at once. At the
+      # 2048 default a 32-minute upload fails with "audio item with 24284
+      # embedding tokens ... exceeds the pre-allocated encoder cache size 2048".
+      #
+      # That error suggests --limit-mm-per-prompt: ignore it, that caps the
+      # NUMBER of items, not their token size. This flag is the only lever.
+      #
+      # Sized to hold the longest file the platform accepts (2h = 90,000 audio
+      # tokens). The root mismatch is upstream's: MOSS's vLLM integration sets
+      # max_audio_clip_s=None (never chunk -- one item for the whole file) while
+      # its max-tokens hint derives from the feature extractor's 30s window, so
+      # vLLM auto-sizes for ~375 tokens and is then handed tens of thousands.
+      - --max-num-batched-tokens=${MOSS_TRANSCRIBE_MAX_BATCHED_TOKENS:-98304}
+      # These two work together and BOTH are required -- despite vLLM's own
+      # docstring claiming kv_cache_memory_bytes "ignores
+      # gpu_memory_utilization". That is true only of the KV *sizing* math.
+      # request_memory() still runs first, in init_device(), purely as an
+      # admission gate: `if free_memory < total * util: raise`. Drop the
+      # utilization flag and it defaults to 0.92, demanding ~110GiB free on a
+      # 120GiB device -- which fails the moment anything else is on the GPU and
+      # crash-loops the container (observed: 17 restarts, "Free memory on device
+      # cuda:0 (109.31/119.67 GiB) ... is less than desired GPU memory
+      # utilization (0.92, 110.1 GiB)").
+      #
+      # So: utilization is ONLY the "is there enough headroom to start" check,
+      # kept as low as MOSS's real footprint allows so it still passes on a
+      # loaded GPU. 0.20 asserts ~24GiB free, covering ~2GiB weights + the 16GiB
+      # reserved below + activations.
+      - --gpu-memory-utilization=${MOSS_TRANSCRIBE_GPU_MEM_UTIL:-0.20}
+      # ...and this sets the KV cache to an ABSOLUTE size, which is what makes
+      # MOSS robust when other models share the GPU. The fraction path would
+      # size the cache as `total * util - non_kv_cache_memory`, where
+      # non_kv_cache_memory comes from a profile run whose non-torch delta
+      # absorbs whatever OTHER processes allocate during that window. At
+      # util=0.10 that raced the in-process pyannote/sherpa models and the
+      # co-resident containers, went negative, and killed the engine with "No
+      # available memory for the cache blocks" -- observed live, twice, on a
+      # real 5-model run. Reserving bytes skips that profiling entirely. See the
+      # env file for how 16GiB was sized.
+      - --kv-cache-memory-bytes=${MOSS_TRANSCRIBE_KV_CACHE_BYTES:-17179869184}
+      - --max-num-seqs=${MOSS_TRANSCRIBE_MAX_NUM_SEQS:-2}
+      - --port=8000
+    ports:
+      - "${MOSS_TRANSCRIBE_PORT:-9024}:8000"
+    volumes:
+      - moss-transcribe-cache:/root/.cache/huggingface
+      # torch.compile / CUDA-graph capture artifacts. The supervisor cold-starts
+      # this container repeatedly against a fixed budget; without this volume
+      # each start re-pays the compile cost.
+      - moss-transcribe-vllm-cache:/root/.cache/vllm
+
+volumes:
+  moss-transcribe-cache:
+    name: moss-transcribe-cache
+  moss-transcribe-vllm-cache:
+    name: moss-transcribe-vllm-cache

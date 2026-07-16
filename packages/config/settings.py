@@ -159,6 +159,29 @@ class Settings(BaseSettings):
     # doesn't trust (internal CA / self-signed).
     vibevoice_ssl_verify: bool = True
 
+    # --- MOSS-Transcribe-Diarize (stock vLLM image; no custom container) ---
+    # Started via ./deploy/moss-transcribe/moss_transcribe_up.sh; OpenMOSS's
+    # 0.9B end-to-end model doing ASR + diarization + timestamping in one
+    # autoregressive pass, served on vLLM's OpenAI-compatible transcription API.
+    #
+    # Same wide timeout as vibevoice, and for the same reason: being small does
+    # NOT make it quick on long audio. Decode is autoregressive over the whole
+    # transcript, so cost tracks output length, not model size. Measured on this
+    # host: ~32 tokens/s generation, and a 32-minute file emits ~24k tokens =
+    # ~13 minutes of decode (an RTF of ~0.4, not the ~0.06 a 30-second clip
+    # suggests -- that figure is prefill-dominated and does not extrapolate).
+    # At MOSS's ~90-minute ceiling that is ~2100s, so an earlier 1800s value
+    # here would have cut off exactly the files this model exists to handle.
+    # Stays under queue_job_timeout_sec (600 cold start + 5400 = 6000 <= 6600).
+    moss_transcribe_url: str = "http://localhost:9024"
+    moss_transcribe_timeout_sec: int = 5400
+    # Cold-start budget for the container (health-ready wait after `docker
+    # start`), separate from the inference timeout above. Only ~2GB of weights
+    # to load, but vLLM's engine start + CUDA-graph capture dominates, so this
+    # mirrors vibevoice_cold_start_timeout_sec rather than being scaled down
+    # with the weights.
+    moss_transcribe_cold_start_timeout_sec: int = 600
+
     # --- GPU container lifecycle supervisor (DGX Spark residency cap) ---
     # Hard cap on how many of the local-lane model containers above may be
     # GPU-resident (started) at once. A request for a model beyond this cap

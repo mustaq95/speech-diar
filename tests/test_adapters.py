@@ -6,6 +6,7 @@ from apps.background_worker.models import _nim_shared
 from apps.background_worker.models.azure_batch.adapter import AzureBatchAdapter
 from apps.background_worker.models.azure_speech.adapter import AzureSpeechAdapter
 from apps.background_worker.models.diarizen.adapter import DiarizenAdapter
+from apps.background_worker.models.moss_transcribe.adapter import MossTranscribeAdapter
 from apps.background_worker.models.nemo_clustering.adapter import NemoClusteringAdapter
 from apps.background_worker.models.nim_sortformer_ofl.adapter import NimSortformerOflAdapter
 from apps.background_worker.models.nim_sortformer_str.adapter import NimSortformerStrAdapter
@@ -395,3 +396,62 @@ def test_vibevoice_adapter_skips_speakerless_non_speech_events() -> None:
     run = VibeVoiceAdapter().adapt(raw)
     assert len(run.segs) == 2
     assert run.num_spk == 2  # the [Silence] event is not a third speaker
+
+
+def test_moss_transcribe_adapter_drops_transcript_and_rebases_speakers_by_first_appearance() -> None:
+    # MOSS emits ONE string, not a segment list: every turn is
+    # `[start][Sxx]text[end]`, concatenated with no separator. The fixture is
+    # upstream's own documented example (README "canonical output format"),
+    # which conveniently starts at S01 rather than S00 — so a correct adapter
+    # must rebase to a zero-based index rather than trusting the label.
+    raw = {
+        "audio_duration_sec": 20.0,
+        "text": (
+            "[0.48][S01]Welcome everyone[1.66]"
+            "[12.26][S02]The new transcription pipeline is ready for evaluation[13.81]"
+            "[14.36][S01]Great, include the diarization results in the report[18.76]"
+        ),
+    }
+    run = MossTranscribeAdapter().adapt(raw)
+    assert run.id == "moss-transcribe"
+    assert run.num_spk == 2
+    assert [seg.spk for seg in run.segs] == [0, 1, 0]  # S01 seen first, so it becomes 0
+    assert run.segs[0].s == 0.48 and run.segs[0].e == 1.66
+    assert run.segs[1].s == 12.26 and run.segs[1].e == 13.81
+    assert MossTranscribeAdapter().audio_duration_sec(raw) == 20.0
+
+
+def test_moss_transcribe_adapter_no_merging_of_adjacent_same_speaker_segments() -> None:
+    # Back-to-back turns by the same speaker, touching at 1.0s. Coalescing
+    # these into one 0.0-2.0 segment would be a KPI lie — the model reported
+    # two turns.
+    raw = {"text": "[0.0][S01]One.[1.0][1.0][S01]Two.[2.0]"}
+    run = MossTranscribeAdapter().adapt(raw)
+    assert len(run.segs) == 2
+    assert run.num_spk == 1
+
+
+def test_moss_transcribe_adapter_skips_speakerless_acoustic_events() -> None:
+    # MOSS optionally annotates acoustic events. A standalone event carries no
+    # [Sxx] tag, so it is not a speech turn and must not mint a speaker. An
+    # event *inside* a turn stays part of that turn's (dropped) text and must
+    # not split it: `.*?` only stops at the next numeric bracket.
+    raw = {
+        "text": (
+            "[0.0][S01]Good morning, Steve.[1.5]"
+            "[1.5][Music][3.0]"
+            "[3.0][S02]Good morning, [Laughter] Katie.[5.0]"
+        ),
+    }
+    run = MossTranscribeAdapter().adapt(raw)
+    assert len(run.segs) == 2
+    assert run.num_spk == 2  # the [Music] event is not a third speaker
+    assert run.segs[1].s == 3.0 and run.segs[1].e == 5.0  # [Laughter] did not truncate the turn
+
+
+def test_moss_transcribe_adapter_empty_text_yields_no_segments() -> None:
+    # An empty generation is an honest empty run, not a crash: the pipeline
+    # still marks the job done and the UI shows the model produced nothing.
+    assert MossTranscribeAdapter().adapt({"text": ""}).segs == []
+    assert MossTranscribeAdapter().adapt({}).segs == []
+    assert MossTranscribeAdapter().adapt({"text": ""}).num_spk == 0

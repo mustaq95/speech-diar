@@ -13,7 +13,10 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
+from apps.background_worker.lanes import lane_for
 from apps.background_worker.models import REGISTRY
+from apps.background_worker.queue_app import queue
+from apps.background_worker.worker import run_model
 from apps.backend_api.dependencies import get_current_user, get_db
 from packages.database.models import AudioFile, EvaluationResult, User
 from packages.shared_contracts.schemas import DiarizationEvaluation, DiarizationModelRun, UploadTimingUpdate
@@ -88,6 +91,58 @@ def update_upload_timing(
     audio_file = _get_audio_file(db, audio_file_id, current_user)
     audio_file.upload_ms = body.upload_ms
     db.commit()
+    return _build_evaluation(db, audio_file)
+
+
+@router.post("/{audio_file_id}/models/{model_id}/retry", response_model=DiarizationEvaluation, response_model_by_alias=True)
+def retry_model(
+    audio_file_id: int,
+    model_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> DiarizationEvaluation:
+    """Run or re-run one model against the audio already in storage, leaving
+    every other model's run untouched.
+
+    Handles a model that never ran on this recording (uploaded before the
+    model existed, or toggled on afterward): if there's no row yet, one is
+    created. An existing row is reset in place rather than duplicated -- the
+    pipelines look a run up by (audio_file_id, model_id) with `.one_or_none()`
+    and nothing in the schema enforces uniqueness, so a second row would break
+    every subsequent job for that model. Either way the row ends up identical
+    to one `upload.py` just created, which is what the worker expects.
+    """
+    audio_file = _get_audio_file(db, audio_file_id, current_user)
+    if model_id not in REGISTRY:
+        raise HTTPException(status_code=404, detail=f"Unknown model {model_id!r}")
+
+    result = db.query(EvaluationResult).filter_by(audio_file_id=audio_file.id, model_id=model_id).one_or_none()
+    if result is None:
+        # New run for a model that never ran here. Don't enqueue a job the
+        # pipeline can't feed: each lane reads the audio from its own store,
+        # and an old upload only lives in one of them. (An existing row already
+        # ran once, so its storage was valid -- no need to re-check on reset.)
+        lane = lane_for(model_id)
+        if lane == "local" and not audio_file.s3_key:
+            raise HTTPException(status_code=400, detail=f"Model {model_id!r} needs a local-lane upload; this recording has none")
+        if lane == "azure" and not (audio_file.blob_key or audio_file.blob_url):
+            raise HTTPException(status_code=400, detail=f"Model {model_id!r} needs an Azure-lane upload; this recording has none")
+        result = EvaluationResult(audio_file_id=audio_file.id, model_id=model_id, status="queued")
+        db.add(result)
+    else:
+        if result.status in ("queued", "running"):
+            raise HTTPException(status_code=409, detail=f"Model {model_id!r} is already {result.status}")
+        result.status = "queued"
+        result.error = None
+        result.payload = None
+        result.loading_started_at = None
+        result.started_at = None
+        result.finished_at = None
+        result.processing_ms = None
+    db.commit()
+
+    queue.enqueue(run_model, audio_file.id, model_id)
+    logger.info("Queued model %r for audio_file_id=%s", model_id, audio_file.id)
     return _build_evaluation(db, audio_file)
 
 

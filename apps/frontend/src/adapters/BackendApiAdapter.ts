@@ -108,6 +108,15 @@ export async function patchUploadTiming(audioFileId: number, uploadMs: number): 
   return BackendApiAdapter.adapt(await response.json());
 }
 
+/** Requeue one model against the audio already uploaded, leaving the other models' runs alone. */
+export async function retryModel(audioFileId: number, modelId: string): Promise<DiarizationEvaluation> {
+  const response = await fetch(`${API_BASE_URL}/evaluations/${audioFileId}/models/${encodeURIComponent(modelId)}/retry`, {
+    method: "POST",
+  });
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return BackendApiAdapter.adapt(await response.json());
+}
+
 /** One origin for playback and waveform decoding — the API streams from whichever lane owns the audio. */
 export function audioStreamUrl(audioFileId: number): string {
   return `${API_BASE_URL}/evaluations/${audioFileId}/audio`;

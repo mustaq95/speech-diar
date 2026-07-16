@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { ReactNode } from "react";
 import type { Metric } from "../types";
 
@@ -157,16 +158,62 @@ export function IconButton({
   onClick,
   primary = false,
   disabled = false,
+  className = "",
 }: {
   children: ReactNode;
   label: string;
   onClick: () => void;
   primary?: boolean;
   disabled?: boolean;
+  className?: string;
 }) {
   return (
-    <button className={`icon-btn ${primary ? "is-primary" : ""}`} type="button" aria-label={label} title={label} onClick={onClick} disabled={disabled}>
+    <button className={`icon-btn ${primary ? "is-primary" : ""} ${className}`} type="button" aria-label={label} title={label} onClick={onClick} disabled={disabled}>
       {children}
     </button>
+  );
+}
+
+/** Re-run one model, with a confirm step so a stray click can't discard a
+ * result. State is per-instance: each row asks its own question, and nothing
+ * has to be lifted into the timeline or the processing grid. */
+export function RetryControls({
+  modelId,
+  onRetry,
+  className = "",
+}: {
+  modelId: string;
+  onRetry: (modelId: string) => Promise<void>;
+  className?: string;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  // Blocks a second click from enqueuing a duplicate job for the same run
+  // before the first response lands.
+  const [pending, setPending] = useState(false);
+
+  const confirm = async () => {
+    setConfirming(false);
+    setPending(true);
+    try {
+      await onRetry(modelId);
+    } catch (error) {
+      console.error("Retry failed:", error);
+      window.alert(`Could not re-run this model: ${(error as Error).message}`);
+    } finally {
+      setPending(false);
+    }
+  };
+
+  return (
+    <div className={`retry-controls ${className}`}>
+      {confirming ? (
+        <>
+          <IconButton label="Confirm re-run" className="is-confirm" onClick={() => void confirm()}>✓</IconButton>
+          <IconButton label="Cancel re-run" className="is-cancel" onClick={() => setConfirming(false)}>✕</IconButton>
+        </>
+      ) : (
+        <IconButton label="Re-run this model" onClick={() => setConfirming(true)} disabled={pending}>↻</IconButton>
+      )}
+    </div>
   );
 }

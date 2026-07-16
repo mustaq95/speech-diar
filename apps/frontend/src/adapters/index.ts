@@ -15,6 +15,7 @@ export {
   fetchModelStatus,
   fetchRuntimeConfig,
   patchUploadTiming,
+  retryModel,
   uploadAudio,
 } from "./BackendApiAdapter";
 export { MockDiarizationAdapter, loadMockEvaluation } from "./MockDiarizationAdapter";
@@ -43,7 +44,7 @@ export function getDiarizationEvaluation(source: DiarizationSourceId = ACTIVE_SO
 // Defaults are derived from whatever models the active source returned, so a
 // new backend never requires touching the UI's state wiring.
 
-const FALLBACK_PARAMS: ModelParams = { min: 1, max: 8, thr: 0.65, ovl: true };
+export const FALLBACK_PARAMS: ModelParams = { min: 1, max: 8, thr: 0.65, ovl: true };
 
 export function deriveDefaultActive(evaluation: DiarizationEvaluation): ActiveMap {
   return Object.fromEntries(evaluation.models.map((model) => [model.id, true]));

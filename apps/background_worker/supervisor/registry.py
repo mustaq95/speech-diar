@@ -58,6 +58,16 @@ def _registry() -> dict[str, ManagedContainer]:
             cold_start_timeout_sec=settings.vibevoice_cold_start_timeout_sec,
             requires_exclusive_gpu=True,
         ),
+        # No requires_exclusive_gpu: unlike vibevoice, MOSS is 0.9B (~2GiB in
+        # bf16) and its vLLM engine is pinned to a fixed fraction of the device
+        # (MOSS_TRANSCRIBE_GPU_MEM_UTIL=0.10), so it co-resides with another
+        # model under the residency cap rather than demanding the whole GPU.
+        "moss-transcribe": ManagedContainer(
+            model_id="moss-transcribe",
+            container_name="moss-transcribe",
+            health_url="http://localhost:9024/health",
+            cold_start_timeout_sec=settings.moss_transcribe_cold_start_timeout_sec,
+        ),
         "nim-sortformer-str": ManagedContainer(
             model_id="nim-sortformer-str",
             container_name="parakeet-nim-str",

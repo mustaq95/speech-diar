@@ -4,9 +4,11 @@ fabricated.
 """
 
 import io
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
+from rq import Queue
 from sqlalchemy.orm import Session, sessionmaker
 
 from packages.database.models import AudioFile, EvaluationResult
@@ -304,3 +306,154 @@ def test_audio_proxy_gives_up_after_max_retries(
 
     with pytest.raises(Exception):
         client.get(f"/evaluations/{audio_file_id}/audio")
+
+
+def test_retry_failed_model_resets_row_and_enqueues(
+    client: TestClient, db_session_factory: sessionmaker[Session], fake_queue: Queue
+) -> None:
+    """A failed run goes back to a clean `queued` row -- identical to what
+    upload.py creates -- plus exactly one new job."""
+    audio_file_id = _seed_audio_file(db_session_factory, s3_key="audio/1.wav")
+    with db_session_factory() as session:
+        session.add(
+            EvaluationResult(
+                audio_file_id=audio_file_id,
+                model_id="pyannote",
+                status="failed",
+                error="CUDA out of memory",
+                started_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                finished_at=datetime(2026, 1, 1, 0, 0, 4, tzinfo=timezone.utc),
+                processing_ms=4000,
+            )
+        )
+        session.commit()
+
+    response = client.post(f"/evaluations/{audio_file_id}/models/pyannote/retry")
+    assert response.status_code == 200
+
+    model = response.json()["models"][0]
+    assert model["status"] == "queued"
+    assert model["error"] is None
+    assert model["processingMs"] is None
+
+    with db_session_factory() as session:
+        rows = session.query(EvaluationResult).filter_by(audio_file_id=audio_file_id, model_id="pyannote").all()
+        assert len(rows) == 1, "retry must reset the row in place, never insert a second one"
+        assert rows[0].status == "queued"
+        assert rows[0].error is None
+        assert rows[0].started_at is None
+        assert rows[0].finished_at is None
+        assert rows[0].processing_ms is None
+
+    assert fake_queue.count == 1
+    job = fake_queue.jobs[0]
+    assert job.args == (audio_file_id, "pyannote")
+
+
+def test_retry_done_model_clears_payload(
+    client: TestClient, db_session_factory: sessionmaker[Session], fake_queue: Queue
+) -> None:
+    """Re-running a successful model drops its segments -- the UI confirms
+    before calling this."""
+    audio_file_id = _seed_audio_file(db_session_factory)
+    payload = {"id": "pyannote", "name": "pyannote", "short": "pya", "description": "", "segs": [{"spk": 0, "s": 0.0, "e": 1.0}], "numSpk": 1}
+    with db_session_factory() as session:
+        session.add(EvaluationResult(audio_file_id=audio_file_id, model_id="pyannote", status="done", payload=payload))
+        session.commit()
+
+    response = client.post(f"/evaluations/{audio_file_id}/models/pyannote/retry")
+    assert response.status_code == 200
+    assert response.json()["models"][0]["status"] == "queued"
+
+    with db_session_factory() as session:
+        row = session.query(EvaluationResult).filter_by(audio_file_id=audio_file_id, model_id="pyannote").one()
+        assert row.payload is None
+    assert fake_queue.count == 1
+
+
+@pytest.mark.parametrize("status", ["queued", "running"])
+def test_retry_in_flight_model_conflicts(
+    client: TestClient, db_session_factory: sessionmaker[Session], fake_queue: Queue, status: str
+) -> None:
+    """Requeueing a run that is already in flight would put two workers on the
+    same row."""
+    audio_file_id = _seed_audio_file(db_session_factory)
+    with db_session_factory() as session:
+        session.add(EvaluationResult(audio_file_id=audio_file_id, model_id="pyannote", status=status))
+        session.commit()
+
+    response = client.post(f"/evaluations/{audio_file_id}/models/pyannote/retry")
+    assert response.status_code == 409
+    assert fake_queue.count == 0
+
+
+def test_retry_unknown_model_404s(
+    client: TestClient, db_session_factory: sessionmaker[Session], fake_queue: Queue
+) -> None:
+    audio_file_id = _seed_audio_file(db_session_factory)
+    response = client.post(f"/evaluations/{audio_file_id}/models/never-ran/retry")
+    assert response.status_code == 404
+    assert fake_queue.count == 0
+
+
+def test_retry_unknown_evaluation_404s(client: TestClient, fake_queue: Queue) -> None:
+    response = client.post("/evaluations/9999/models/pyannote/retry")
+    assert response.status_code == 404
+    assert fake_queue.count == 0
+
+
+def test_retry_leaves_other_models_untouched(
+    client: TestClient, db_session_factory: sessionmaker[Session]
+) -> None:
+    """The whole point of a per-model retry: the models that succeeded keep
+    their results."""
+    audio_file_id = _seed_audio_file(db_session_factory)
+    payload = {"id": "sherpa-onnx", "name": "sherpa", "short": "sha", "description": "", "segs": [{"spk": 0, "s": 0.0, "e": 2.0}], "numSpk": 1}
+    with db_session_factory() as session:
+        session.add(EvaluationResult(audio_file_id=audio_file_id, model_id="pyannote", status="failed", error="boom"))
+        session.add(EvaluationResult(audio_file_id=audio_file_id, model_id="sherpa-onnx", status="done", payload=payload))
+        session.commit()
+
+    response = client.post(f"/evaluations/{audio_file_id}/models/pyannote/retry")
+    assert response.status_code == 200
+
+    by_id = {model["id"]: model for model in response.json()["models"]}
+    assert by_id["pyannote"]["status"] == "queued"
+    assert by_id["sherpa-onnx"]["status"] == "done"
+    assert len(by_id["sherpa-onnx"]["segs"]) == 1
+
+
+def test_retry_creates_row_for_never_run_model(
+    client: TestClient, db_session_factory: sessionmaker[Session], fake_queue: Queue
+) -> None:
+    """A model toggled on for an old recording (uploaded before the model
+    existed) has no row yet -- retry creates one queued run and enqueues it."""
+    audio_file_id = _seed_audio_file(db_session_factory, s3_key="audio/1.wav")
+    # No EvaluationResult for moss-transcribe on this audio.
+
+    response = client.post(f"/evaluations/{audio_file_id}/models/moss-transcribe/retry")
+    assert response.status_code == 200
+    by_id = {m["id"]: m for m in response.json()["models"]}
+    assert by_id["moss-transcribe"]["status"] == "queued"
+
+    with db_session_factory() as session:
+        rows = session.query(EvaluationResult).filter_by(audio_file_id=audio_file_id, model_id="moss-transcribe").all()
+        assert len(rows) == 1
+        assert rows[0].status == "queued"
+
+    assert fake_queue.count == 1
+    assert fake_queue.jobs[0].args == (audio_file_id, "moss-transcribe")
+
+
+def test_retry_new_model_lane_mismatch_400(
+    client: TestClient, db_session_factory: sessionmaker[Session], fake_queue: Queue
+) -> None:
+    """An azure-lane model can't run on a local-only upload -- reject instead
+    of enqueuing a job the pipeline can't feed."""
+    audio_file_id = _seed_audio_file(db_session_factory, s3_key="audio/1.wav")  # local lane only, no blob
+
+    response = client.post(f"/evaluations/{audio_file_id}/models/azure-batch/retry")
+    assert response.status_code == 400
+    assert fake_queue.count == 0
+    with db_session_factory() as session:
+        assert session.query(EvaluationResult).filter_by(audio_file_id=audio_file_id, model_id="azure-batch").count() == 0

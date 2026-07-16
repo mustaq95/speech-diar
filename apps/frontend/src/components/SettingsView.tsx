@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import type { ActiveMap, AvailableMap, EvalConfig, Metric, ModelRun, ParamMap, Project } from "../types";
+import { FALLBACK_PARAMS } from "../adapters";
 import { SPEAKER_COLORS } from "../data";
 import { SegmentedMetric, SelectControl, SliderControl, Stepper, Toggle, WaveGlyph } from "./controls";
 
@@ -119,7 +120,10 @@ export function SettingsView({
         {models.map((model) => {
           const isAvailable = available[model.id] ?? false;
           const on = active[model.id] && isAvailable;
-          const p = params[model.id];
+          // A model toggled on for an old recording that predates it has no
+          // params entry (params derive from the evaluation's models); fall
+          // back so the disabled placeholder body renders instead of crashing.
+          const p = params[model.id] ?? FALLBACK_PARAMS;
           return (
             <article key={model.id} className={`model-card ${isAvailable ? "" : "is-unavailable"}`}>
               <div className="model-card-head">

@@ -4,7 +4,7 @@ import type { ModelContainerStatus } from "../types/diarization";
 import { SPEAKER_COLORS } from "../data";
 import { activeSpeakers, fmt, hexA, overlapsFor } from "../utils";
 import { isInFlight, modelTimingLabel } from "../timing";
-import { IconButton } from "./controls";
+import { IconButton, RetryControls } from "./controls";
 import { LifecycleChip } from "./LifecycleChip";
 
 /** Percent along the timeline, safe when there's no duration yet (nothing loaded). */
@@ -42,6 +42,8 @@ interface StudioProps {
   onToggle: () => void;
   onStep: (dir: -1 | 1) => void;
   onSeek: (time: number) => void;
+  /** Undefined for the demo and the pre-upload catalog shell — no real run to requeue. */
+  onRetry?: (modelId: string) => Promise<void>;
   playheadRef: (node: HTMLDivElement | null) => void;
   waveFillRef: (node: HTMLDivElement | null) => void;
   clockRef: (node: HTMLElement | null) => void;
@@ -222,6 +224,7 @@ export function Studio({
   onToggle,
   onStep,
   onSeek,
+  onRetry,
   playheadRef,
   waveFillRef,
   clockRef,
@@ -288,6 +291,14 @@ export function Studio({
               </span>
             </div>
             <small className="model-timing">{modelTimingLabel(model, duration, now)}</small>
+            {/* Same corner for anything not in flight: a finished run (done or
+                failed) to re-run, or a never-run shell (no status — a model
+                toggled on that hasn't run here yet) to run for the first time.
+                `onRetry` is only set for a real, non-demo evaluation, so the
+                pre-upload catalog shells (also status-less) never show it. */}
+            {onRetry && model.status !== "queued" && model.status !== "running" && (
+              <RetryControls modelId={model.id} onRetry={onRetry} className="in-gutter" />
+            )}
           </div>
         ))}
         <div className="studio-scroll" ref={scrollRef}>

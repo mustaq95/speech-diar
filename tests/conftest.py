@@ -95,6 +95,7 @@ def client(db_session_factory: sessionmaker[Session], fake_queue: Queue, monkeyp
 
     app.dependency_overrides[get_db] = override_get_db
     monkeypatch.setattr("apps.backend_api.routers.upload.queue", fake_queue)
+    monkeypatch.setattr("apps.backend_api.routers.evaluations.queue", fake_queue)
     test_client = TestClient(app)
     try:
         yield test_client

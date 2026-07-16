@@ -23,6 +23,7 @@ import {
   mergeActiveWithCatalog,
   modelRunFromMetadata,
   patchUploadTiming,
+  retryModel,
   uploadAudio,
 } from "./adapters";
 import { speakerSignature, decodeWaveformPeaks } from "./playback";
@@ -76,6 +77,11 @@ export default function App() {
   const [uploadName, setUploadName] = useState("");
   const [wavePeaks, setWavePeaks] = useState<number[]>(FLAT_WAVE_PEAKS);
   const [nowTick, setNowTick] = useState(() => Date.now());
+  // Audio is primary; the waveform is best-effort. `audioReady` gates the
+  // heavy waveform decode so it never competes with the audio element's own
+  // load. `audioNotice` replaces blocking alerts on the recovery path.
+  const [audioReady, setAudioReady] = useState(false);
+  const [audioNotice, setAudioNotice] = useState<string | null>(null);
 
   const timeRef = useRef(0);
   const playingRef = useRef(false);
@@ -94,6 +100,7 @@ export default function App() {
 
   const playableUrl = evaluation && !isDemo ? audioStreamUrl(evaluation.audioFileId) : null;
   const hasInFlight = useMemo(() => models.some(isInFlight), [models]);
+  const hasFailed = useMemo(() => models.some((model) => model.status === "failed"), [models]);
 
   const events = useMemo(() => buildEvents(models), [models]);
   const shownModels = useMemo(() => models.filter((model) => active[model.id]), [active, models]);
@@ -101,7 +108,15 @@ export default function App() {
   const durationText = fmt(duration);
   // Dashboard always shows the Studio shell; before anything is uploaded it
   // falls back to the configured model catalog so the layout looks the same.
-  const dashboardModels = evaluation ? models : catalogModels;
+  // With an evaluation open, append any model the user toggled on that never
+  // ran here (e.g. a model added after this recording was uploaded) as a
+  // shell row, so it shows immediately and can be run via the ↻ button.
+  const dashboardModels = useMemo(() => {
+    if (!evaluation) return catalogModels;
+    const present = new Set(models.map((model) => model.id));
+    const extra = catalogModels.filter((model) => active[model.id] && !present.has(model.id));
+    return extra.length ? [...models, ...extra] : models;
+  }, [evaluation, models, catalogModels, active]);
 
   // Fetch the real, honest model registry and runtime config once at boot.
   useEffect(() => {
@@ -161,9 +176,13 @@ export default function App() {
   // Auto-advance from the dedicated processing screen once every model has settled.
   // Navigation is intentionally left untouched here: when "open dashboard on upload"
   // is off, the user decides when to switch to the Dashboard tab to see results.
+  //
+  // A failure holds the screen open: the per-model re-run button lives on these
+  // cards, so dismissing on settle would pull it away exactly when it's wanted.
+  // The Dashboard tab is still one click away, so nobody is stuck here.
   useEffect(() => {
-    if (workflow === "processing" && evaluation && !hasInFlight) setWorkflow("idle");
-  }, [workflow, evaluation, hasInFlight]);
+    if (workflow === "processing" && evaluation && !hasInFlight && !hasFailed) setWorkflow("idle");
+  }, [workflow, evaluation, hasInFlight, hasFailed]);
 
   // The saved project's speaker count is captured at upload time (before any
   // model has run) — refresh it once processing settles so the Projects list
@@ -189,11 +208,15 @@ export default function App() {
   }, [hasInFlight]);
 
   // Real waveform: decode the actual audio bytes once per evaluation (never a synthetic shape).
+  // Deferred until the audio element has validated its source (`audioReady`),
+  // so the full-file decode never competes with audio's own load. On a long
+  // file under heavy load that race is what left the audio unplayable.
   useEffect(() => {
     if (!playableUrl) {
       setWavePeaks(FLAT_WAVE_PEAKS);
       return;
     }
+    if (!audioReady) return;
     let cancelled = false;
     const bars = Math.min(MAX_WAVE_BARS, Math.max(MIN_WAVE_BARS, Math.round((duration * MIN_PX_PER_SEC) / TARGET_PX_PER_BAR)));
     decodeWaveformPeaks(playableUrl, bars)
@@ -203,7 +226,7 @@ export default function App() {
         if (!cancelled) setWavePeaks(FLAT_WAVE_PEAKS);
       });
     return () => { cancelled = true; };
-  }, [playableUrl, duration]);
+  }, [playableUrl, duration, audioReady]);
 
   const syncDom = useCallback((nextTime = timeRef.current) => {
     const pct = duration > 0 ? nextTime / duration : 0;
@@ -376,6 +399,35 @@ export default function App() {
       });
   }, [active, catalogModels, projects, streamInline]);
 
+  // Play, self-healing under load. "No supported sources" means the browser
+  // abandoned a source that stalled (networkState NETWORK_NO_SOURCE); a fresh
+  // load() re-arms it. Retry a couple of times, waiting for `canplay` rather
+  // than hammering play(), and restore the intended position so a reload
+  // doesn't jump back to 0. Only after retries are spent do we tell the user,
+  // inline, never a blocking alert.
+  const attemptPlay = useCallback((targetTime: number, tries = 0) => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    audio.play().then(() => {
+      setAudioNotice(null);
+      if (Math.abs(audio.currentTime - targetTime) > 0.3) audio.currentTime = targetTime;
+    }).catch((error: Error) => {
+      if (tries >= 2) {
+        console.error("Audio play failed after retries:", error);
+        setPlaying(false);
+        setAudioNotice("Audio is still loading under heavy processing — press play again in a moment.");
+        return;
+      }
+      const onReady = () => {
+        audio.removeEventListener("canplay", onReady);
+        audio.currentTime = targetTime;
+        attemptPlay(targetTime, tries + 1);
+      };
+      audio.addEventListener("canplay", onReady, { once: true });
+      audio.load();
+    });
+  }, []);
+
   const openProject = (project: Project) => {
     const requestId = ++openRequestRef.current;
     audioRef.current?.pause();
@@ -404,6 +456,20 @@ export default function App() {
         setCurrent(null);
       });
   };
+
+  // Requeue one model against the audio already uploaded. The response carries
+  // that model back as `queued`, which flips `hasInFlight` and re-arms the poll
+  // effect above on its own — no separate refresh needed.
+  const handleRetry = useCallback(
+    async (modelId: string) => {
+      if (!evaluation) return;
+      const next = await retryModel(evaluation.audioFileId, modelId);
+      setEvaluation((prev) =>
+        prev && prev.audioFileId === next.audioFileId ? { ...next, uploadMs: prev.uploadMs ?? next.uploadMs } : prev,
+      );
+    },
+    [evaluation],
+  );
 
   // Clears the loaded session and sends the user to a fresh Upload tab —
   // used by "+ New recording", not by the Upload tab button itself (which
@@ -457,16 +523,22 @@ export default function App() {
   return (
     <div className="app">
       {catalogError && <div className="catalog-error">{catalogError}</div>}
+      {audioNotice && <div className="catalog-error" onClick={() => setAudioNotice(null)}>{audioNotice}</div>}
       {playableUrl && (
         <audio
           ref={audioRef}
           src={playableUrl}
           preload="metadata"
+          onLoadStart={() => setAudioReady(false)}
+          onLoadedMetadata={() => setAudioReady(true)}
+          onCanPlay={() => setAudioReady(true)}
           onEnded={() => setPlaying(false)}
           onError={() => {
+            // Non-fatal: a transient stream hiccup under load shouldn't crash
+            // playback. Re-arm the element for the next interaction; the play
+            // retry path recovers an active session. No blocking alert.
             console.error("Audio playback error:", audioRef.current?.error);
-            setPlaying(false);
-            window.alert("Audio playback failed — the stream may have been interrupted.");
+            audioRef.current?.load();
           }}
         />
       )}
@@ -519,7 +591,7 @@ export default function App() {
       )}
       {nav === "upload" && workflow === "uploading" && <UploadingScreen fileName={uploadName} pct={uploadPct} />}
       {nav === "upload" && workflow === "processing" && evaluation && (
-        <ProcessingScreen models={evaluation.models} durationSec={evaluation.durationSec} now={nowTick} />
+        <ProcessingScreen models={evaluation.models} durationSec={evaluation.durationSec} now={nowTick} onRetry={handleRetry} />
       )}
       {nav === "dashboard" && workflow !== "loading" && (
         <main className="dashboard">
@@ -549,25 +621,23 @@ export default function App() {
               zoom={zoom}
               playing={playing}
               now={nowTick}
+              onRetry={evaluation && !isDemo ? handleRetry : undefined}
               onToggle={() => {
                 if (timeRef.current >= duration) setPlaybackTime(0);
-                setPlaying((value) => {
-                  const next = !value;
-                  const audio = audioRef.current;
-                  if (audio && playableUrl) {
-                    if (next) {
-                      if (timeRef.current >= duration) audio.currentTime = 0;
-                      void audio.play().catch((error: Error) => {
-                        console.error(error);
-                        window.alert(`Could not play audio: ${error.message}`);
-                        setPlaying(false);
-                      });
-                    } else {
-                      audio.pause();
-                    }
+                // Side effects stay out of the state updater: React double-invokes
+                // updaters in StrictMode, which would fire two play/retry chains.
+                const next = !playing;
+                setPlaying(next);
+                const audio = audioRef.current;
+                if (audio && playableUrl) {
+                  if (next) {
+                    const target = timeRef.current >= duration ? 0 : timeRef.current;
+                    if (timeRef.current >= duration) audio.currentTime = 0;
+                    attemptPlay(target);
+                  } else {
+                    audio.pause();
                   }
-                  return next;
-                });
+                }
               }}
               onStep={step}
               onSeek={(next) => setPlaybackTime(next)}

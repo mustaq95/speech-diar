@@ -159,6 +159,21 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .fail-mark { width: 16px; height: 16px; border-radius: 50%; background: rgba(240,90,90,.15); color: #f05a5a; display: inline-flex; align-items: center; justify-content: center; font-size: 11px; }
 .processing-card-head > div { display: flex; align-items: center; gap: 10px; }
 .processing-card p { margin: 9px 0 0; color: #7a869c; font-size: 11.5px; font-family: "IBM Plex Mono", ui-monospace, monospace; }
+/* Re-run controls: smaller than the transport's 32px circles so they sit
+   inside a card without competing with the model name. The confirm tick is
+   accented and the cancel cross is muted, so neither reads as the ✕ fail-mark
+   sitting a few pixels to the left. */
+.retry-controls { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.retry-controls .icon-btn { width: 24px; height: 24px; font-size: 11px; }
+/* The gutter stacks name/speakers/timing into a short row, so the control sits
+   inline with the timing line rather than claiming a fourth one. */
+/* Pinned to the card's bottom-right, same spot for every finished model.
+   The card's content is vertically centred, so padding-bottom lifts it clear
+   of the button instead of letting a long failure label run underneath. */
+.retry-controls.in-gutter { position: absolute; right: 12px; bottom: 8px; }
+.retry-controls.in-gutter .icon-btn { width: 20px; height: 20px; font-size: 10px; }
+.retry-controls .icon-btn.is-confirm { border-color: rgba(76,154,255,.5); background: rgba(76,154,255,.15); color: var(--accent); }
+.retry-controls .icon-btn.is-cancel { color: #7a869c; }
 .done-mark { width: 16px; height: 16px; border-radius: 50%; background: rgba(52,211,153,.15); color: var(--good); display: inline-flex; align-items: center; justify-content: center; font-size: 11px; }
 .dashboard { flex: 1; display: flex; flex-direction: column; padding: 16px 20px 24px; gap: 14px; min-height: 0; }
 .config-bar { border-radius: 10px; padding: 10px 14px; }
@@ -178,7 +193,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .gutter-ruler { grid-column: 1; grid-row: 1; height: 30px; border-bottom: 1px solid var(--line); }
 .gutter-transport { grid-column: 1; grid-row: 2; border-bottom: 1px solid var(--line); }
 .gutter-transport .transport { height: 100%; border-bottom: 0; }
-.gutter-model { grid-column: 1; border-top: 1px solid var(--line); padding: 0 14px; display: flex; flex-direction: column; justify-content: center; gap: 6px; overflow: hidden; min-height: 0; }
+.gutter-model { position: relative; grid-column: 1; border-top: 1px solid var(--line); padding: 0 14px 22px; display: flex; flex-direction: column; justify-content: center; gap: 6px; overflow: hidden; min-height: 0; }
 .model-row-gap { margin-top: 8px; }
 .transport-buttons { display: flex; align-items: center; gap: 9px; }
 .icon-btn { width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--line-2); background: #171c27; color: #cfd6e4; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; font-size: 12px; }

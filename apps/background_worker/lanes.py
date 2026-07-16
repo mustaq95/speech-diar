@@ -22,6 +22,7 @@ LANE_MAP: dict[str, Lane] = {
     "diarizen": "local",
     "vibevoice": "local",
     "pyannote-3-1": "local",
+    "moss-transcribe": "local",
 }
 
 
