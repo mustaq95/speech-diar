@@ -26,7 +26,13 @@ export const BackendApiAdapter: DiarizationAdapter<BackendEvaluationPayload> = {
 
 async function errorDetail(response: Response): Promise<string> {
   const parsed = await response.json().catch(() => null);
-  return (parsed && typeof parsed === "object" && "detail" in parsed && String(parsed.detail)) || `Request failed with status ${response.status}`;
+  if (parsed && typeof parsed === "object" && "detail" in parsed) {
+    const detail = (parsed as { detail: unknown }).detail;
+    // FastAPI validation errors (422) return `detail` as an array of objects,
+    // not a string — stringify it so callers never surface "[object Object]".
+    if (detail != null) return typeof detail === "string" ? detail : JSON.stringify(detail);
+  }
+  return `Request failed with status ${response.status}`;
 }
 
 /** Runtime settings the frontend can pick up without a rebuild (see backend `GET /config`). */
@@ -115,6 +121,15 @@ export async function retryModel(audioFileId: number, modelId: string): Promise<
   });
   if (!response.ok) throw new Error(await errorDetail(response));
   return BackendApiAdapter.adapt(await response.json());
+}
+
+/** Delete a recording and all its backend evidence (DB rows + stored audio).
+ * Idempotent: a 404 means it's already gone, which is success from the caller's
+ * point of view (e.g. a stale localStorage card whose row was already removed). */
+export async function deleteEvaluation(audioFileId: number): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/evaluations/${audioFileId}`, { method: "DELETE" });
+  if (response.status === 404) return;
+  if (!response.ok) throw new Error(await errorDetail(response));
 }
 
 /** One origin for playback and waveform decoding — the API streams from whichever lane owns the audio. */

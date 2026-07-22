@@ -10,6 +10,7 @@ export {
   API_BASE_URL,
   BackendApiAdapter,
   audioStreamUrl,
+  deleteEvaluation,
   fetchEvaluation,
   fetchModelCatalog,
   fetchModelStatus,

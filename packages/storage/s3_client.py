@@ -72,3 +72,9 @@ def download_to(key: str, path: Path) -> None:
     """Download an object to a local path — a worker scratch file for engines
     that need a real path on disk (deleted by the caller when done)."""
     _client().download_file(get_settings().s3_bucket, key, str(path))
+
+
+def delete_object(key: str) -> None:
+    """Remove an object — used when a recording is deleted. S3/MinIO treats
+    deleting a missing key as a no-op, so this is safe to call unconditionally."""
+    _client().delete_object(Bucket=get_settings().s3_bucket, Key=key)

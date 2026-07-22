@@ -174,6 +174,46 @@ export function IconButton({
   );
 }
 
+/** Delete one project, with a confirm step so a stray click can't destroy a
+ * recording. Same inline pattern as RetryControls: per-instance state, no
+ * modal. `stopPropagation` keeps a click inside here from opening the row. */
+export function DeleteControls({
+  onDelete,
+  className = "",
+}: {
+  onDelete: () => Promise<void>;
+  className?: string;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  const [pending, setPending] = useState(false);
+
+  const confirm = async () => {
+    setConfirming(false);
+    setPending(true);
+    try {
+      await onDelete();
+    } catch (error) {
+      console.error("Delete failed:", error);
+      window.alert(`Could not delete this recording: ${(error as Error).message}`);
+    } finally {
+      setPending(false);
+    }
+  };
+
+  return (
+    <div className={`delete-controls ${className}`} onClick={(event) => event.stopPropagation()}>
+      {confirming ? (
+        <>
+          <IconButton label="Confirm delete" className="is-cancel" onClick={() => void confirm()}>✓</IconButton>
+          <IconButton label="Keep recording" onClick={() => setConfirming(false)}>✕</IconButton>
+        </>
+      ) : (
+        <IconButton label="Delete this recording" onClick={() => setConfirming(true)} disabled={pending}>🗑</IconButton>
+      )}
+    </div>
+  );
+}
+
 /** Re-run one model, with a confirm step so a stray click can't discard a
  * result. State is per-instance: each row asks its own question, and nothing
  * has to be lifted into the timeline or the processing grid. */

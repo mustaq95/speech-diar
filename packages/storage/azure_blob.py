@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import BinaryIO
 
+from azure.core.exceptions import ResourceNotFoundError
 from azure.storage.blob import BlobSasPermissions, BlobServiceClient, generate_blob_sas
 
 from packages.config.settings import get_settings
@@ -93,6 +94,16 @@ def open_stream(blob_key: str, start: int = 0):
     client = _service()
     blob = client.get_blob_client(settings.azure_storage_container_name, blob_key)
     return blob.download_blob(offset=start)
+
+
+def delete_blob(key: str) -> None:
+    """Remove a blob — used when a recording is deleted (and no other
+    recording still references this content-addressed key). A blob that's
+    already gone is a no-op, not an error."""
+    try:
+        _container().get_blob_client(key).delete_blob()
+    except ResourceNotFoundError:
+        pass
 
 
 def blob_size(blob_key: str) -> int:

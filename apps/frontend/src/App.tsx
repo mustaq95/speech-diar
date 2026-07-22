@@ -10,9 +10,11 @@ import { MIN_PX_PER_SEC, Studio } from "./components/Studio";
 import { TopBar } from "./components/TopBar";
 import { UploadingScreen } from "./components/UploadingScreen";
 import { boundsFor, buildEvents, fmt, loadModelActive, loadProjects, saveModelActive, saveProjects } from "./utils";
+import { buildReportHtml, computeReport, downloadReport, type ReportEntry } from "./report";
 import {
   DEMO_AUDIO_FILE_ID,
   audioStreamUrl,
+  deleteEvaluation,
   deriveDefaultEval,
   deriveDefaultParams,
   fetchEvaluation,
@@ -184,14 +186,16 @@ export default function App() {
     if (workflow === "processing" && evaluation && !hasInFlight && !hasFailed) setWorkflow("idle");
   }, [workflow, evaluation, hasInFlight, hasFailed]);
 
-  // The saved project's speaker count is captured at upload time (before any
-  // model has run) — refresh it once processing settles so the Projects list
-  // doesn't keep showing a stale "0 speakers detected".
+  // The saved project's speaker and model counts are captured at upload time
+  // (before any model has run) — refresh them from the real evaluation once it
+  // settles so the Projects list doesn't keep showing a stale "0 speakers
+  // detected" or a model count that a later per-model retry has since changed.
   useEffect(() => {
     if (!evaluation || isDemo || hasInFlight || !current || current.audioFileId !== evaluation.audioFileId) return;
     const speakers = Math.max(0, ...evaluation.models.map((run) => run.numSpk));
-    if (speakers === current.speakers) return;
-    const updated: Project = { ...current, speakers };
+    const modelCount = evaluation.models.length;
+    if (speakers === current.speakers && modelCount === current.models) return;
+    const updated: Project = { ...current, speakers, models: modelCount };
     setCurrent(updated);
     setProjects((prev) => {
       const next = prev.map((project) => (project.id === updated.id ? updated : project));
@@ -199,6 +203,56 @@ export default function App() {
       return next;
     });
   }, [evaluation, isDemo, hasInFlight, current]);
+
+  // Keep a ref to the latest projects so the reconcile effect below can depend
+  // on `nav` alone — it also updates `projects`, so depending on `projects`
+  // would loop.
+  const projectsRef = useRef(projects);
+  useEffect(() => { projectsRef.current = projects; }, [projects]);
+
+  // On entering the Projects tab, refresh each row's model + speaker counts from
+  // the real backend evaluation. `project.models` is a localStorage snapshot
+  // taken at upload; running or retrying models later changes the true run
+  // count, and the list must reflect that for every recording — not just the
+  // one currently open (which the effect above already keeps live). Fetches run
+  // in parallel; rows update as they resolve. A stale card whose backend row is
+  // gone (404) is left untouched.
+  useEffect(() => {
+    if (nav !== "projects") return;
+    let cancelled = false;
+    const snapshot = projectsRef.current.filter((project) => Number.isFinite(project.audioFileId));
+    Promise.all(
+      snapshot.map(async (project) => {
+        try {
+          const evalr = await fetchEvaluation(project.audioFileId);
+          return {
+            id: project.id,
+            models: evalr.models.length,
+            speakers: Math.max(0, ...evalr.models.map((run) => run.numSpk)),
+          };
+        } catch {
+          return null;
+        }
+      }),
+    ).then((results) => {
+      if (cancelled) return;
+      const byId = new Map(results.filter((r): r is NonNullable<typeof r> => r !== null).map((r) => [r.id, r]));
+      setProjects((prev) => {
+        let changed = false;
+        const next = prev.map((project) => {
+          const fresh = byId.get(project.id);
+          if (fresh && (fresh.models !== project.models || fresh.speakers !== project.speakers)) {
+            changed = true;
+            return { ...project, models: fresh.models, speakers: fresh.speakers };
+          }
+          return project;
+        });
+        if (changed) saveProjects(next);
+        return changed ? next : prev;
+      });
+    });
+    return () => { cancelled = true; };
+  }, [nav]);
 
   // Live "now" for elapsed-time labels, ticking only while something is running.
   useEffect(() => {
@@ -208,9 +262,9 @@ export default function App() {
   }, [hasInFlight]);
 
   // Real waveform: decode the actual audio bytes once per evaluation (never a synthetic shape).
-  // Deferred until the audio element has validated its source (`audioReady`),
-  // so the full-file decode never competes with audio's own load. On a long
-  // file under heavy load that race is what left the audio unplayable.
+  // Deferred until the audio element can actually play (`audioReady`, set on
+  // `canplay`), so the full-file decode never competes with audio's own buffering.
+  // On a long file under heavy load that race is what left the audio unplayable.
   useEffect(() => {
     if (!playableUrl) {
       setWavePeaks(FLAT_WAVE_PEAKS);
@@ -326,6 +380,55 @@ export default function App() {
     saveProjects(next);
   };
 
+  const [reportBusy, setReportBusy] = useState(false);
+
+  // Delete a recording end to end: the backend drops its DB rows and stored
+  // audio, then we remove it from the local project list. If it's the one
+  // currently open, clear the loaded session so the dashboard doesn't point at
+  // a recording that no longer exists.
+  const handleDeleteProject = async (project: Project) => {
+    // Older localStorage cards can predate the audioFileId field; there's no
+    // backend row to delete, so just drop the card. A real id still deletes the
+    // backend evidence (deleteEvaluation treats a 404 as already-gone).
+    if (Number.isFinite(project.audioFileId)) {
+      await deleteEvaluation(project.audioFileId);
+    }
+    persistProjects(projects.filter((entry) => entry.id !== project.id));
+    if (current?.id === project.id) {
+      audioRef.current?.pause();
+      setEvaluation(null);
+      setCurrent(null);
+    }
+  };
+
+  // Build one aggregate HTML report over every remaining recording, computed
+  // from each project's real evaluation. Recordings that fail to load are
+  // skipped rather than aborting the whole report.
+  const handleGenerateReport = async () => {
+    if (reportBusy || projects.length === 0) return;
+    setReportBusy(true);
+    try {
+      const settled = await Promise.all(
+        projects.map(async (project): Promise<ReportEntry | null> => {
+          try {
+            return { project, evaluation: await fetchEvaluation(project.audioFileId) };
+          } catch (error) {
+            console.error(`Skipping ${project.name} in report:`, error);
+            return null;
+          }
+        }),
+      );
+      const entries = settled.filter((entry): entry is ReportEntry => entry !== null);
+      if (entries.length === 0) {
+        window.alert("Could not load any recordings for the report.");
+        return;
+      }
+      downloadReport(buildReportHtml(computeReport(entries)));
+    } finally {
+      setReportBusy(false);
+    }
+  };
+
   // Any completed action that produces a ready evaluation (demo, upload, open
   // project) sends the user straight to the Dashboard tab to see the result.
   // That's the point of the action, not unwanted tab coupling — but nothing
@@ -424,7 +527,10 @@ export default function App() {
         attemptPlay(targetTime, tries + 1);
       };
       audio.addEventListener("canplay", onReady, { once: true });
-      audio.load();
+      // Only re-arm the element if it actually errored. With preload="auto" the
+      // browser is already buffering; calling load() here would abort that fetch
+      // and restart from zero, which is exactly what starves playback under load.
+      if (audio.error) audio.load();
     });
   }, []);
 
@@ -528,9 +634,8 @@ export default function App() {
         <audio
           ref={audioRef}
           src={playableUrl}
-          preload="metadata"
+          preload="auto"
           onLoadStart={() => setAudioReady(false)}
-          onLoadedMetadata={() => setAudioReady(true)}
           onCanPlay={() => setAudioReady(true)}
           onEnded={() => setPlaying(false)}
           onError={() => {
@@ -545,7 +650,16 @@ export default function App() {
       <TopBar nav={nav} onNav={handleNav} />
       <ModelStatusStrip catalog={catalog} status={modelStatus} />
 
-      {nav === "projects" && <ProjectsView projects={projects} onOpenProject={openProject} onNew={startNewUpload} />}
+      {nav === "projects" && (
+        <ProjectsView
+          projects={projects}
+          onOpenProject={openProject}
+          onNew={startNewUpload}
+          onDelete={handleDeleteProject}
+          onGenerateReport={handleGenerateReport}
+          reportBusy={reportBusy}
+        />
+      )}
       {nav === "settings" && (
         <SettingsView
           models={catalogModels}

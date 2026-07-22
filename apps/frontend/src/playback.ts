@@ -76,7 +76,8 @@ export function computePcmWavePeaks(buffer: ArrayBuffer, bars = 210): number[] {
 /** Fetch audio from `url` and return real per-bar peak amplitudes, scanned
  * straight from its PCM bytes (no AudioContext, no full Float32 decode). */
 export async function decodeWaveformPeaks(url: string, bars = 210): Promise<number[]> {
-  const response = await fetch(url);
+  // Low priority so this full-file download yields to any in-flight audio buffering.
+  const response = await fetch(url, { priority: "low" });
   if (!response.ok) throw new Error(`Could not fetch audio for waveform (status ${response.status})`);
   const arrayBuffer = await response.arrayBuffer();
   return computePcmWavePeaks(arrayBuffer, bars);

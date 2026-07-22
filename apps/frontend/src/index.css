@@ -98,6 +98,10 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .primary-btn, .danger-btn { border: 0; border-radius: 9px; padding: 10px 18px; font-size: 13px; font-weight: 700; cursor: pointer; }
 .primary-btn { color: var(--bg); background: var(--accent); }
 .danger-btn { color: #ff6b6b; background: rgba(255,107,107,.1); border: 1px solid rgba(255,107,107,.3); }
+.view-head-actions { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
+.ghost-btn { border: 1px solid var(--line-2); border-radius: 9px; padding: 10px 16px; font-size: 13px; font-weight: 600; color: var(--text); background: transparent; cursor: pointer; }
+.ghost-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.ghost-btn:disabled { opacity: .45; cursor: not-allowed; }
 .project-list { display: flex; flex-direction: column; gap: 10px; }
 .project-row { display: flex; align-items: center; gap: 16px; padding: 15px 18px; border-radius: 12px; background: var(--panel); border: 1px solid var(--line); cursor: pointer; text-align: left; min-width: 0; }
 .project-row.is-fresh { border-color: rgba(52,211,153,.3); }
@@ -174,6 +178,11 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .retry-controls.in-gutter .icon-btn { width: 20px; height: 20px; font-size: 10px; }
 .retry-controls .icon-btn.is-confirm { border-color: rgba(76,154,255,.5); background: rgba(76,154,255,.15); color: var(--accent); }
 .retry-controls .icon-btn.is-cancel { color: #7a869c; }
+/* Same inline confirm as retry, but the confirm step is destructive, so it
+   reads red instead of blue. */
+.delete-controls { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.delete-controls .icon-btn { width: 24px; height: 24px; font-size: 11px; }
+.delete-controls .icon-btn.is-cancel { border-color: rgba(255,107,107,.5); background: rgba(255,107,107,.14); color: #ff6b6b; }
 .done-mark { width: 16px; height: 16px; border-radius: 50%; background: rgba(52,211,153,.15); color: var(--good); display: inline-flex; align-items: center; justify-content: center; font-size: 11px; }
 .dashboard { flex: 1; display: flex; flex-direction: column; padding: 16px 20px 24px; gap: 14px; min-height: 0; }
 .config-bar { border-radius: 10px; padding: 10px 14px; }

@@ -9,12 +9,13 @@ all the client gets.
 import logging
 from collections.abc import Generator
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from apps.background_worker.lanes import lane_for
 from apps.background_worker.models import REGISTRY
+from apps.background_worker.pipelines.azure_pipeline import _fixed_key
 from apps.background_worker.queue_app import queue
 from apps.background_worker.worker import run_model
 from apps.backend_api.dependencies import get_current_user, get_db
@@ -144,6 +145,55 @@ def retry_model(
     queue.enqueue(run_model, audio_file.id, model_id)
     logger.info("Queued model %r for audio_file_id=%s", model_id, audio_file.id)
     return _build_evaluation(db, audio_file)
+
+
+@router.delete("/{audio_file_id}", status_code=204)
+def delete_evaluation(
+    audio_file_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Response:
+    """Delete a recording and every trace of it: its EvaluationResult rows, the
+    AudioFile row, and the audio object(s) in whichever lane's store owns them.
+
+    Nothing cascades in the schema, so the child rows are removed explicitly
+    before the parent. Storage cleanup runs after the DB commit and is
+    best-effort: once the rows are gone the recording is gone from the user's
+    perspective, so a missing or unreachable object is logged, not surfaced as
+    a failure. In-flight jobs for a just-deleted recording are tolerated by the
+    pipelines (they drop a job whose row has vanished), so a queued/running
+    model doesn't block deletion.
+    """
+    audio_file = _get_audio_file(db, audio_file_id, current_user)
+    s3_key = audio_file.s3_key
+    blob_key = audio_file.blob_key
+
+    # The Azure lane is content-addressed and deduplicated: two recordings with
+    # identical audio share one blob_key. Only delete the blob if no other
+    # recording still points at it. The local s3_key is keyed by audio_file.id,
+    # so it's never shared.
+    blob_shared = bool(blob_key) and (
+        db.query(AudioFile.id).filter(AudioFile.blob_key == blob_key, AudioFile.id != audio_file.id).first() is not None
+    )
+
+    db.query(EvaluationResult).filter_by(audio_file_id=audio_file.id).delete()
+    db.delete(audio_file)
+    db.commit()
+
+    if s3_key:
+        try:
+            s3_client.delete_object(s3_key)
+        except Exception:
+            logger.warning("Failed to delete S3 object %s for deleted audio_file_id=%s", s3_key, audio_file_id, exc_info=True)
+    if blob_key and not blob_shared:
+        for key in (blob_key, _fixed_key(blob_key)):
+            try:
+                azure_blob.delete_blob(key)
+            except Exception:
+                logger.warning("Failed to delete blob %s for deleted audio_file_id=%s", key, audio_file_id, exc_info=True)
+
+    logger.info("Deleted audio_file_id=%s", audio_file_id)
+    return Response(status_code=204)
 
 
 def _iter_s3_object(key: str, start: int = 0, length: int | None = None, chunk_size: int = 65536) -> Generator[bytes, None, None]:

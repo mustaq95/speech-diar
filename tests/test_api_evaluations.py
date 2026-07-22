@@ -103,6 +103,61 @@ def test_patch_evaluation_persists_upload_ms(client: TestClient, db_session_fact
         assert session.query(AudioFile).filter_by(id=audio_file_id).one().upload_ms == 987
 
 
+def test_delete_evaluation_removes_rows_and_s3_object(
+    client: TestClient, db_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    audio_file_id = _seed_audio_file(db_session_factory, s3_key="audio/1.wav")
+    with db_session_factory() as session:
+        session.add(EvaluationResult(audio_file_id=audio_file_id, model_id="pyannote", status="done"))
+        session.add(EvaluationResult(audio_file_id=audio_file_id, model_id="sherpa-onnx", status="failed", error="boom"))
+        session.commit()
+
+    deleted: list[str] = []
+    monkeypatch.setattr("apps.backend_api.routers.evaluations.s3_client.delete_object", lambda key: deleted.append(key))
+
+    response = client.delete(f"/evaluations/{audio_file_id}")
+    assert response.status_code == 204
+    assert deleted == ["audio/1.wav"]
+
+    with db_session_factory() as session:
+        assert session.query(AudioFile).filter_by(id=audio_file_id).one_or_none() is None
+        assert session.query(EvaluationResult).filter_by(audio_file_id=audio_file_id).count() == 0
+
+    # Gone for good — reopening now 404s.
+    assert client.get(f"/evaluations/{audio_file_id}").status_code == 404
+
+
+def test_delete_evaluation_deletes_blob_and_fixed_variant(
+    client: TestClient, db_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    audio_file_id = _seed_audio_file(db_session_factory, blob_key="uploads/abc.wav")
+    deleted: list[str] = []
+    monkeypatch.setattr("apps.backend_api.routers.evaluations.azure_blob.delete_blob", lambda key: deleted.append(key))
+
+    response = client.delete(f"/evaluations/{audio_file_id}")
+    assert response.status_code == 204
+    assert deleted == ["uploads/abc.wav", "uploads/abc-fixed.wav"]
+
+
+def test_delete_evaluation_skips_blob_shared_by_another_recording(
+    client: TestClient, db_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Azure lane dedups by content hash, so two recordings can share one
+    blob_key — deleting one must not pull the audio out from under the other."""
+    shared = _seed_audio_file(db_session_factory, blob_key="uploads/dup.wav")
+    _seed_audio_file(db_session_factory, blob_key="uploads/dup.wav")  # still points at it
+    deleted: list[str] = []
+    monkeypatch.setattr("apps.backend_api.routers.evaluations.azure_blob.delete_blob", lambda key: deleted.append(key))
+
+    response = client.delete(f"/evaluations/{shared}")
+    assert response.status_code == 204
+    assert deleted == []  # blob left intact for the surviving recording
+
+
+def test_delete_unknown_evaluation_404s(client: TestClient) -> None:
+    assert client.delete("/evaluations/9999").status_code == 404
+
+
 def test_audio_proxy_streams_from_minio_when_s3_key_set(
     client: TestClient, db_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:
