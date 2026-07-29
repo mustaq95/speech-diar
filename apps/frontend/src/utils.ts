@@ -1,4 +1,4 @@
-import type { ActiveMap, EventItem, ModelRun, Project } from "./types";
+import type { ActiveMap, ModelRun, Project } from "./types";
 
 export function fmt(t: number): string {
   const safe = Math.max(0, t);
@@ -80,20 +80,6 @@ export function saveModelActive(active: ActiveMap): void {
   } catch {
     // Local persistence is optional for the static studio.
   }
-}
-
-export function buildEvents(models: ModelRun[]): EventItem[] {
-  return models
-    .flatMap((model) =>
-      model.segs.map((seg) => ({
-        t: seg.s,
-        id: model.id,
-        short: model.short,
-        spk: seg.spk,
-        overlap: countAt(model, seg.s + 0.4) >= 2,
-      })),
-    )
-    .sort((a, b) => a.t - b.t);
 }
 
 export function boundsFor(models: ModelRun[]): number[] {

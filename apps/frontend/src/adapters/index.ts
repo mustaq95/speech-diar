@@ -1,10 +1,9 @@
 import { DEFAULT_EVAL, DEFAULT_PARAMS } from "../data";
 import type { ActiveMap, EvalConfig, ModelParams, ModelRun, ParamMap } from "../types";
 import type { DiarizationEvaluation, ModelMetadata } from "../types/diarization";
-import { loadMockEvaluation } from "./MockDiarizationAdapter";
-import { loadModelAEvaluation } from "./ModelAAdapter";
 
 export type { DiarizationAdapter } from "./DiarizationAdapter";
+export type { RuntimeConfig } from "./BackendApiAdapter";
 export { DEMO_AUDIO_FILE_ID, normalizeModelRun } from "./DiarizationAdapter";
 export {
   API_BASE_URL,
@@ -15,35 +14,17 @@ export {
   fetchModelCatalog,
   fetchModelStatus,
   fetchRuntimeConfig,
+  fetchTranscripts,
+  ingestRecording,
+  parseBlobInput,
   patchUploadTiming,
   retryModel,
+  startTranscript,
   uploadAudio,
 } from "./BackendApiAdapter";
-export { MockDiarizationAdapter, loadMockEvaluation } from "./MockDiarizationAdapter";
-export { ModelAAdapter, SAMPLE_MODEL_A_OUTPUT, loadModelAEvaluation } from "./ModelAAdapter";
-export type { ModelARawOutput } from "./ModelAAdapter";
 
-export type DiarizationSourceId = "mock" | "model-a";
-
-const SOURCES: Record<DiarizationSourceId, () => DiarizationEvaluation> = {
-  mock: loadMockEvaluation,
-  "model-a": loadModelAEvaluation,
-};
-
-/** Flip to "model-a" to render the hypothetical backend through the same UI. */
-export const ACTIVE_SOURCE: DiarizationSourceId = "mock";
-
-/**
- * The single entry point the UI uses to obtain diarization data. When the real
- * API lands, this becomes an async fetch whose response is handed to the
- * matching adapter — the UI contract does not change.
- */
-export function getDiarizationEvaluation(source: DiarizationSourceId = ACTIVE_SOURCE): DiarizationEvaluation {
-  return SOURCES[source]();
-}
-
-// Defaults are derived from whatever models the active source returned, so a
-// new backend never requires touching the UI's state wiring.
+// Defaults are derived from whatever models the backend returned, so a new
+// model never requires touching the UI's state wiring.
 
 export const FALLBACK_PARAMS: ModelParams = { min: 1, max: 8, thr: 0.65, ovl: true };
 

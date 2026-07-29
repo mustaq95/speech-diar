@@ -62,6 +62,15 @@ class Settings(BaseSettings):
     azure_batch_max_speakers: int = 8
     locale: str = "en-US"
 
+    # --- External recording API (S3-backed meeting-recording source) ---
+    # The eval backend pulls audio from a recording API that streams raw bytes
+    # behind a Bearer token (production: ADEO; local dev: tools/recording_api on
+    # :8215). A token pasted with the URL (as a curl -H line) wins; this is the
+    # fallback used when the pasted input carries none. The local replica also
+    # enforces this exact token, so seeding and ingestion match by construction.
+    recording_api_token: str | None = None
+    recording_fetch_timeout_sec: int = 600
+
     # --- Azure lane storage: Blob (only touched when the Azure model is on) ---
     azure_storage_account_name: str | None = None
     azure_storage_account_key: str | None = None
@@ -182,6 +191,67 @@ class Settings(BaseSettings):
     # with the weights.
     moss_transcribe_cold_start_timeout_sec: int = 600
 
+    # --- Live-speech transcription (the Live Speech panel) ---
+    # Two ASR engines are available; the mode is chosen PER RUN from the panel,
+    # not by a setting:
+    #   online  -> TryHamsa STT over WSS. Audio LEAVES this host.
+    #   offline -> the local cohere-transcribe vLLM container. Audio stays here.
+    # The alignment stage (ctc-forced-aligner, below) is shared by both modes.
+    # The chosen engine's id is stamped on each TranscriptResult row at enqueue
+    # time, so a later run in the other mode never relabels an existing
+    # transcript. A host only offers a mode whose credentials/endpoint are set.
+
+    # --- TryHamsa STT (online mode) ---
+    # A streaming WebSocket API, not a request/response one: audio is paced to
+    # the server in 100ms chunks so its VAD can segment, which makes ASR
+    # wall-clock a function of the recording's LENGTH (~50% of it), not of
+    # model speed. hamsa_stt_chunk_sleep_sec is that pace.
+    # HAMSA_STT_URL wins over HAMSA_STT_WS_URL when both are set (see
+    # hamsa_ws_endpoint); both names exist because the reference client
+    # accepted either.
+    hamsa_stt_url: str | None = None
+    hamsa_stt_ws_url: str | None = None
+    hamsa_stt_key: str | None = None
+    hamsa_stt_bearer_token: str | None = None
+    # Per-service, mirroring vibevoice_ssl_verify -- deliberately NOT the bare
+    # SSL_VERIFY some clients use, so turning verification off for this one
+    # endpoint can never silently weaken another service's TLS.
+    hamsa_stt_ssl_verify: bool = True
+    hamsa_stt_sample_rate: int = 16000
+    hamsa_stt_chunk_sleep_sec: float = 0.05
+    # How long the socket may sit silent after the audio is sent before the
+    # transcript is considered complete. Hamsa emits one message per detected
+    # speech segment and gives no explicit end-of-stream signal.
+    hamsa_stt_idle_timeout_sec: float = 5.0
+    # Hard ceiling on one streaming session, so a hung socket fails on its own
+    # instead of burning the whole queue_job_timeout_sec. Must comfortably
+    # exceed 0.5x the longest recording: a 2-hour file streams for ~1 hour.
+    hamsa_stt_session_timeout_sec: int = 5400
+
+    # --- Cohere Transcribe Arabic (offline mode) ---
+    # CohereLabs/cohere-transcribe-arabic-07-2026, a 2B Arabic/English ASR
+    # model served on vLLM's OpenAI-compatible transcription API. Started via
+    # ./deploy/cohere-transcribe/cohere_transcribe_up.sh.
+    #
+    # Deliberately NOT GPU-supervisor-managed: it consumes no residency slot,
+    # is never evicted or idle-unloaded, and is expected to stay up once
+    # started. Its footprint is bounded by the vLLM flags in its compose file
+    # instead of by the cap.
+    cohere_transcribe_url: str = "http://localhost:9025"
+    cohere_transcribe_timeout_sec: int = 1800
+    # Empty = auto-detect (correct for both English and Arabic). A non-empty
+    # value FORCES that language as a decoder prompt the model obeys over the
+    # audio, so "ar" makes English recordings hallucinate Arabic and "en" would
+    # break Arabic ones. Only set it to force a known single-language batch.
+    cohere_transcribe_language: str = ""
+
+    # --- CTC forced aligner (in-process in the worker; both modes) ---
+    # MahmoudAshraf97/ctc-forced-aligner's MMS-300m model, which romanizes
+    # text before alignment and so handles code-switched audio. Runs on
+    # diarization_device (cuda here), loaded once per worker process.
+    ctc_aligner_language: str = "ara"
+    ctc_aligner_batch_size: int = 4
+
     # --- GPU container lifecycle supervisor (DGX Spark residency cap) ---
     # Hard cap on how many of the local-lane model containers above may be
     # GPU-resident (started) at once. A request for a model beyond this cap
@@ -218,6 +288,11 @@ class Settings(BaseSettings):
     @property
     def cors_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_allow_origins.split(",") if origin.strip()]
+
+    @property
+    def hamsa_ws_endpoint(self) -> str | None:
+        """The Hamsa WebSocket URL, from either accepted setting name."""
+        return self.hamsa_stt_url or self.hamsa_stt_ws_url
 
 
 @lru_cache

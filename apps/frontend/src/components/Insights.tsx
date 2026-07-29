@@ -1,30 +1,42 @@
-import { useEffect, useRef } from "react";
-import type { ActiveMap, EventItem, ModelRun } from "../types";
+import type { ActiveMap, ModelRun } from "../types";
+import type { TranscriptionMode, TranscriptRun } from "../types/diarization";
+import type { RuntimeConfig } from "../adapters";
 import { SPEAKER_COLORS } from "../data";
 import { fmt, hexA } from "../utils";
+import { LiveSpeech } from "./LiveSpeech";
 import { currentSpeakerRows } from "./Studio";
 
 interface InsightsProps {
   models: ModelRun[];
   active: ActiveMap;
   time: number;
-  events: EventItem[];
+  /** Every engine's transcript for this recording; the panel picks by mode. */
+  transcripts: TranscriptRun[];
+  /** Settings toggle for the live-speech panel; the transcript itself always runs. */
   feed: boolean;
+  /** Null until the first `GET /config` lands. Carries each mode's availability. */
+  runtimeConfig: RuntimeConfig | null;
+  onRunTranscript?: (mode: TranscriptionMode) => Promise<void>;
+  wordSyncRef: (sync: ((time: number) => void) | null) => void;
   clockRef: (node: HTMLElement | null) => void;
 }
 
-export function Insights({ models, active, time, events, feed, clockRef }: InsightsProps) {
+export function Insights({ models, active, time, transcripts, feed, runtimeConfig, onRunTranscript, wordSyncRef, clockRef }: InsightsProps) {
   const rows = currentSpeakerRows(models, active, time);
-  const feedItems = events.filter((event) => active[event.id] && event.t <= time + 0.01).slice(-14).reverse();
-  const newestKey = feedItems[0] ? `${feedItems[0].id}-${feedItems[0].t}` : "";
-  const feedRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    feedRef.current?.scrollTo({ top: 0 });
-  }, [newestKey]);
 
   return (
     <aside className="insights">
+      {feed && (
+        <LiveSpeech
+          transcripts={transcripts}
+          models={models}
+          active={active}
+          runtimeConfig={runtimeConfig}
+          onRun={onRunTranscript}
+          wordSyncRef={wordSyncRef}
+        />
+      )}
+
       <div className="insights-head">
         <h2>Live Insights</h2>
         <span ref={clockRef} className="mono accent">{fmt(time)}</span>
@@ -60,27 +72,6 @@ export function Insights({ models, active, time, events, feed, clockRef }: Insig
           </div>
         ))}
       </div>
-
-      {feed && (
-        <>
-          <div className="eyebrow feed-title">Event feed</div>
-          <div className="event-feed" ref={feedRef}>
-            {feedItems.length ? feedItems.map((event, index) => {
-              const color = SPEAKER_COLORS[event.spk % SPEAKER_COLORS.length];
-              return (
-                <div key={`${event.id}-${event.t}-${index}`} className="feed-row">
-                  <span className="mono">{fmt(event.t)}</span>
-                  <i style={{ background: color }} />
-                  <span><b>{event.short}</b> · Speaker {event.spk + 1}</span>
-                  {event.overlap && <em>OVLP</em>}
-                </div>
-              );
-            }) : (
-              <div className="feed-empty">Press play to stream events</div>
-            )}
-          </div>
-        </>
-      )}
     </aside>
   );
 }

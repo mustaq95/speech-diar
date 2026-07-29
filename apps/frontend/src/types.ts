@@ -43,11 +43,3 @@ export type ParamMap = Record<ModelId, ModelParams>;
 export type ActiveMap = Record<ModelId, boolean>;
 /** Which catalog model ids are implemented, from `GET /models`; unavailable ids are shown but their toggle is disabled. */
 export type AvailableMap = Record<ModelId, boolean>;
-
-export interface EventItem {
-  t: number;
-  id: ModelRun["id"];
-  short: string;
-  spk: number;
-  overlap: boolean;
-}

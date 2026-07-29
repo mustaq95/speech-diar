@@ -1,7 +1,8 @@
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import type { ActiveMap, AvailableMap, ModelRun, Project } from "../types";
 import { WaveGlyph } from "./controls";
 import { SPEAKER_COLORS } from "../data";
+import { parseBlobInput } from "../adapters";
 
 interface EmptyDashboardProps {
   /** The real, honest model catalog from `GET /models` (as ModelRun shells). */
@@ -11,16 +12,24 @@ interface EmptyDashboardProps {
   projects: Project[];
   /** Real upload: a user-picked audio file to send through the backend. */
   onFile: (file: File) => void;
-  /** Synthetic demo: canned output, never sent through the backend. */
-  onLoadDemo: () => void;
+  /** Pull a recording from an external stream URL (bare URL or a pasted curl). */
+  onLoadBlob: (url: string, token?: string) => void;
   onSettings: () => void;
   onOpenProject: (project: Project) => void;
   onProjects: () => void;
 }
 
-export function EmptyDashboard({ models, available, active, projects, onFile, onLoadDemo, onSettings, onOpenProject, onProjects }: EmptyDashboardProps) {
+export function EmptyDashboard({ models, available, active, projects, onFile, onLoadBlob, onSettings, onOpenProject, onProjects }: EmptyDashboardProps) {
   const shown = models.filter((model) => active[model.id]).length;
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [blobOpen, setBlobOpen] = useState(false);
+  const [blobInput, setBlobInput] = useState("");
+
+  const submitBlob = () => {
+    const { url, token } = parseBlobInput(blobInput);
+    if (!url) return;
+    onLoadBlob(url, token);
+  };
   return (
     <main className="page page-empty">
       <section className="empty-head">
@@ -63,10 +72,24 @@ export function EmptyDashboard({ models, available, active, projects, onFile, on
           <span>or click to browse</span>
           <span className="drop-actions">
             <button type="button" className="action-fill" onClick={(event) => { event.stopPropagation(); fileInputRef.current?.click(); }}>Browse files</button>
-            <button type="button" className="action-outline" onClick={(event) => { event.stopPropagation(); onLoadDemo(); }}>Load demo</button>
+            <button type="button" className="action-outline" onClick={(event) => { event.stopPropagation(); setBlobOpen((open) => !open); }}>Load Blob</button>
           </span>
+          {blobOpen && (
+            <span className="blob-loader" onClick={(event) => event.stopPropagation()}>
+              <input
+                type="text"
+                className="blob-input"
+                value={blobInput}
+                autoFocus
+                placeholder={'http://localhost:8215/v1/recording/{sessionId}/{agendaItemId}/stream  ·  or a full curl -H "Authorization: Bearer …"'}
+                onChange={(event) => setBlobInput(event.target.value)}
+                onKeyDown={(event) => { if (event.key === "Enter") submitBlob(); }}
+              />
+              <button type="button" className="action-fill" onClick={submitBlob}>Ingest</button>
+            </span>
+          )}
           <small>Audio (WAV, MP3, M4A, FLAC…) · up to 2 hours</small>
-          <small className="demo-caveat">Demo uses synthetic data — not real model results</small>
+          <small className="demo-caveat">Load Blob pulls a recording from your recording API (token from .env, or paste a curl)</small>
         </div>
 
         <aside className="models-summary">

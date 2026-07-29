@@ -79,9 +79,9 @@ def running_containers() -> set[str]:
     return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
-def is_healthy(health_url: str) -> bool:
+def is_healthy(health_url: str, timeout: float = 5.0) -> bool:
     try:
-        response = httpx.get(health_url, timeout=5.0)
+        response = httpx.get(health_url, timeout=timeout)
         return response.status_code == 200
     except httpx.HTTPError:
         return False

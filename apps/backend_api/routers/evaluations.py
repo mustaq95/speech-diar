@@ -9,7 +9,7 @@ all the client gets.
 import logging
 from collections.abc import Generator
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -17,10 +17,25 @@ from apps.background_worker.lanes import lane_for
 from apps.background_worker.models import REGISTRY
 from apps.background_worker.pipelines.azure_pipeline import _fixed_key
 from apps.background_worker.queue_app import queue
+from apps.background_worker.transcription import (
+    ALIGNER_NAME,
+    DEFAULT_TRANSCRIPTION_MODE,
+    asr_id_for_mode,
+    engine_for,
+)
+from apps.background_worker.transcription.pipeline import run_asr
 from apps.background_worker.worker import run_model
 from apps.backend_api.dependencies import get_current_user, get_db
-from packages.database.models import AudioFile, EvaluationResult, User
-from packages.shared_contracts.schemas import DiarizationEvaluation, DiarizationModelRun, UploadTimingUpdate
+from packages.config.settings import get_settings
+from packages.database.models import AudioFile, EvaluationResult, TranscriptResult, User
+from packages.shared_contracts.schemas import (
+    DiarizationEvaluation,
+    DiarizationModelRun,
+    TranscriptionMode,
+    TranscriptRun,
+    TranscriptWord,
+    UploadTimingUpdate,
+)
 from packages.storage import azure_blob, s3_client
 
 router = APIRouter(prefix="/evaluations", tags=["evaluations"])
@@ -147,6 +162,120 @@ def retry_model(
     return _build_evaluation(db, audio_file)
 
 
+def _transcript_run(row: TranscriptResult) -> TranscriptRun:
+    """Row -> contract. Display names and mode come from the engine that ACTUALLY
+    ran (`row.asr_id`), never from the mode a new run would use — a later run in
+    the other mode must not relabel a transcript the other engine produced."""
+    engine = engine_for(row.asr_id)
+    return TranscriptRun(
+        audio_file_id=row.audio_file_id,
+        status=row.status,
+        stage=row.stage,
+        asr_id=row.asr_id,
+        # An id with no engine entry can only come from a row written by an
+        # older/other build. Report it as offline-unknown rather than guessing
+        # that audio left the host.
+        mode=engine.mode if engine else "offline",
+        asr_name=engine.name if engine else row.asr_id,
+        aligner_name=ALIGNER_NAME,
+        text=row.text or "",
+        words=[TranscriptWord.model_validate(word) for word in (row.words or [])],
+        asr_ms=row.asr_ms,
+        align_ms=row.align_ms,
+        error=row.error,
+    )
+
+
+@router.get("/{audio_file_id}/transcript", response_model=list[TranscriptRun], response_model_by_alias=True)
+def get_transcripts(
+    audio_file_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[TranscriptRun]:
+    """Every live-speech transcript for one recording — at most one per engine.
+
+    A separate endpoint from `GET /evaluations/{id}` on purpose: that response
+    is polled every pollIntervalMs while models are in flight, and a long
+    recording's word list is hundreds of KB that would ride along on every
+    poll forever.
+
+    A list, not one object, because the online and offline runs coexist and
+    comparing them is the point. An empty list means no transcript was ever
+    started for this recording (e.g. it predates the feature, or no ASR engine
+    is configured) — the client renders that as an offer to run one, not as an
+    error, which is why this is an empty collection rather than a 404.
+    """
+    audio_file = _get_audio_file(db, audio_file_id, current_user)
+    rows = (
+        db.query(TranscriptResult)
+        .filter_by(audio_file_id=audio_file.id)
+        .order_by(TranscriptResult.asr_id)
+        .all()
+    )
+    return [_transcript_run(row) for row in rows]
+
+
+@router.post("/{audio_file_id}/transcript", response_model=TranscriptRun, response_model_by_alias=True)
+def start_transcript(
+    audio_file_id: int,
+    mode: TranscriptionMode = Body(DEFAULT_TRANSCRIPTION_MODE, embed=True),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TranscriptRun:
+    """Run or re-run the transcript for audio already in storage.
+
+    Covers three cases with one path: a recording uploaded before this feature
+    existed, a failed run worth retrying, and transcribing in the other mode.
+    The mode is chosen by the caller (the Live Speech toggle); its engine is
+    resolved HERE, at enqueue time, and stamped on the row.
+
+    Everything below is keyed on (recording, engine), never on the recording
+    alone. Running the other mode ADDS a row, leaving the first engine's text,
+    words and timings intact — that side-by-side is what the panel compares.
+    Only a re-run of the SAME engine resets a row, and the in-flight 409 guards
+    only that engine, so offline can start while online is still streaming.
+    Mirrors `retry_model` above, which is per model for the same reason.
+    """
+    audio_file = _get_audio_file(db, audio_file_id, current_user)
+    if not audio_file.s3_key:
+        raise HTTPException(
+            status_code=400, detail="This recording has no local-lane audio, so it cannot be transcribed"
+        )
+
+    settings = get_settings()
+    asr_id = asr_id_for_mode(mode)
+    engine = engine_for(asr_id)
+    if engine is None or not engine.configured(settings):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{mode} mode selects {asr_id!r}, which is not configured on this host",
+        )
+
+    row = db.query(TranscriptResult).filter_by(audio_file_id=audio_file.id, asr_id=asr_id).one_or_none()
+    if row is None:
+        row = TranscriptResult(audio_file_id=audio_file.id, asr_id=asr_id, status="queued")
+        db.add(row)
+    else:
+        if row.status in ("queued", "running"):
+            raise HTTPException(
+                status_code=409, detail=f"{engine.name} transcript is already {row.status}"
+            )
+        row.status = "queued"
+        row.stage = None
+        row.error = None
+        row.text = None
+        row.words = None
+        row.asr_ms = None
+        row.align_ms = None
+        row.asr_started_at = None
+        row.align_started_at = None
+    db.commit()
+
+    queue.enqueue(run_asr, audio_file.id, asr_id)
+    logger.info("Queued transcript (%s) for audio_file_id=%s", asr_id, audio_file.id)
+    return _transcript_run(row)
+
+
 @router.delete("/{audio_file_id}", status_code=204)
 def delete_evaluation(
     audio_file_id: int,
@@ -177,6 +306,7 @@ def delete_evaluation(
     )
 
     db.query(EvaluationResult).filter_by(audio_file_id=audio_file.id).delete()
+    db.query(TranscriptResult).filter_by(audio_file_id=audio_file.id).delete()
     db.delete(audio_file)
     db.commit()
 

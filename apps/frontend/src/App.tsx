@@ -9,7 +9,7 @@ import { SettingsView } from "./components/SettingsView";
 import { MIN_PX_PER_SEC, Studio } from "./components/Studio";
 import { TopBar } from "./components/TopBar";
 import { UploadingScreen } from "./components/UploadingScreen";
-import { boundsFor, buildEvents, fmt, loadModelActive, loadProjects, saveModelActive, saveProjects } from "./utils";
+import { boundsFor, fmt, loadModelActive, loadProjects, saveModelActive, saveProjects } from "./utils";
 import { buildReportHtml, computeReport, downloadReport, type ReportEntry } from "./report";
 import {
   DEMO_AUDIO_FILE_ID,
@@ -21,17 +21,20 @@ import {
   fetchModelCatalog,
   fetchModelStatus,
   fetchRuntimeConfig,
-  getDiarizationEvaluation,
+  fetchTranscripts,
+  ingestRecording,
   mergeActiveWithCatalog,
   modelRunFromMetadata,
   patchUploadTiming,
   retryModel,
+  startTranscript,
   uploadAudio,
 } from "./adapters";
+import type { RuntimeConfig } from "./adapters";
 import { speakerSignature, decodeWaveformPeaks } from "./playback";
 import { isInFlight } from "./timing";
 import type { ActiveMap, AvailableMap, DiarizationEvaluation, EvalConfig, ModelId, ModelMetadata, ModelRun, Nav, ParamMap, Project, Workflow } from "./types";
-import type { ModelContainerStatus } from "./types/diarization";
+import type { ModelContainerStatus, TranscriptionMode, TranscriptRun, UploadAck } from "./types/diarization";
 
 const FLAT_WAVE_PEAKS = Array.from({ length: 210 }, () => 0.3);
 const DEFAULT_POLL_INTERVAL_MS = 1500;
@@ -53,7 +56,12 @@ export default function App() {
 
   const [catalog, setCatalog] = useState<ModelMetadata[]>([]);
   const [catalogError, setCatalogError] = useState<string | null>(null);
-  const [pollIntervalMs, setPollIntervalMs] = useState(DEFAULT_POLL_INTERVAL_MS);
+  // Whole runtime config, not just the poll interval: the Live Speech panel
+  // needs the current transcription mode to say what a run would use now.
+  // Null until the first fetch lands; the panel treats that as "unknown" rather
+  // than guessing a mode.
+  const [runtimeConfig, setRuntimeConfig] = useState<RuntimeConfig | null>(null);
+  const pollIntervalMs = runtimeConfig?.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const [modelStatus, setModelStatus] = useState<ModelContainerStatus[]>([]);
   const catalogModels = useMemo(() => catalog.map(modelRunFromMetadata), [catalog]);
   const availableMap: AvailableMap = useMemo(
@@ -84,6 +92,10 @@ export default function App() {
   // load. `audioNotice` replaces blocking alerts on the recovery path.
   const [audioReady, setAudioReady] = useState(false);
   const [audioNotice, setAudioNotice] = useState<string | null>(null);
+  // Live-speech transcripts, one per ASR engine that has run on this recording.
+  // Fetched separately from the evaluation (the word list is far too big to
+  // ride along on the evaluation poll) and empty when none was ever started.
+  const [transcripts, setTranscripts] = useState<TranscriptRun[]>([]);
 
   const timeRef = useRef(0);
   const playingRef = useRef(false);
@@ -99,12 +111,16 @@ export default function App() {
   const innerRef = useRef<HTMLDivElement | null>(null);
   const openRequestRef = useRef(0);
   const seekCommitTimer = useRef<number | null>(null);
+  // The LiveSpeech panel's current-word highlight, driven from syncDom like
+  // every other playback-synced element — never through React state, which at
+  // one update per spoken word would reintroduce exactly the re-render storm
+  // syncDom exists to avoid.
+  const wordSyncRef = useRef<((time: number) => void) | null>(null);
 
   const playableUrl = evaluation && !isDemo ? audioStreamUrl(evaluation.audioFileId) : null;
   const hasInFlight = useMemo(() => models.some(isInFlight), [models]);
   const hasFailed = useMemo(() => models.some((model) => model.status === "failed"), [models]);
 
-  const events = useMemo(() => buildEvents(models), [models]);
   const shownModels = useMemo(() => models.filter((model) => active[model.id]), [active, models]);
   const fileName = isDemo ? "Synthetic demo (no real audio)" : (current?.name ?? uploadName) || "No recording loaded";
   const durationText = fmt(duration);
@@ -126,7 +142,7 @@ export default function App() {
       .then((list) => setCatalog(list))
       .catch((error: Error) => setCatalogError(`Could not load model list: ${error.message}`));
     fetchRuntimeConfig()
-      .then((cfg) => setPollIntervalMs(cfg.pollIntervalMs))
+      .then((cfg) => setRuntimeConfig(cfg))
       .catch(() => undefined);
   }, []);
 
@@ -163,6 +179,61 @@ export default function App() {
     return () => window.clearInterval(id);
   }, [evaluation, isDemo, hasInFlight, pollIntervalMs]);
 
+  // The live-speech transcripts, on their own fetch + poll. Unlike the model
+  // poll (gated by hasInFlight), this one is gated by the transcripts' OWN
+  // status: ASR and alignment finish on a completely different schedule from
+  // the diarizers -- online ASR takes about half the recording's duration, so
+  // it routinely outlives every model run. An empty list (no transcript for
+  // this recording) is a real state, not an error: it renders as an offer to
+  // run one.
+  const transcriptAudioFileId = evaluation && !isDemo ? evaluation.audioFileId : null;
+  useEffect(() => {
+    if (transcriptAudioFileId == null) {
+      setTranscripts([]);
+      return;
+    }
+    let cancelled = false;
+    fetchTranscripts(transcriptAudioFileId)
+      .then((next) => { if (!cancelled) setTranscripts(next); })
+      .catch((error: Error) => console.error("Transcript fetch failed:", error));
+    return () => { cancelled = true; };
+  }, [transcriptAudioFileId]);
+
+  // Any engine still working keeps the poll alive: online and offline can be in
+  // flight at the same time, and each finishes on its own schedule.
+  const transcriptInFlight = transcripts.some((run) => run.status === "queued" || run.status === "running");
+  useEffect(() => {
+    if (transcriptAudioFileId == null || !transcriptInFlight) return;
+    const id = window.setInterval(() => {
+      // The id is captured per interval, so a response that arrives after the
+      // user switched recordings is dropped instead of overwriting the new one.
+      const requested = transcriptAudioFileId;
+      fetchTranscripts(requested)
+        .then((next) => setTranscripts((prev) => (requested === transcriptAudioFileId ? next : prev)))
+        .catch((error: Error) => console.error("Transcript poll failed:", error));
+    }, pollIntervalMs);
+    return () => window.clearInterval(id);
+  }, [transcriptAudioFileId, transcriptInFlight, pollIntervalMs]);
+
+  // The POST returns only the run it started, so it is merged into the list by
+  // engine rather than replacing it -- the other mode's transcript stays on
+  // screen and stays selectable.
+  const handleRunTranscript = useCallback(async (mode: TranscriptionMode) => {
+    if (transcriptAudioFileId == null) return;
+    const started = await startTranscript(transcriptAudioFileId, mode);
+    setTranscripts((prev) => [
+      ...prev.filter((run) => run.asrId !== started.asrId),
+      started,
+    ].sort((a, b) => a.asrId.localeCompare(b.asrId)));
+  }, [transcriptAudioFileId]);
+
+  const registerWordSync = useCallback((sync: ((time: number) => void) | null) => {
+    wordSyncRef.current = sync;
+    // Paint the correct word immediately on (re)registration, so a transcript
+    // that lands mid-playback or a panel remount doesn't wait for the next frame.
+    sync?.(timeRef.current);
+  }, []);
+
   // Model GPU-residency status is platform-wide, not tied to any one
   // evaluation's in-flight state — a model can start loading or unloading
   // because of a completely different evaluation's job. Poll continuously,
@@ -172,6 +243,23 @@ export default function App() {
     const poll = () => fetchModelStatus().then(setModelStatus).catch((error: Error) => console.error("Model status poll failed:", error));
     void poll();
     const id = window.setInterval(poll, pollIntervalMs);
+    return () => window.clearInterval(id);
+  }, [pollIntervalMs]);
+
+  // Re-fetch runtime config on the same cadence. Transcription availability is a
+  // live signal: the offline engine's container can finish its (minutes-long)
+  // cold start after the page has loaded, and the Live Speech toggle must enable
+  // itself then rather than staying disabled until a manual reload. The initial
+  // fetch above handles first paint; this only refreshes. The equality guard
+  // avoids a re-render every tick when nothing changed (the common case).
+  useEffect(() => {
+    const refresh = () =>
+      fetchRuntimeConfig()
+        .then((cfg) =>
+          setRuntimeConfig((prev) => (prev && JSON.stringify(prev) === JSON.stringify(cfg) ? prev : cfg)),
+        )
+        .catch(() => undefined);
+    const id = window.setInterval(refresh, pollIntervalMs);
     return () => window.clearInterval(id);
   }, [pollIntervalMs]);
 
@@ -289,6 +377,7 @@ export default function App() {
     if (miniFillRef.current) miniFillRef.current.style.width = `${pct * 100}%`;
     if (clockRef.current) clockRef.current.textContent = fmt(nextTime);
     if (clock2Ref.current) clock2Ref.current.textContent = fmt(nextTime);
+    wordSyncRef.current?.(nextTime);
     if (playingRef.current && scrollRef.current && innerRef.current) {
       const px = pct * innerRef.current.offsetWidth;
       const view = scrollRef.current.clientWidth;
@@ -433,24 +522,46 @@ export default function App() {
   // project) sends the user straight to the Dashboard tab to see the result.
   // That's the point of the action, not unwanted tab coupling — but nothing
   // else about tab access depends on it.
-  const startFlow = useCallback(() => {
-    audioRef.current?.pause();
-    const demo = getDiarizationEvaluation();
-    setEvaluation(demo);
-    setActive(Object.fromEntries(demo.models.map((model) => [model.id, true])));
-    setParams(deriveDefaultParams(demo));
-    setEvalCfg(deriveDefaultEval(demo));
-    setCurrent(null);
+  // Shared tail of both ingestion paths (file upload and pulled recording):
+  // reconcile the ack against the backend, persist the Project card, navigate.
+  const finishIngest = useCallback(async (ack: UploadAck, displayName: string, uploadStart: number) => {
+    const uploadMs = Math.round(performance.now() - uploadStart);
+    const initial = await fetchEvaluation(ack.audioFileId);
+    void patchUploadTiming(ack.audioFileId, uploadMs).catch((error: Error) => console.error("Could not save upload time:", error));
+    const withUpload: DiarizationEvaluation = { ...initial, uploadMs };
+    setEvaluation(withUpload);
+    setActive(Object.fromEntries(withUpload.models.map((model) => [model.id, true])));
+    setParams(deriveDefaultParams(withUpload));
+    setEvalCfg(deriveDefaultEval(withUpload));
+    const project: Project = {
+      id: Date.now(),
+      audioFileId: ack.audioFileId,
+      name: displayName,
+      date: new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }),
+      duration: fmt(withUpload.durationSec),
+      models: withUpload.models.length,
+      speakers: Math.max(0, ...withUpload.models.map((run) => run.numSpk)),
+      fresh: true,
+    };
+    persistProjects([project, ...projects]);
+    setCurrent(project);
     timeRef.current = 0;
     sigRef.current = "";
     setTime(0);
-    setNav("dashboard");
-    setWorkflow("idle");
-    setPlaying(false);
-  }, []);
+    // "Open dashboard as soon as audio lands" is what actually moves the user
+    // off the Upload tab; when it's off they stay put and can switch to
+    // Dashboard whenever they choose.
+    if (streamInline) setNav("dashboard");
+    setWorkflow(streamInline ? "idle" : "processing");
+  }, [projects, streamInline]);
+
+  const enabledModelIds = useCallback(
+    () => catalogModels.filter((model) => active[model.id]).map((model) => model.id) as ModelId[],
+    [active, catalogModels],
+  );
 
   const startRealUpload = useCallback((file: File) => {
-    const modelIds: ModelId[] = catalogModels.filter((model) => active[model.id]).map((model) => model.id);
+    const modelIds = enabledModelIds();
     if (modelIds.length === 0) {
       window.alert("Enable at least one model in Settings before uploading.");
       return;
@@ -465,42 +576,42 @@ export default function App() {
 
     const uploadStart = performance.now();
     uploadAudio(file, modelIds, (pct) => setUploadPct(pct))
-      .then(async (ack) => {
-        const uploadMs = Math.round(performance.now() - uploadStart);
-        const initial = await fetchEvaluation(ack.audioFileId);
-        void patchUploadTiming(ack.audioFileId, uploadMs).catch((error: Error) => console.error("Could not save upload time:", error));
-        const withUpload: DiarizationEvaluation = { ...initial, uploadMs };
-        setEvaluation(withUpload);
-        setActive(Object.fromEntries(withUpload.models.map((model) => [model.id, true])));
-        setParams(deriveDefaultParams(withUpload));
-        setEvalCfg(deriveDefaultEval(withUpload));
-        const project: Project = {
-          id: Date.now(),
-          audioFileId: ack.audioFileId,
-          name: file.name,
-          date: new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }),
-          duration: fmt(withUpload.durationSec),
-          models: withUpload.models.length,
-          speakers: Math.max(0, ...withUpload.models.map((run) => run.numSpk)),
-          fresh: true,
-        };
-        persistProjects([project, ...projects]);
-        setCurrent(project);
-        timeRef.current = 0;
-        sigRef.current = "";
-        setTime(0);
-        // "Open dashboard as soon as audio uploads" is what actually moves the
-        // user off the Upload tab; when it's off they stay put and can switch
-        // to Dashboard whenever they choose.
-        if (streamInline) setNav("dashboard");
-        setWorkflow(streamInline ? "idle" : "processing");
-      })
+      .then((ack) => finishIngest(ack, file.name, uploadStart))
       .catch((error: Error) => {
         console.error(error);
         window.alert(`Upload failed: ${error.message}`);
         setWorkflow("idle");
       });
-  }, [active, catalogModels, projects, streamInline]);
+  }, [enabledModelIds, finishIngest]);
+
+  const startBlobIngest = useCallback((url: string, token?: string) => {
+    const modelIds = enabledModelIds();
+    if (modelIds.length === 0) {
+      window.alert("Enable at least one model in Settings before ingesting.");
+      return;
+    }
+    audioRef.current?.pause();
+    setEvaluation(null);
+    // The backend does the fetch, so there's no client-side byte progress; the
+    // uploading screen shows an indeterminate state until the ack returns.
+    // Label the recording by its agendaItemId (the last path segment), not the
+    // full sessionId/agendaItemId.
+    const displayName = url.replace(/\/stream\/?$/, "").split("/").filter(Boolean).at(-1) || "recording";
+    setUploadName(displayName);
+    setNav("upload");
+    setWorkflow("uploading");
+    setUploadPct(0);
+    setPlaying(false);
+
+    const uploadStart = performance.now();
+    ingestRecording(url, token, modelIds)
+      .then((ack) => finishIngest(ack, displayName, uploadStart))
+      .catch((error: Error) => {
+        console.error(error);
+        window.alert(`Ingest failed: ${error.message}`);
+        setWorkflow("idle");
+      });
+  }, [enabledModelIds, finishIngest]);
 
   // Play, self-healing under load. "No supported sources" means the browser
   // abandoned a source that stalled (networkState NETWORK_NO_SOURCE); a fresh
@@ -697,7 +808,7 @@ export default function App() {
           active={active}
           projects={projects}
           onFile={startRealUpload}
-          onLoadDemo={startFlow}
+          onLoadBlob={startBlobIngest}
           onSettings={() => handleNav("settings")}
           onOpenProject={openProject}
           onProjects={() => handleNav("projects")}
@@ -766,8 +877,11 @@ export default function App() {
               models={dashboardModels}
               active={active}
               time={time}
-              events={events}
+              transcripts={transcripts}
               feed={feed}
+              runtimeConfig={runtimeConfig}
+              onRunTranscript={evaluation && !isDemo ? handleRunTranscript : undefined}
+              wordSyncRef={registerWordSync}
               clockRef={(node) => { clock2Ref.current = node; }}
             />
           </section>

@@ -158,8 +158,8 @@ export function SettingsView({
         <Row label="Neon glow on active speech" desc="Highlight currently-detected segments on each track.">
           <Toggle on={glow} onClick={onGlow} label="Neon glow" />
         </Row>
-        <Row label="Live event feed" desc="Show the who-spoke-when feed in the insights panel.">
-          <Toggle on={feed} onClick={onFeed} label="Live event feed" />
+        <Row label="Live speech transcript" desc="Show the word-level transcript in the insights panel, highlighting each word as it is spoken. The transcript itself is always produced; this only controls the panel.">
+          <Toggle on={feed} onClick={onFeed} label="Live speech" />
         </Row>
       </Section>
 

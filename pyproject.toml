@@ -20,6 +20,11 @@ dependencies = [
     "rq>=1.16",
     "redis>=5.0",
     "python-dotenv>=1.0",
+    # TryHamsa STT speaks a streaming WebSocket protocol, and it is the default
+    # (online) transcription engine -- so this belongs in the base deps, not in
+    # the heavy `models` extra. A worker must be able to transcribe without a
+    # CUDA-only install.
+    "websockets>=13.0",
 ]
 
 # Heavy, GPU-oriented local diarization engines. NOT installed by default -
@@ -39,6 +44,16 @@ models = [
     # for any platform unless pinned here directly.
     "sherpa-onnx-core>=1.13",
     "numpy>=1.26",
+    # Word-level timings for the live-speech transcript, in both transcription
+    # modes. The PyPI package NAMED "ctc-forced-aligner" is an unrelated
+    # English-only ONNX aligner (github.com/deskpai/ctc_forced_aligner) that
+    # squats the name -- the MMS forced aligner this platform needs only exists
+    # on GitHub, hence the direct source pin.
+    "ctc-forced-aligner @ git+https://github.com/MahmoudAshraf97/ctc-forced-aligner.git",
+    # Required by the aligner above (>=5.4 is what its MMS model loading path
+    # needs on this host). Verified alongside pyannote.audio 4.0.7, which keeps
+    # importing cleanly with the huggingface-hub 1.x that this pulls in.
+    "transformers>=5.4.0",
 ]
 
 # Installed by default with `uv sync` (uv treats "dev" as a default group).
@@ -56,6 +71,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["apps", "packages"]
+
+# The `models` extra pins ctc-forced-aligner straight from GitHub, because the
+# PyPI package of that name is an unrelated project squatting it. Hatchling
+# refuses direct references (VCS/URL deps) unless this is set.
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 markers = [

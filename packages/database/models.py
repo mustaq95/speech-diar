@@ -7,7 +7,7 @@ stores a model's raw native output.
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, JSON, func
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, JSON, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -71,6 +71,56 @@ class EvaluationResult(Base):
     processing_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     audio_file: Mapped[AudioFile] = relationship(back_populates="results")
+
+
+class TranscriptResult(Base):
+    """One live-speech transcript per (audio file, ASR engine): ASR text plus
+    the forced aligner's word timings.
+
+    Separate from `EvaluationResult` rather than another row there, because
+    this is transcription, not diarization: it carries text (which the
+    diarization contract has no field for), it has no speaker segments, and
+    its two stages are timed independently instead of sharing one
+    `processing_ms`.
+
+    Keyed per engine, the same shape `EvaluationResult` uses per model: this is
+    a comparison tool, so an online and an offline transcript of the same
+    recording must coexist. Re-running one engine resets its own row and leaves
+    the other engine's result untouched.
+    """
+
+    __tablename__ = "transcript_results"
+    __table_args__ = (
+        UniqueConstraint("audio_file_id", "asr_id", name="uq_transcript_results_audio_file_asr"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    audio_file_id: Mapped[int] = mapped_column(ForeignKey("audio_files.id"), index=True)
+    # The engine that ACTUALLY produced this transcript ("hamsa" |
+    # "cohere-transcribe"), stamped from the mode chosen for this run when the
+    # job is enqueued. Half the row's identity, not a label: a run in the other
+    # mode writes its OWN row and can never relabel this one. The UI's mode
+    # indicator reads this column.
+    asr_id: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(16), default="queued")  # queued|running|done|failed
+    # Which of the two stages is live, or the one that failed; cleared on
+    # success. Not a status in its own right -- `status` stays the single
+    # queued/running/done/failed vocabulary the rest of the platform uses.
+    stage: Mapped[str | None] = mapped_column(String(16), nullable=True)  # asr|align
+    error: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    # Written when the ASR stage finishes, so the UI can show the transcript
+    # while alignment is still running. Text, not String: a 2-hour recording's
+    # transcript has no useful length bound.
+    text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # list[TranscriptWord] JSON; written when the alignment stage finishes.
+    words: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    asr_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    align_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    asr_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    align_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    audio_file: Mapped[AudioFile] = relationship()
 
 
 class ModelContainerState(Base):

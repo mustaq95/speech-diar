@@ -1,0 +1,122 @@
+# Cohere Transcribe Arabic (CohereLabs, Apache-2.0) -- a 2B Arabic/English
+# speech-to-text model, served through vLLM's OpenAI-compatible transcription
+# API. This is the OFFLINE transcription engine: audio stays on this host,
+# unlike the online TryHamsa path which streams to a remote endpoint. The Live
+# Speech panel selects online vs offline per run.
+#
+# Service: cohere-transcribe -- HTTP :9025 (POST /v1/audio/transcriptions,
+# GET /health)
+#
+# Unlike the diarization containers, this one is NOT managed by the GPU
+# supervisor (apps/background_worker/supervisor/): it does not consume a
+# MAX_RESIDENT_MODELS slot, is never evicted or idle-unloaded, and is expected
+# to stay up once started. That is a deliberate choice -- see the "Accepted
+# risk" section of the live-speech plan. The consequence is that the memory
+# flags below are the ONLY thing bounding this container's footprint, so they
+# are sized conservatively rather than left to vLLM's defaults.
+#
+# Prereqs: cp deploy/cohere-transcribe/cohere-transcribe.env.example \
+#             deploy/cohere-transcribe/cohere-transcribe.env
+#          # set HF_TOKEN -- the model repo is GATED
+#          ./deploy/cohere-transcribe/cohere_transcribe_up.sh
+
+services:
+  cohere-transcribe:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cohere-transcribe:local
+    container_name: cohere-transcribe
+    restart: unless-stopped
+    gpus: all
+    ipc: host
+    shm_size: "8gb"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    environment:
+      # See deploy/vibevoice/docker-compose.vibevoice.yml: Xet's chunked
+      # parallel transfer was observed on this host silently producing
+      # truncated safetensors shards. Plain sequential HTTP fails loudly and
+      # resumes instead.
+      HF_HUB_DISABLE_XET: "1"
+      PYTORCH_ALLOC_CONF: "expandable_segments:True"
+      # This host's GPU is sm_121a (GB10/DGX Spark Blackwell). Triton ships
+      # its OWN bundled ptxas (V12.8.93) and uses it by default, which does
+      # not know that arch -- every torch.compile / CUDA-graph kernel dies
+      # with `ptxas fatal: Value 'sm_121a' is not defined for option
+      # 'gpu-name'` and the engine never starts. The cu130 base image's
+      # TOOLKIT ptxas does support it, so point Triton at that one. The base
+      # image alone is necessary but NOT sufficient -- both halves are
+      # required. See deploy/vibevoice/Dockerfile:18-39 and
+      # vllm-project/vllm#33313.
+      TRITON_PTXAS_PATH: "/usr/local/cuda/bin/ptxas"
+      # vLLM's transcription endpoint rejects audio on BOTH size and duration
+      # before the model ever sees it, and its defaults are sized for OpenAI's
+      # API (25MB / 30s), not for this platform's uploads. Both gates were hit
+      # live on moss-transcribe: a 32-minute upload died in 0.5s with a bare
+      # 400, because the filesize check is a plain len(bytes) comparison that
+      # runs before any decode. Sized to this platform's stated ceiling ("WAV,
+      # up to 2 hours" in the upload UI); uploads reach here as 16kHz mono s16
+      # (upload.py), so 2h = ~220MB.
+      VLLM_MAX_AUDIO_CLIP_FILESIZE_MB: "256"
+      VLLM_MAX_AUDIO_DECODE_DURATION_S: "7200"
+    env_file:
+      - path: cohere-transcribe.env
+        required: false
+    # Appended to the image's ["vllm", "serve"] entrypoint.
+    command:
+      - ${COHERE_TRANSCRIBE_MODEL_ID:-CohereLabs/cohere-transcribe-arabic-07-2026}
+      # The worker addresses the model by this name, not by the HF repo id --
+      # keeps apps/background_worker/transcription/cohere/runner.py stable if
+      # COHERE_TRANSCRIBE_MODEL_ID is ever repointed.
+      - --served-model-name=cohere-transcribe
+      # vLLM has a native implementation of the architecture, but AutoProcessor
+      # still loads the repo's custom feature-extractor code.
+      - --trust-remote-code
+      - --dtype=bfloat16
+      # Free-memory admission gate ONLY, not the KV cache size (that is the
+      # absolute reservation below). vLLM refuses to start unless
+      # `free_memory >= total * util`, and that check runs even when
+      # --kv-cache-memory-bytes is set, despite its docstring implying
+      # otherwise. Kept low so this container can still start on a GPU that
+      # already has diarization models resident -- which, being exempt from the
+      # residency cap, is the normal case for it.
+      - --gpu-memory-utilization=${COHERE_TRANSCRIBE_GPU_MEM_UTIL:-0.15}
+      # ...and this sets the KV cache to an ABSOLUTE size, which is what makes
+      # the container robust when other models share the GPU. The fraction path
+      # sizes the cache as `total * util - non_kv_cache_memory`, where
+      # non_kv_cache_memory comes from a profile run whose non-torch delta
+      # absorbs whatever OTHER processes allocate during that window; on a real
+      # multi-model run that went negative and killed the engine with "No
+      # available memory for the cache blocks". Reserving bytes skips the
+      # profiling entirely. 4GiB is ample for an ASR model whose context is a
+      # short audio window plus a transcript, not a 128k chat history.
+      - --kv-cache-memory-bytes=${COHERE_TRANSCRIBE_KV_CACHE_BYTES:-4294967296}
+      # The multimodal ENCODER CACHE, despite the name: vLLM sets
+      # `encoder_cache_size = max_num_batched_tokens` and a single audio item
+      # cannot be split across batches. If vLLM hands this model a whole long
+      # file as one item (the way it does for MOSS), the default 2048 rejects
+      # anything past a couple of minutes. This model's feature extractor
+      # documents its own chunking, so the whole-file case may not arise --
+      # 32768 is a middle setting that covers long inputs either way at a
+      # trivial cost (~32768 x 1024 x 2 = ~67MB). See the env file.
+      - --max-num-batched-tokens=${COHERE_TRANSCRIBE_MAX_BATCHED_TOKENS:-32768}
+      # The platform serializes one transcript job at a time, so there is never
+      # real concurrent load; this just allows a stray manual/smoke request
+      # without preempting an in-flight job.
+      - --max-num-seqs=${COHERE_TRANSCRIBE_MAX_NUM_SEQS:-2}
+      - --port=8000
+    ports:
+      - "${COHERE_TRANSCRIBE_PORT:-9025}:8000"
+    volumes:
+      - cohere-transcribe-cache:/root/.cache/huggingface
+      # torch.compile / CUDA-graph capture artifacts, so a restart does not
+      # re-pay the compile cost.
+      - cohere-transcribe-vllm-cache:/root/.cache/vllm
+
+volumes:
+  cohere-transcribe-cache:
+    name: cohere-transcribe-cache
+  cohere-transcribe-vllm-cache:
+    name: cohere-transcribe-vllm-cache
