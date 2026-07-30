@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import type { ActiveMap, ModelRun } from "../types";
 import type { TranscriptionMode, TranscriptRun } from "../types/diarization";
 import type { RuntimeConfig } from "../adapters";
@@ -73,7 +74,9 @@ function wordIndexAt(starts: number[], time: number): number {
  *    when the set of speaking models changes — see commit 147312b, "Fix tab
  *    freeze on rapid timeline seeking". A state update per spoken word would
  *    undo exactly that. So the word spans render once, and `wordSyncRef` hands
- *    App.tsx a callback that moves a single class between two spans.
+ *    App.tsx a callback that moves a single class between two spans. That class
+ *    has to outrank the speaker tint, which is why the tint travels as CSS
+ *    custom properties rather than as an inline `color` (see the render below).
  *
  * 2. **Speaker tint is labelled, not implied.** No ASR engine here reports
  *    speakers, so the colors come from whichever diarization model is picked in
@@ -324,7 +327,12 @@ export function LiveSpeech({ transcripts, models, active, runtimeConfig, onRun, 
                   <span
                     ref={(node) => { spansRef.current[index] = node; }}
                     className={`ls-word${word.overlap ? " is-overlap" : ""}`}
-                    style={color ? { color, background: hexA(color, 0.1) } : undefined}
+                    // Custom properties, not `color`/`background` directly: an inline
+                    // declaration outranks every stylesheet rule, so writing the tint
+                    // straight here would stop `.is-current` from ever painting the
+                    // playback cursor on a word that has a speaker. index.css reads
+                    // these at one-class specificity so the cursor wins.
+                    style={color ? ({ "--ls-spk": color, "--ls-spk-bg": hexA(color, 0.1) } as CSSProperties) : undefined}
                     title={`${fmtWordTime(word.s)}–${fmtWordTime(word.e)}`}
                   >
                     {word.w}

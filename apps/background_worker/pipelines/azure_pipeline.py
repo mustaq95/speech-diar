@@ -7,6 +7,13 @@ the local lane.
 
 This module NEVER touches MinIO — see `local_pipeline.py` for the primary
 lane, which is entirely separate.
+
+DB sessions are short-lived and never held across the Azure call — the rule
+`local_pipeline.py` documents at its top. A batch job on real audio runs for
+minutes, far past the 60 s `idle_in_transaction_session_timeout` backstop in
+`packages/database/session.py`: holding a session open across it got the
+connection killed mid-job, so `mark_done` raised and the `mark_failed` meant
+to catch that raised too, stranding the row at "running" forever.
 """
 
 import audioop
@@ -105,17 +112,28 @@ def run_azure_model(audio_file_id: int, model_id: str) -> None:
             mark_failed(session, result, "Audio was not stored in Azure Blob for the azure lane")
             return
 
+        blob_key = audio_file.blob_key
         mark_running(session, result)
 
-        try:
-            sas_url = _sas_url_for_azure_batch(audio_file.blob_key)
-            raw = model.runner.run(sas_url)
-            run = normalize_model_run(model.adapter.adapt(raw))
-        except Exception as exc:
-            logger.exception("Azure model %r failed on audio_file_id=%s", model_id, audio_file_id)
-            mark_failed(session, result, str(exc))
-            return
+    try:
+        sas_url = _sas_url_for_azure_batch(blob_key)
+        raw = model.runner.run(sas_url)
+        run = normalize_model_run(model.adapter.adapt(raw))
+    except Exception as exc:
+        logger.exception("Azure model %r failed on audio_file_id=%s", model_id, audio_file_id)
+        with SessionLocal() as session:
+            result = get_result_row(session, audio_file_id, model_id)
+            # The row can be deleted while the job runs — this lane's window is
+            # up to azure_batch_job_timeout_sec (1800s), the widest there is.
+            # Same "dropping stale job" outcome as the lookup above, not a crash
+            # inside the exception handler.
+            if result is not None:
+                mark_failed(session, result, str(exc))
+        return
 
-        # Prefer Azure's own reported job duration; fall back to worker wall-clock.
-        processing_ms = model.adapter.processing_ms(raw)
-        mark_done(session, result, run.model_dump(by_alias=True, mode="json"), processing_ms=processing_ms)
+    with SessionLocal() as session:
+        result = get_result_row(session, audio_file_id, model_id)
+        if result is not None:
+            # Prefer Azure's own reported job duration; fall back to worker wall-clock.
+            processing_ms = model.adapter.processing_ms(raw)
+            mark_done(session, result, run.model_dump(by_alias=True, mode="json"), processing_ms=processing_ms)

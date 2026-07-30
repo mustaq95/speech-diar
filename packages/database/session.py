@@ -16,6 +16,12 @@ DEV_USER_EMAIL = "dev@example.com"
 engine = create_engine(
     get_settings().database_url,
     future=True,
+    # The flip side of the timeout below: once Postgres kills a connection the
+    # pool still hands it out, and the failure surfaces later as an
+    # InternalError on whatever statement happens to run next (it surfaced as a
+    # commit that had nothing to do with the session that actually leaked).
+    # Costs one trivial round-trip per checkout.
+    pool_pre_ping=True,
     # Backstop against a leaked/abandoned session (e.g. an aborted streaming
     # response) permanently starving the pool: Postgres kills it after 60s
     # of holding an open transaction instead of holding it forever.

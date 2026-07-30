@@ -294,6 +294,94 @@ def test_azure_pipeline_engine_failure_marks_failed(db_session_factory: sessionm
     assert "Azure said no" in result.error
 
 
+# --- azure_pipeline: session lifetime -------------------------------------
+
+
+class _SessionTracker:
+    """Wraps a session factory and counts how many sessions are currently open."""
+
+    def __init__(self, factory: sessionmaker[Session]) -> None:
+        self._factory = factory
+        self.open_count = 0
+
+    def __call__(self) -> Session:
+        session = self._factory()
+        self.open_count += 1
+        original_close = session.close
+        closed = False
+
+        def close(*args: Any, **kwargs: Any) -> None:
+            nonlocal closed
+            if not closed:
+                closed = True
+                self.open_count -= 1
+            original_close(*args, **kwargs)
+
+        session.close = close  # type: ignore[method-assign]
+        return session
+
+
+def _sessions_open_while_reaching_azure(
+    db_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch, fake_model: FakeModel
+) -> list[int]:
+    """Installs a tracked session factory and records the open-session count at
+    each point where the pipeline talks to Azure."""
+    tracker = _SessionTracker(db_session_factory)
+    counts: list[int] = []
+    engine_run = fake_model.runner.run
+
+    def run(audio_input: str, params: dict[str, Any] | None = None) -> dict:
+        counts.append(tracker.open_count)
+        return engine_run(audio_input, params)
+
+    fake_model.runner = SimpleNamespace(run=run)
+    monkeypatch.setattr(azure_pipeline, "SessionLocal", tracker)
+    monkeypatch.setattr(azure_pipeline, "REGISTRY", {"fake": fake_model})
+    monkeypatch.setattr(azure_pipeline, "read_sas_url", lambda blob_key: counts.append(tracker.open_count) or "https://example.test/x")
+    _stub_well_formed_blob(monkeypatch)
+    return counts
+
+
+def test_azure_pipeline_holds_no_db_session_while_the_batch_job_runs(
+    db_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression. An Azure batch job runs for minutes on real audio, far past
+    the 60 s `idle_in_transaction_session_timeout` that
+    packages/database/session.py sets on every connection. Holding a session
+    open across it got the connection killed mid-job, so `mark_done` raised —
+    and so did the `mark_failed` in the except arm, since it shared the same
+    dead session. Nothing wrote a terminal status and the row sat at "running"
+    forever while the UI counted up. Caught live on a 7:40 recording."""
+    audio_file_id = _seed(db_session_factory, s3_key=None, blob_key="uploads/slow.wav")
+    fake_model = FakeModel(processing_ms=4242)
+    counts = _sessions_open_while_reaching_azure(db_session_factory, monkeypatch, fake_model)
+
+    azure_pipeline.run_azure_model(audio_file_id, "fake")
+
+    assert counts == [0, 0]  # SAS build and engine call, both with no session held
+    result = _status(db_session_factory, audio_file_id, "fake")
+    assert result.status == "done"
+    assert result.processing_ms == 4242
+
+
+def test_azure_pipeline_engine_failure_marks_failed_on_a_fresh_session(
+    db_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The half of the same bug that hid it: with no session open when the
+    engine raises, `mark_failed` has to open its own, so the row still reaches
+    a terminal state."""
+    audio_file_id = _seed(db_session_factory, s3_key=None, blob_key="uploads/slow.wav")
+    fake_model = FakeModel(error=RuntimeError("Azure said no"))
+    counts = _sessions_open_while_reaching_azure(db_session_factory, monkeypatch, fake_model)
+
+    azure_pipeline.run_azure_model(audio_file_id, "fake")
+
+    assert counts == [0, 0]
+    result = _status(db_session_factory, audio_file_id, "fake")
+    assert result.status == "failed"
+    assert "Azure said no" in result.error
+
+
 # --- azure_pipeline: bad-header repair ------------------------------------
 
 

@@ -15,6 +15,7 @@ Configuration: AZURE_SPEECH_KEY + AZURE_SPEECH_REGION (or AZURE_SPEECH_ENDPOINT)
 in `.env`, read via `packages/config/settings.py`.
 """
 
+import logging
 import time
 from typing import Any
 
@@ -23,6 +24,8 @@ import requests
 from packages.config.settings import get_settings
 
 from ..base_model import ModelRunner
+
+logger = logging.getLogger(__name__)
 
 # Native shape: the v3.2 batch result JSON —
 # {"durationInTicks": ..., "recognizedPhrases": [{"speaker": 1,
@@ -81,7 +84,8 @@ class AzureBatchRunner(ModelRunner[AzureBatchRawOutput]):
         job_url = submit.json()["self"]
 
         try:
-            deadline = time.monotonic() + settings.azure_batch_job_timeout_sec
+            started = time.monotonic()
+            deadline = started + settings.azure_batch_job_timeout_sec
             while True:
                 # Deadline check comes BEFORE the GET: this is a paid API, so
                 # once the timeout expires no further calls go out (the
@@ -91,6 +95,10 @@ class AzureBatchRunner(ModelRunner[AzureBatchRawOutput]):
                     raise RuntimeError(f"Batch job timed out after {settings.azure_batch_job_timeout_sec}s")
                 job = requests.get(job_url, headers=headers, timeout=60).json()
                 status = job.get("status")
+                # Azure queues batch jobs, so a long wait here is normal and
+                # says nothing about audio length. Without this line the loop
+                # is a black box and any stall looks identical to a hang.
+                logger.info("azure-batch job %s: status=%s after %.0fs", job_url.rsplit("/", 1)[-1], status, time.monotonic() - started)
                 if status == "Succeeded":
                     break
                 if status == "Failed":
