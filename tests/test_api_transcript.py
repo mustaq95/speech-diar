@@ -434,3 +434,151 @@ def test_evaluation_payload_does_not_carry_the_transcript(
     body = client.get(f"/evaluations/{audio_file_id}").json()
 
     assert set(body) == {"audioFileId", "durationSec", "uploadMs", "models"}
+
+
+# --- GET /evaluations/{id}/transcript/{asr_id}/raw ------------------------
+
+
+def test_get_transcript_raw_output_returns_the_asr_engines_native_output(
+    client: TestClient, db_session_factory: sessionmaker[Session]
+) -> None:
+    """hamsa's adapter joins its whole frame log down to one string. The route
+    hands back the frames, which is the only place the per-frame detail exists."""
+    audio_file_id = _recording(db_session_factory)
+    frames = [
+        {"type": "partial", "text": "mar"},
+        {"type": "final", "text": "marhaba", "start": 0.1, "end": 0.9},
+    ]
+    with db_session_factory() as session:
+        session.add(
+            TranscriptResult(
+                audio_file_id=audio_file_id, asr_id="hamsa", status="done", text="marhaba", raw_output=frames
+            )
+        )
+        session.commit()
+
+    response = client.get(f"/evaluations/{audio_file_id}/transcript/hamsa/raw")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["asrId"] == "hamsa"
+    assert body["status"] == "done"
+    assert body["rawOutput"] == frames
+    assert body["run"]["text"] == "marhaba"
+
+
+def test_get_transcript_raw_output_is_keyed_per_engine(
+    client: TestClient, db_session_factory: sessionmaker[Session]
+) -> None:
+    """Both engines' transcripts coexist, so asking for one must never return the
+    other's raw output."""
+    audio_file_id = _recording(db_session_factory)
+    with db_session_factory() as session:
+        session.add_all([
+            TranscriptResult(
+                audio_file_id=audio_file_id, asr_id="hamsa", status="done", text="online", raw_output=[{"f": 1}]
+            ),
+            TranscriptResult(
+                audio_file_id=audio_file_id,
+                asr_id="cohere-transcribe",
+                status="done",
+                text="offline",
+                raw_output={"text": "offline", "usage": {"total_tokens": 12}},
+            ),
+        ])
+        session.commit()
+
+    online = client.get(f"/evaluations/{audio_file_id}/transcript/hamsa/raw").json()
+    offline = client.get(f"/evaluations/{audio_file_id}/transcript/cohere-transcribe/raw").json()
+
+    assert online["rawOutput"] == [{"f": 1}]
+    # The usage block is exactly what cohere's adapter drops on the way to text.
+    assert offline["rawOutput"]["usage"] == {"total_tokens": 12}
+
+
+def test_get_transcript_raw_output_is_null_before_the_asr_stage_finishes(
+    client: TestClient, db_session_factory: sessionmaker[Session]
+) -> None:
+    audio_file_id = _recording(db_session_factory)
+    with db_session_factory() as session:
+        session.add(TranscriptResult(audio_file_id=audio_file_id, asr_id="hamsa", status="running", stage="asr"))
+        session.commit()
+
+    response = client.get(f"/evaluations/{audio_file_id}/transcript/hamsa/raw")
+    assert response.status_code == 200
+    assert response.json()["rawOutput"] is None
+
+
+def test_get_transcript_raw_output_404s_when_that_engine_never_ran(
+    client: TestClient, db_session_factory: sessionmaker[Session]
+) -> None:
+    audio_file_id = _recording(db_session_factory)
+
+    assert client.get(f"/evaluations/{audio_file_id}/transcript/hamsa/raw").status_code == 404
+
+
+def test_get_transcript_raw_output_404s_for_an_unknown_engine(
+    client: TestClient, db_session_factory: sessionmaker[Session]
+) -> None:
+    audio_file_id = _recording(db_session_factory)
+
+    assert client.get(f"/evaluations/{audio_file_id}/transcript/not-an-engine/raw").status_code == 404
+
+
+def test_transcript_list_does_not_carry_raw_output(
+    client: TestClient, db_session_factory: sessionmaker[Session]
+) -> None:
+    """The transcript list is polled on its own timer while a run is in flight;
+    hamsa's frame log must not ride along on it."""
+    audio_file_id = _recording(db_session_factory)
+    with db_session_factory() as session:
+        session.add(
+            TranscriptResult(
+                audio_file_id=audio_file_id, asr_id="hamsa", status="done", text="hi", raw_output=[{"f": 1}]
+            )
+        )
+        session.commit()
+
+    body = client.get(f"/evaluations/{audio_file_id}/transcript").json()
+    assert len(body) == 1
+    assert "rawOutput" not in body[0]
+
+
+def test_rerunning_an_engine_clears_its_raw_output(
+    client: TestClient, db_session_factory: sessionmaker[Session], fake_queue: Queue
+) -> None:
+    audio_file_id = _recording(db_session_factory)
+    with db_session_factory() as session:
+        session.add(
+            TranscriptResult(
+                audio_file_id=audio_file_id, asr_id="hamsa", status="done", text="old", raw_output=[{"f": 1}]
+            )
+        )
+        session.commit()
+
+    response = client.post(f"/evaluations/{audio_file_id}/transcript", json={"mode": "online"})
+    assert response.status_code == 200
+
+    raw = client.get(f"/evaluations/{audio_file_id}/transcript/hamsa/raw").json()
+    assert raw["rawOutput"] is None
+    assert raw["status"] == "queued"
+
+
+def test_transcript_raw_output_column_is_not_loaded_by_a_default_query(
+    db_session_factory: sessionmaker[Session],
+) -> None:
+    """The deferral itself, invisible over HTTP."""
+    from sqlalchemy import inspect
+
+    audio_file_id = _recording(db_session_factory)
+    with db_session_factory() as session:
+        session.add(
+            TranscriptResult(
+                audio_file_id=audio_file_id, asr_id="hamsa", status="done", text="hi", raw_output={"big": "blob"}
+            )
+        )
+        session.commit()
+
+    with db_session_factory() as session:
+        row = session.query(TranscriptResult).filter_by(audio_file_id=audio_file_id).one()
+        assert "raw_output" in inspect(row).unloaded
+        assert row.raw_output == {"big": "blob"}

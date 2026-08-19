@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 from rq import Queue
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session, sessionmaker, undefer
 
 from apps.background_worker.transcription import pipeline
 from packages.database.models import AudioFile, TranscriptResult, User
@@ -55,7 +55,15 @@ def wired(
 
 def _row(factory: sessionmaker[Session], audio_file_id: int, asr_id: str = "hamsa") -> TranscriptResult:
     with factory() as session:
-        return session.query(TranscriptResult).filter_by(audio_file_id=audio_file_id, asr_id=asr_id).one()
+        return (
+            session.query(TranscriptResult)
+            # raw_output is deferred on the model, so it is not loaded by
+            # default -- and the row is detached once this session closes, after
+            # which loading it raises DetachedInstanceError.
+            .options(undefer(TranscriptResult.raw_output))
+            .filter_by(audio_file_id=audio_file_id, asr_id=asr_id)
+            .one()
+        )
 
 
 def _stub_engine(monkeypatch: pytest.MonkeyPatch, asr_id: str, text: str, calls: list[str] | None = None):
@@ -85,6 +93,9 @@ def test_asr_persists_text_and_its_own_timing_then_queues_alignment(
     # the panel distinguishes "not measured" from "measured as fast".
     assert row.align_ms is None
     assert row.words is None
+    # The engine's native output, kept verbatim beside the text its adapter
+    # reduced it to.
+    assert row.raw_output == {"native": "مرحبا بكم"}
 
     jobs = wired.queue.get_jobs()
     assert [job.func_name.rsplit(".", 1)[-1] for job in jobs] == ["run_align"]
@@ -171,6 +182,9 @@ def test_empty_transcript_completes_without_queueing_alignment(
     assert row.stage is None
     assert row.text == ""
     assert row.asr_ms is not None
+    # This path commits separately from the normal one, and it is the case where
+    # the native output matters most: it is what explains an empty transcript.
+    assert row.raw_output == {"native": ""}
     assert wired.queue.count == 0
 
 

@@ -78,6 +78,24 @@ export interface DiarizationEvaluation {
   models: DiarizationModelRun[];
 }
 
+/** One model's run on one recording, both representations side by side.
+ *
+ * An inspection surface, served only by `GET /evaluations/{id}/models/{modelId}/raw`
+ * and deliberately absent from the polled evaluation response: raw output is the one
+ * thing here that can run to megabytes. `rawOutput` is untyped because its shape is
+ * whatever the engine emits — nothing outside that engine's own adapter may parse it. */
+export interface ModelRawOutput {
+  /** The model this run belongs to. */
+  modelId: string;
+  /** queued|running|done|failed. */
+  status?: ModelStatus;
+  /** The engine's native output, verbatim. Null when the run predates raw-output
+   * persistence or did not reach completion — only a done run stores one. */
+  rawOutput?: Record<string, unknown> | unknown[] | null;
+  /** The adapted contract built from that raw output. */
+  run?: DiarizationModelRun;
+}
+
 /** One word of the transcript, with the timing the aligner gave it. `s`/`e` are
  * undefined when the aligner could not place the word (characters outside the CTC
  * vocabulary); the word is still carried, unplaced, never dropped or guessed. */
@@ -123,6 +141,23 @@ export interface TranscriptRun {
   alignMs?: number;
   /** Failure reason when status === "failed". */
   error?: string;
+}
+
+/** ModelRawOutput's counterpart for one ASR engine's transcript.
+ *
+ * `rawOutput` is the ASR engine's native output only — hamsa's WebSocket frame log
+ * or cohere's response JSON. The aligner's native output is not persisted, because
+ * `run.words` already carries its per-word timings. */
+export interface TranscriptRawOutput {
+  /** Engine that actually ran: "hamsa" | "cohere-transcribe". */
+  asrId: string;
+  /** queued|running|done|failed. */
+  status?: ModelStatus;
+  /** The ASR engine's native output, verbatim. Null when the transcript predates
+   * raw-output persistence or its ASR stage has not finished. */
+  rawOutput?: Record<string, unknown> | unknown[] | null;
+  /** The adapted transcript built from that raw output. */
+  run?: TranscriptRun;
 }
 
 /** One model's initial state right after being enqueued. */

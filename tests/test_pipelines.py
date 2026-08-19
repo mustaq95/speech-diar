@@ -1,7 +1,8 @@
 """Integration tests for the two worker pipelines (local_pipeline.py /
 azure_pipeline.py): each must take one `EvaluationResult` row from
-queued -> running -> done|failed, writing real timing and payload — no
-lane ever touches the other lane's storage function.
+queued -> running -> done|failed, writing real timing, the adapted payload and
+the engine's raw native output — no lane ever touches the other lane's storage
+function.
 """
 
 import io
@@ -10,7 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session, sessionmaker, undefer
 
 from apps.background_worker.pipelines import azure_pipeline, local_pipeline
 from packages.database.models import AudioFile, EvaluationResult
@@ -57,7 +58,16 @@ def _seed(db_session_factory: sessionmaker[Session], *, s3_key: str | None, blob
 
 def _status(db_session_factory: sessionmaker[Session], audio_file_id: int, model_id: str) -> EvaluationResult:
     with db_session_factory() as session:
-        row = session.query(EvaluationResult).filter_by(audio_file_id=audio_file_id, model_id=model_id).one()
+        row = (
+            session.query(EvaluationResult)
+            # raw_output is deferred on the model, so it is NOT loaded by
+            # default -- and the expunge below detaches the row, after which
+            # loading it is impossible (DetachedInstanceError). Undefer here so
+            # callers can assert on it.
+            .options(undefer(EvaluationResult.raw_output))
+            .filter_by(audio_file_id=audio_file_id, model_id=model_id)
+            .one()
+        )
         session.expunge(row)
         return row
 
@@ -85,6 +95,8 @@ def test_local_pipeline_success_marks_done_with_payload_and_timing(
     assert result.started_at is not None and result.finished_at is not None
     assert result.processing_ms is not None and result.processing_ms >= 0
     assert result.payload["numSpk"] == 1
+    # The engine's native output, verbatim beside the adapted payload.
+    assert result.raw_output == {"native": "payload"}
 
 
 def test_local_pipeline_engine_failure_marks_failed_with_error(
@@ -225,6 +237,7 @@ def test_azure_pipeline_success_prefers_adapter_reported_processing_ms(
     result = _status(db_session_factory, audio_file_id, "fake")
     assert result.status == "done"
     assert result.processing_ms == 4242  # Azure's own reported duration, not wall-clock
+    assert result.raw_output == {"native": "payload"}
 
 
 def test_azure_pipeline_falls_back_to_wall_clock_when_adapter_reports_none(

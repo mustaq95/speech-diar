@@ -11,6 +11,13 @@ engine's `runner.py` executes it and returns its NATIVE output, and its
 `adapter.py` is the only code allowed to understand that shape. No abstract
 base class: three single-use engines do not need one.
 
+The ASR engines' native output is also persisted verbatim
+(`TranscriptResult.raw_output`) and served by one inspection route, since
+`adapt` reduces it to a single string — hamsa's whole frame log becomes one
+`" ".join(...)`. It travels as an opaque blob; nothing outside each engine's
+own adapter parses it. The ALIGNER's native output is not kept: `words`
+already carries the per-word timings it produces.
+
 The mode, chosen per run from the Live Speech panel, selects one ASR engine:
 
     online  -> hamsa/             streams to a remote endpoint; audio leaves this host

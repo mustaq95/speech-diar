@@ -136,4 +136,10 @@ def run_azure_model(audio_file_id: int, model_id: str) -> None:
         if result is not None:
             # Prefer Azure's own reported job duration; fall back to worker wall-clock.
             processing_ms = model.adapter.processing_ms(raw)
-            mark_done(session, result, run.model_dump(by_alias=True, mode="json"), processing_ms=processing_ms)
+            mark_done(
+                session,
+                result,
+                run.model_dump(by_alias=True, mode="json"),
+                processing_ms=processing_ms,
+                raw_output=raw,
+            )

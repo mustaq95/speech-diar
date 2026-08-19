@@ -153,6 +153,6 @@ def run_local_model(audio_file_id: int, model_id: str) -> None:
 
     with SessionLocal() as session:
         result = get_result_row(session, audio_file_id, model_id)
-        mark_done(session, result, run.model_dump(by_alias=True, mode="json"))
+        mark_done(session, result, run.model_dump(by_alias=True, mode="json"), raw_output=raw)
         if is_managed(model_id):
             admission.release(session, model_id)

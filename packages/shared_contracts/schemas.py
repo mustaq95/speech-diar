@@ -81,6 +81,30 @@ class DiarizationEvaluation(ContractModel):
     models: list[DiarizationModelRun]
 
 
+class ModelRawOutput(ContractModel):
+    """One model's run on one recording, both representations side by side.
+
+    An inspection surface, served only by `GET
+    /evaluations/{id}/models/{model_id}/raw` and deliberately absent from the
+    polled evaluation response: raw output is the one thing here that can run to
+    megabytes. `raw_output` is left untyped because its shape is whatever the
+    engine emits -- nothing outside that engine's own adapter may parse it.
+    """
+
+    model_id: str = Field(description="The model this run belongs to")
+    status: ModelStatus | None = Field(default=None, description="queued|running|done|failed")
+    raw_output: dict | list | None = Field(
+        default=None,
+        description=(
+            "The engine's native output, verbatim. Null when the run predates raw-output "
+            "persistence or did not reach completion -- only a done run stores one."
+        ),
+    )
+    run: DiarizationModelRun | None = Field(
+        default=None, description="The adapted contract built from that raw output"
+    )
+
+
 class TranscriptWord(ContractModel):
     """One word of the transcript, with the timing the aligner gave it.
 
@@ -130,6 +154,28 @@ class TranscriptRun(ContractModel):
     asr_ms: int | None = Field(default=None, description="Measured wall-clock time of the ASR stage in ms")
     align_ms: int | None = Field(default=None, description="Measured wall-clock time of the alignment stage in ms")
     error: str | None = Field(default=None, description="Failure reason when status == 'failed'")
+
+
+class TranscriptRawOutput(ContractModel):
+    """`ModelRawOutput`'s counterpart for one ASR engine's transcript.
+
+    `raw_output` is the ASR engine's native output only -- hamsa's WebSocket
+    frame log or cohere's response JSON. The aligner's native output is not
+    persisted, because `run.words` already carries its per-word timings.
+    """
+
+    asr_id: str = Field(description="Engine that actually ran: 'hamsa' | 'cohere-transcribe'")
+    status: ModelStatus | None = Field(default=None, description="queued|running|done|failed")
+    raw_output: dict | list | None = Field(
+        default=None,
+        description=(
+            "The ASR engine's native output, verbatim. Null when the transcript predates "
+            "raw-output persistence or its ASR stage has not finished."
+        ),
+    )
+    run: TranscriptRun | None = Field(
+        default=None, description="The adapted transcript built from that raw output"
+    )
 
 
 class QueuedModel(ContractModel):

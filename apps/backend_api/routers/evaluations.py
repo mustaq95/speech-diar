@@ -23,7 +23,7 @@ from apps.background_worker.transcription import (
     asr_id_for_mode,
     engine_for,
 )
-from apps.background_worker.transcription.pipeline import run_asr
+from apps.background_worker.transcription.pipeline import get_transcript_row, run_asr
 from apps.background_worker.worker import run_model
 from apps.backend_api.dependencies import get_current_user, get_db
 from packages.config.settings import get_settings
@@ -31,7 +31,9 @@ from packages.database.models import AudioFile, EvaluationResult, TranscriptResu
 from packages.shared_contracts.schemas import (
     DiarizationEvaluation,
     DiarizationModelRun,
+    ModelRawOutput,
     TranscriptionMode,
+    TranscriptRawOutput,
     TranscriptRun,
     TranscriptWord,
     UploadTimingUpdate,
@@ -151,6 +153,7 @@ def retry_model(
         result.status = "queued"
         result.error = None
         result.payload = None
+        result.raw_output = None
         result.loading_started_at = None
         result.started_at = None
         result.finished_at = None
@@ -160,6 +163,45 @@ def retry_model(
     queue.enqueue(run_model, audio_file.id, model_id)
     logger.info("Queued model %r for audio_file_id=%s", model_id, audio_file.id)
     return _build_evaluation(db, audio_file)
+
+
+@router.get("/{audio_file_id}/models/{model_id}/raw", response_model=ModelRawOutput, response_model_by_alias=True)
+def get_model_raw_output(
+    audio_file_id: int,
+    model_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ModelRawOutput:
+    """One model's native output on this recording, beside the adapted contract.
+
+    What the engine actually emitted, verbatim: the transcript text, per-word
+    timings, confidences and non-speech events that its adapter drops on the way
+    to the unified contract. Served as an opaque blob — nothing here parses it,
+    and the adapter remains the only code that understands a given shape.
+
+    A separate endpoint from `GET /evaluations/{id}` for the same reason the
+    transcript is one: that response is polled every pollIntervalMs while models
+    are in flight, and azure-batch's raw JSON alone runs to megabytes.
+
+    `rawOutput: null` with a 200 means the run exists but stored no raw output —
+    it predates this column, or it failed. A 404 means no run at all.
+    """
+    audio_file = _get_audio_file(db, audio_file_id, current_user)
+    if model_id not in REGISTRY:
+        raise HTTPException(status_code=404, detail=f"Unknown model {model_id!r}")
+
+    result = db.query(EvaluationResult).filter_by(audio_file_id=audio_file.id, model_id=model_id).one_or_none()
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Model {model_id!r} has not run on this recording")
+
+    # Touching `raw_output` is what loads the deferred column; this route is the
+    # only place that pays for it.
+    return ModelRawOutput(
+        model_id=model_id,
+        status=result.status,
+        raw_output=result.raw_output,
+        run=_model_run_from_result(result),
+    )
 
 
 def _transcript_run(row: TranscriptResult) -> TranscriptRun:
@@ -265,6 +307,7 @@ def start_transcript(
         row.error = None
         row.text = None
         row.words = None
+        row.raw_output = None
         row.asr_ms = None
         row.align_ms = None
         row.asr_started_at = None
@@ -274,6 +317,44 @@ def start_transcript(
     queue.enqueue(run_asr, audio_file.id, asr_id)
     logger.info("Queued transcript (%s) for audio_file_id=%s", asr_id, audio_file.id)
     return _transcript_run(row)
+
+
+@router.get(
+    "/{audio_file_id}/transcript/{asr_id}/raw",
+    response_model=TranscriptRawOutput,
+    response_model_by_alias=True,
+)
+def get_transcript_raw_output(
+    audio_file_id: int,
+    asr_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TranscriptRawOutput:
+    """One ASR engine's native output for this recording, beside the transcript.
+
+    `get_model_raw_output`'s counterpart for the transcription subsystem, with
+    the same 200-with-null vs 404 distinction. The ASR engine's output only: the
+    aligner's is not persisted, because `run.words` already carries its per-word
+    timings.
+
+    Keyed on the engine, not the recording — a recording holds one transcript per
+    engine and the online/offline comparison is the point, so there is no single
+    "the" raw output to return.
+    """
+    audio_file = _get_audio_file(db, audio_file_id, current_user)
+    if engine_for(asr_id) is None:
+        raise HTTPException(status_code=404, detail=f"Unknown ASR engine {asr_id!r}")
+
+    row = get_transcript_row(db, audio_file.id, asr_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Engine {asr_id!r} has not transcribed this recording")
+
+    return TranscriptRawOutput(
+        asr_id=asr_id,
+        status=row.status,
+        raw_output=row.raw_output,
+        run=_transcript_run(row),
+    )
 
 
 @router.delete("/{audio_file_id}", status_code=204)

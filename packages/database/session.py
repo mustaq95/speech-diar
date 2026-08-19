@@ -5,7 +5,7 @@ local database (no migrations tool this iteration — see the plan's
 "Design decisions" section).
 """
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from packages.config.settings import get_settings
@@ -39,9 +39,29 @@ def init_db() -> None:
     request is attributed to this one seeded user (see dependencies.py).
     """
     Base.metadata.create_all(bind=engine)
+    _ensure_raw_output_columns()
     with SessionLocal() as session:
         _seed_dev_user(session)
         _seed_model_container_state(session)
+
+
+def _ensure_raw_output_columns() -> None:
+    """Add `raw_output` to the two result tables if it isn't there yet.
+
+    `create_all` above only ever CREATEs; it never ALTERs a table that already
+    exists, and this repo has no migration tool. So a column added to a table
+    that's already deployed has to be added explicitly, or every read of that
+    table fails with UndefinedColumn against an older database.
+
+    Postgres only: on SQLite (the test harness) `create_all` built both tables
+    from the current models a moment ago, so the columns are already there --
+    and SQLite has no ADD COLUMN IF NOT EXISTS to be idempotent with.
+    """
+    if engine.dialect.name != "postgresql":
+        return
+    with engine.begin() as conn:
+        for table in ("evaluation_results", "transcript_results"):
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS raw_output JSON"))
 
 
 def _seed_dev_user(session: Session) -> None:

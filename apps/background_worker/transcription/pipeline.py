@@ -125,7 +125,10 @@ def run_asr(audio_file_id: int, asr_id: str) -> None:
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix) as scratch:
             download_to(s3_key, Path(scratch.name))
-            text = engine.adapt(engine.run(scratch.name))
+            # Two statements, not one: the engine's native output is persisted
+            # verbatim beside the text its adapter reduces it to.
+            raw = engine.run(scratch.name)
+            text = engine.adapt(raw)
     except Exception as exc:
         logger.exception("ASR (%s) failed on audio_file_id=%s", asr_id, audio_file_id)
         with SessionLocal() as session:
@@ -141,6 +144,10 @@ def run_asr(audio_file_id: int, asr_id: str) -> None:
             return
         row.text = text
         row.asr_ms = asr_ms
+        # Above the empty-transcript branch below, so both commit paths keep it:
+        # an empty transcript is the case where the native output is most worth
+        # having, since it is what explains why the engine found nothing.
+        row.raw_output = raw
         if not text:
             # Silence, or speech the engine found nothing in. A legitimate
             # result, not a failure — and there is nothing to align, so the run

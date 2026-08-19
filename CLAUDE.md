@@ -34,7 +34,9 @@ When running Python directly (not via `uv run`), `source .venv/bin/activate` fir
 
 ### Architecture — the rules that constrain every change
 
-**Raw model output never crosses a service boundary.** Every engine emits a different native shape. Each model has a `runner.py` (executes the engine, returns native output untouched) and an `adapter.py` (the *only* code allowed to understand that shape; translates it to `DiarizationModelRun`). API, DB, and frontend speak only the unified contract. Same split exists on the frontend (`apps/frontend/src/adapters/`).
+**Raw model output never crosses a service boundary interpreted.** Every engine emits a different native shape. Each model has a `runner.py` (executes the engine, returns native output untouched) and an `adapter.py` (the *only* code allowed to understand that shape; translates it to `DiarizationModelRun`). API, DB, and frontend speak only the unified contract. Same split exists on the frontend (`apps/frontend/src/adapters/`).
+
+The one exception is deliberate and narrow: native output is persisted verbatim (`EvaluationResult.raw_output`, `TranscriptResult.raw_output`) and served by `GET /evaluations/{id}/models/{model_id}/raw` and `GET /evaluations/{id}/transcript/{asr_id}/raw`, because the adapters necessarily drop real data (transcript text, per-word timings, confidences, non-speech events) that an evaluation tool should not lose. It travels as an **opaque blob**: nothing outside the owning adapter parses it, both columns are `deferred=True` so the polled routes never load them, and no UI renders them.
 
 **Segments are never merged or cleaned up.** This is a KPI evaluation tool — the UI shows exactly what the model produced, including sub-second gaps. One segment per turn the engine reported. Never coalesce.
 

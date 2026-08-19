@@ -52,7 +52,16 @@ def _as_aware_utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
-def mark_done(session: Session, result: EvaluationResult, payload: dict, processing_ms: int | None = None) -> None:
+def mark_done(
+    session: Session,
+    result: EvaluationResult,
+    payload: dict,
+    processing_ms: int | None = None,
+    raw_output: dict | list | None = None,
+) -> None:
+    """`payload` is the adapted contract; `raw_output` is the engine's own native
+    output, stored verbatim and never parsed here. One commit, so a row is never
+    `done` with its raw output missing."""
     finished = datetime.now(timezone.utc)
     result.status = "done"
     result.finished_at = finished
@@ -61,6 +70,7 @@ def mark_done(session: Session, result: EvaluationResult, payload: dict, process
     elif result.started_at is not None:
         result.processing_ms = int((finished - _as_aware_utc(result.started_at)).total_seconds() * 1000)
     result.payload = payload
+    result.raw_output = raw_output
     session.commit()
 
 

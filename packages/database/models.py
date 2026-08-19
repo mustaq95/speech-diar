@@ -1,8 +1,10 @@
 """SQLAlchemy ORM tables.
 
 EvaluationResult.payload stores the unified contract
-(packages/shared_contracts DiarizationModelRun) as JSON — the database never
-stores a model's raw native output.
+(packages/shared_contracts DiarizationModelRun) as JSON. Alongside it,
+`raw_output` keeps the engine's own native output verbatim — stored as an
+opaque blob and served only by the dedicated raw routes, never parsed here.
+TranscriptResult carries the same pair for the live-speech ASR engines.
 """
 
 from datetime import datetime
@@ -55,6 +57,17 @@ class EvaluationResult(Base):
     status: Mapped[str] = mapped_column(String(16), default="queued")  # queued|running|done|failed
     error: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # DiarizationModelRun JSON
+    # The model's NATIVE output, exactly as its runner returned it -- never
+    # parsed or reshaped here. Carries everything the adapter drops (transcript
+    # text, per-word timings, confidences, the engine's own speaker labels).
+    # dict | list because the pyannote and sherpa runners return lists.
+    #
+    # deferred: the only multi-MB column on this table, read by exactly one
+    # route, while GET /evaluations/{id} re-SELECTs every row of it every
+    # FRONTEND_POLL_INTERVAL_MS per in-flight recording. Undeferred, the ORM
+    # would pull each blob out of TOAST on every one of those polls to build a
+    # response that never contains it.
+    raw_output: Mapped[dict | list | None] = mapped_column(JSON, nullable=True, deferred=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     # Worker-measured timing: started/finished bracket the run itself
     # (excludes queue wait); processing_ms = finished - started.
@@ -114,6 +127,14 @@ class TranscriptResult(Base):
     text: Mapped[str | None] = mapped_column(Text, nullable=True)
     # list[TranscriptWord] JSON; written when the alignment stage finishes.
     words: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # The ASR engine's NATIVE output, verbatim -- hamsa's whole WebSocket frame
+    # log (a list) or cohere's bare response JSON (a dict), both of which its
+    # adapter reduces to the single `text` string above. The ALIGNER's native
+    # output is not kept: `words` already carries its per-word timings.
+    #
+    # deferred for the same reason as EvaluationResult.raw_output: the
+    # transcript list is polled on its own timer while a run is in flight.
+    raw_output: Mapped[dict | list | None] = mapped_column(JSON, nullable=True, deferred=True)
     asr_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     align_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

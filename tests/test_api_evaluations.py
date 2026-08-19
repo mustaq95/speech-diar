@@ -9,7 +9,8 @@ from datetime import datetime, timezone
 import pytest
 from fastapi.testclient import TestClient
 from rq import Queue
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import inspect
+from sqlalchemy.orm import Session, sessionmaker, undefer
 
 from packages.database.models import AudioFile, EvaluationResult
 
@@ -413,7 +414,15 @@ def test_retry_done_model_clears_payload(
     audio_file_id = _seed_audio_file(db_session_factory)
     payload = {"id": "pyannote", "name": "pyannote", "short": "pya", "description": "", "segs": [{"spk": 0, "s": 0.0, "e": 1.0}], "numSpk": 1}
     with db_session_factory() as session:
-        session.add(EvaluationResult(audio_file_id=audio_file_id, model_id="pyannote", status="done", payload=payload))
+        session.add(
+            EvaluationResult(
+                audio_file_id=audio_file_id,
+                model_id="pyannote",
+                status="done",
+                payload=payload,
+                raw_output=[{"start": 0.0, "end": 1.0, "label": "SPEAKER_00"}],
+            )
+        )
         session.commit()
 
     response = client.post(f"/evaluations/{audio_file_id}/models/pyannote/retry")
@@ -421,8 +430,16 @@ def test_retry_done_model_clears_payload(
     assert response.json()["models"][0]["status"] == "queued"
 
     with db_session_factory() as session:
-        row = session.query(EvaluationResult).filter_by(audio_file_id=audio_file_id, model_id="pyannote").one()
+        row = (
+            session.query(EvaluationResult)
+            .options(undefer(EvaluationResult.raw_output))
+            .filter_by(audio_file_id=audio_file_id, model_id="pyannote")
+            .one()
+        )
         assert row.payload is None
+        # Must go with the payload: raw output left behind would describe a run
+        # whose adapted result has been cleared.
+        assert row.raw_output is None
     assert fake_queue.count == 1
 
 
@@ -512,3 +529,130 @@ def test_retry_new_model_lane_mismatch_400(
     assert fake_queue.count == 0
     with db_session_factory() as session:
         assert session.query(EvaluationResult).filter_by(audio_file_id=audio_file_id, model_id="azure-batch").count() == 0
+
+
+# --- GET /evaluations/{id}/models/{model_id}/raw -------------------------
+
+
+def test_get_model_raw_output_returns_native_output_beside_adapted_run(
+    client: TestClient, db_session_factory: sessionmaker[Session]
+) -> None:
+    """The whole point of the route: data the adapter drops on the way to the
+    contract is still readable afterward. Here the engine's own speaker label,
+    which the payload has re-based to 0."""
+    audio_file_id = _seed_audio_file(db_session_factory)
+    payload = {"id": "pyannote", "name": "pyannote", "short": "pya", "description": "", "segs": [{"spk": 0, "s": 0.0, "e": 1.0}], "numSpk": 1}
+    raw = [{"start": 0.0, "end": 1.0, "label": "SPEAKER_07"}]
+    with db_session_factory() as session:
+        session.add(
+            EvaluationResult(
+                audio_file_id=audio_file_id, model_id="pyannote", status="done", payload=payload, raw_output=raw
+            )
+        )
+        session.commit()
+
+    response = client.get(f"/evaluations/{audio_file_id}/models/pyannote/raw")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["modelId"] == "pyannote"
+    assert body["status"] == "done"
+    assert body["rawOutput"] == raw
+    assert body["rawOutput"][0]["label"] == "SPEAKER_07"  # gone from the payload below
+    assert body["run"]["segs"] == [{"spk": 0, "s": 0.0, "e": 1.0}]
+
+
+def test_get_model_raw_output_is_null_for_a_run_that_stored_none(
+    client: TestClient, db_session_factory: sessionmaker[Session]
+) -> None:
+    """A run predating this column (or one that failed) has no raw output. The
+    run still exists, so that is a 200 with null -- not a 404."""
+    audio_file_id = _seed_audio_file(db_session_factory)
+    with db_session_factory() as session:
+        session.add(EvaluationResult(audio_file_id=audio_file_id, model_id="pyannote", status="done", payload=None))
+        session.commit()
+
+    response = client.get(f"/evaluations/{audio_file_id}/models/pyannote/raw")
+    assert response.status_code == 200
+    assert response.json()["rawOutput"] is None
+
+
+def test_get_model_raw_output_404s_for_a_model_that_never_ran(
+    client: TestClient, db_session_factory: sessionmaker[Session]
+) -> None:
+    audio_file_id = _seed_audio_file(db_session_factory)
+
+    response = client.get(f"/evaluations/{audio_file_id}/models/pyannote/raw")
+    assert response.status_code == 404
+
+
+def test_get_model_raw_output_404s_for_an_unknown_model(
+    client: TestClient, db_session_factory: sessionmaker[Session]
+) -> None:
+    audio_file_id = _seed_audio_file(db_session_factory)
+
+    response = client.get(f"/evaluations/{audio_file_id}/models/not-a-model/raw")
+    assert response.status_code == 404
+
+
+def test_get_model_raw_output_404s_for_another_users_recording(
+    client: TestClient, db_session_factory: sessionmaker[Session]
+) -> None:
+    """Same ownership check as every other route here, so raw output can't be
+    read out of a recording the caller doesn't own."""
+    with db_session_factory() as session:
+        other = AudioFile(owner_id=999, filename="theirs.wav", duration_sec=5.0)
+        session.add(other)
+        session.commit()
+        audio_file_id = other.id
+        session.add(EvaluationResult(audio_file_id=audio_file_id, model_id="pyannote", status="done"))
+        session.commit()
+
+    response = client.get(f"/evaluations/{audio_file_id}/models/pyannote/raw")
+    assert response.status_code == 404
+
+
+def test_evaluation_payload_does_not_carry_raw_output(
+    client: TestClient, db_session_factory: sessionmaker[Session]
+) -> None:
+    """`GET /evaluations/{id}` is polled every pollIntervalMs while models are in
+    flight. Raw output is the one field here that runs to megabytes, so it must
+    never ride along on that response."""
+    audio_file_id = _seed_audio_file(db_session_factory)
+    with db_session_factory() as session:
+        session.add(
+            EvaluationResult(
+                audio_file_id=audio_file_id,
+                model_id="pyannote",
+                status="done",
+                raw_output=[{"start": 0.0, "end": 1.0, "label": "SPEAKER_00"}],
+            )
+        )
+        session.commit()
+
+    response = client.get(f"/evaluations/{audio_file_id}")
+    assert response.status_code == 200
+    model = response.json()["models"][0]
+    assert "rawOutput" not in model
+
+
+def test_raw_output_column_is_not_loaded_by_a_default_query(
+    db_session_factory: sessionmaker[Session],
+) -> None:
+    """The deferral itself, which the HTTP assertions above cannot see: a plain
+    ORM query must leave the blob on disk. Without this, every poll would
+    de-TOAST every model's raw output to build a response that omits it."""
+    audio_file_id = _seed_audio_file(db_session_factory)
+    with db_session_factory() as session:
+        session.add(
+            EvaluationResult(
+                audio_file_id=audio_file_id, model_id="pyannote", status="done", raw_output={"big": "blob"}
+            )
+        )
+        session.commit()
+
+    with db_session_factory() as session:
+        row = session.query(EvaluationResult).filter_by(audio_file_id=audio_file_id).one()
+        assert "raw_output" in inspect(row).unloaded
+        # Still reachable on demand -- deferred, not write-only.
+        assert row.raw_output == {"big": "blob"}
+        assert "raw_output" not in inspect(row).unloaded

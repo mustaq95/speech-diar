@@ -9,7 +9,11 @@ Each model lives in its own folder with two halves:
 
 This is the backend twin of the frontend's adapter layer
 (`apps/frontend/src/adapters/`): raw model output never crosses a service
-boundary, only the unified contract does.
+boundary INTERPRETED, only the unified contract does. Native output is
+persisted verbatim (`EvaluationResult.raw_output`) and served by one
+inspection route, but strictly as an opaque blob — no API, DB or frontend code
+reads inside it, so the adapter here is still the only thing that understands
+any engine's shape.
 """
 
 from abc import ABC, abstractmethod
