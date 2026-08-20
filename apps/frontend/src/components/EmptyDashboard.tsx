@@ -17,9 +17,12 @@ interface EmptyDashboardProps {
   onSettings: () => void;
   onOpenProject: (project: Project) => void;
   onProjects: () => void;
+  /** Transcript evaluation needs no recording — its read-aloud flow records one.
+   * So it gets an entry point here, where there is nothing loaded to toggle from. */
+  onTranscript: () => void;
 }
 
-export function EmptyDashboard({ models, available, active, projects, onFile, onLoadBlob, onSettings, onOpenProject, onProjects }: EmptyDashboardProps) {
+export function EmptyDashboard({ models, available, active, projects, onFile, onLoadBlob, onSettings, onOpenProject, onProjects, onTranscript }: EmptyDashboardProps) {
   const shown = models.filter((model) => active[model.id]).length;
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [blobOpen, setBlobOpen] = useState(false);
@@ -37,6 +40,9 @@ export function EmptyDashboard({ models, available, active, projects, onFile, on
           <div className="eyebrow">Comparison workspace</div>
           <h1>No recording loaded</h1>
           <p>Upload audio to run it through every configured model at once and compare speaker boundaries, overlaps, and model agreement.</p>
+          <button type="button" className="action-outline empty-transcript-cta" onClick={onTranscript}>
+            Or evaluate transcription →
+          </button>
         </div>
         <div className="animated-bars" aria-hidden="true">
           {SPEAKER_COLORS.slice(0, 5).map((color, index) => (
@@ -122,7 +128,7 @@ export function EmptyDashboard({ models, available, active, projects, onFile, on
           </div>
           <div className="recent-grid">
             {projects.slice(0, 3).map((project) => (
-              <button key={project.id} type="button" className="recent-card" onClick={() => onOpenProject(project)}>
+              <button key={project.audioFileId} type="button" className="recent-card" onClick={() => onOpenProject(project)}>
                 <span className="recent-icon"><WaveGlyph colors={SPEAKER_COLORS} /></span>
                 <span>
                   <strong>{project.name}</strong>

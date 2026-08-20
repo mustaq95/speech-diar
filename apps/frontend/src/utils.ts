@@ -1,4 +1,4 @@
-import type { ActiveMap, ModelRun, Project } from "./types";
+import type { ActiveMap, ModelRun } from "./types";
 
 export function fmt(t: number): string {
   const safe = Math.max(0, t);
@@ -38,29 +38,6 @@ export function overlapsFor(model: ModelRun): Array<{ s: number; e: number }> {
   return out;
 }
 
-export function loadProjects(): Project[] {
-  try {
-    const raw = localStorage.getItem("speechdyn_projects");
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) return parsed;
-    }
-  } catch {
-    return [];
-  }
-  return [];
-}
-
-export function saveProjects(projects: Project[]): void {
-  try {
-    localStorage.setItem("speechdyn_projects", JSON.stringify(projects));
-  } catch {
-    // Local persistence is optional for the static studio.
-  }
-}
-
-/** Which models the user chose to run, from Settings. Null means no saved
- * preference yet (e.g. first visit) — caller falls back to catalog defaults. */
 export function loadModelActive(): ActiveMap | null {
   try {
     const raw = localStorage.getItem("speechdyn_model_active");

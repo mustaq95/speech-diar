@@ -45,7 +45,8 @@ from packages.database.models import TranscriptResult
 from packages.database.session import SessionLocal
 from packages.storage.s3_client import download_to
 
-from . import ALIGNER_NAME, engine_for
+from . import ALIGNER_NAME, engine_for, transport_for
+from .scoring import score_if_reference_exists
 from .ctc_aligner import adapter as aligner_adapter
 from .ctc_aligner import runner as aligner_runner
 
@@ -54,6 +55,22 @@ logger = logging.getLogger(__name__)
 #: The alignment stage's own id, used only as `job.args[1]` for job-shape
 #: consistency (see the module docstring). It is not a selectable engine.
 ALIGNER_ID = "ctc-aligner"
+
+
+def _score_and_log(session: Session, row: TranscriptResult, audio_file_id: int, asr_id: str) -> None:
+    """Score the row if the recording has a reference, never failing the run.
+
+    A scoring failure must not lose a transcript that took real time to produce:
+    the text is the expensive part and is already on the row. The error rates are
+    left null, which the UI shows as unscored rather than as zero.
+    """
+    from packages.database.models import AudioFile
+
+    try:
+        audio_file = session.get(AudioFile, audio_file_id)
+        score_if_reference_exists(session, row, audio_file.duration_sec if audio_file else None)
+    except Exception:  # noqa: BLE001 - the transcript is worth more than the score
+        logger.exception("Scoring %s for audio_file_id=%s failed", asr_id, audio_file_id)
 
 
 def get_transcript_row(session: Session, audio_file_id: int, asr_id: str) -> TranscriptResult | None:
@@ -144,6 +161,14 @@ def run_asr(audio_file_id: int, asr_id: str) -> None:
             return
         row.text = text
         row.asr_ms = asr_ms
+        # Stamped here rather than at enqueue so a row written by an older build
+        # still gets labelled; the scorecard needs it to say what each figure means.
+        row.transport = transport_for(asr_id)
+        # Scored at the end of ASR, not after alignment: WER is a comparison of
+        # TEXT, so it needs nothing the aligner produces, and computing it here
+        # means a recording with a reference shows its error rates as soon as the
+        # words exist instead of waiting on word timings it does not use.
+        _score_and_log(session, row, audio_file_id, asr_id)
         # Above the empty-transcript branch below, so both commit paths keep it:
         # an empty transcript is the case where the native output is most worth
         # having, since it is what explains why the engine found nothing.
@@ -151,7 +176,9 @@ def run_asr(audio_file_id: int, asr_id: str) -> None:
         if not text:
             # Silence, or speech the engine found nothing in. A legitimate
             # result, not a failure — and there is nothing to align, so the run
-            # completes here rather than queueing a no-op second stage.
+            # completes here rather than queueing a no-op second stage. It is
+            # still scored: an engine that returned nothing has a 100% error rate
+            # against a non-empty reference, and that is a real result to show.
             row.status = "done"
             row.stage = None
             session.commit()

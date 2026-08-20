@@ -2,25 +2,46 @@ import type { DiarizationModelRun, DiarizationSegment, ModelId } from "./types/d
 
 export type { DiarizationEvaluation, ModelId, ModelMetadata } from "./types/diarization";
 
-export type Nav = "dashboard" | "upload" | "projects" | "settings";
+export type Nav = "dashboard" | "transcript" | "upload" | "projects" | "settings";
 /** Upload tab sub-state; "loading" also covers opening a saved project from the Dashboard tab. */
 export type Workflow = "idle" | "uploading" | "loading" | "processing";
 export type Metric = "DER" | "JER" | "WDER";
+
+/** The two evaluation surfaces the center-of-dashboard toggle switches between.
+ * Diarization is the timeline studio; Transcript is a full page, because the
+ * read-aloud flow starts with no recording loaded and so cannot live inside a
+ * studio pane that only exists once one is. */
+export type StudioMode = "diarization" | "transcript";
 
 // The UI-facing data types are aliases of the unified diarization contract:
 // components only ever see data that came through an adapter.
 export type Segment = DiarizationSegment;
 export type ModelRun = DiarizationModelRun;
 
+/** One row of the recordings list.
+ *
+ * A thin view over `RecordingSummary` from the backend rather than a stored object:
+ * the list is now fetched, so `date`/`duration` are formatted for display here and
+ * the counts arrive already computed. `fresh` is the only piece of local state left —
+ * it marks recordings created in THIS browser session, which is what the NEW badge
+ * always actually meant.
+ */
 export interface Project {
-  id: number;
-  /** Backend AudioFile id — lets reopening a project re-fetch its real evaluation. */
+  /** Backend AudioFile id. The row's identity — there is no separate local id now. */
   audioFileId: number;
+  surface: StudioMode;
   name: string;
   date: string;
+  /** Formatted for display. `durationSec` is the number the report sums. */
   duration: string;
+  durationSec: number;
+  /** Diarization: models run and highest speaker count found. */
   models: number;
   speakers: number;
+  /** Transcript: engines compared, and the best WER once scored. */
+  engines: number;
+  scored: boolean;
+  bestWer?: number;
   fresh?: boolean;
 }
 

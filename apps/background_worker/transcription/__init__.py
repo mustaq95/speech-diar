@@ -37,6 +37,8 @@ from .cohere import adapter as cohere_adapter
 from .cohere import runner as cohere_runner
 from .hamsa import adapter as hamsa_adapter
 from .hamsa import runner as hamsa_runner
+from .inception import adapter as inception_adapter
+from .inception import runner as inception_runner
 
 #: Display name for the alignment stage, shown on the panel next to align_ms.
 ALIGNER_NAME = "CTC Forced Aligner · MMS-300m"
@@ -89,6 +91,17 @@ ASR_ENGINES: dict[str, AsrEngine] = {
             run=hamsa_runner.run,
             adapt=hamsa_adapter.adapt,
             configured=lambda s: bool(s.hamsa_ws_endpoint and s.hamsa_stt_key),
+        ),
+        AsrEngine(
+            asr_id="inception-stt",
+            # Online: this gateway is remote, so the audio leaves the host —
+            # same as hamsa. `mode` is no longer what picks an engine (asr_id
+            # is); it stays as an honest description of where audio goes.
+            mode="online",
+            name="Inception-STT",
+            run=inception_runner.run,
+            adapt=inception_adapter.adapt,
+            configured=lambda s: bool(s.litellm_base_url and s.litellm_api_key),
         ),
         AsrEngine(
             asr_id="cohere-transcribe",
@@ -155,3 +168,55 @@ def default_asr_id(settings: Settings) -> str | None:
 
 def engine_for(asr_id: str) -> AsrEngine | None:
     return ASR_ENGINES.get(asr_id)
+
+
+#: Engines the transcript-evaluation surface compares, in display order.
+#:
+#: An explicit tuple, not "every configured engine": this comparison is between
+#: TryHamsa and Inception-STT specifically, and silently gaining a third column
+#: because someone started a container would change what the scorecard means.
+#: cohere-transcribe stays available by id for the Live Speech panel.
+COMPARISON_ASR_IDS: tuple[str, ...] = ("hamsa", "inception-stt")
+
+#: Which transport each engine's audio actually travels over. Not derivable from
+#: `mode` -- hamsa and inception-stt are BOTH online, yet one streams
+#: continuously with server-side VAD and the other only accepts short
+#: request/response chunks. Every reported figure is labelled with this, because
+#: a chunked engine carries its boundary cost inside its own error rate.
+ASR_TRANSPORTS: dict[str, str] = {
+    "hamsa": "stream",
+    "inception-stt": "chunks",
+    "cohere-transcribe": "chunks",
+}
+
+
+def transport_for(asr_id: str) -> str | None:
+    """The transport an engine uses, or None for an unregistered id."""
+    return ASR_TRANSPORTS.get(asr_id)
+
+
+def resolve_asr_ids(
+    asr_ids: list[str] | None = None, mode: TranscriptionMode | None = None
+) -> list[str]:
+    """The engines a transcript request means, from either way of asking.
+
+    `asr_ids` is the real selector and wins when given. `mode` is kept as an
+    alias for the Live Speech panel, which predates multi-engine runs and asks
+    by mode -- but a mode can no longer identify an engine on its own (hamsa and
+    inception-stt are both "online"), so it resolves through MODE_TO_ASR_ID's
+    one explicit choice per mode rather than by scanning for a match.
+
+    Duplicates are collapsed and order is preserved: a caller asking for the
+    same engine twice must not get two jobs writing to one row.
+
+    Raises KeyError for an unregistered id, so a typo fails at the request
+    instead of becoming a queued job that dies in a worker.
+    """
+    if asr_ids:
+        seen: dict[str, None] = {}
+        for asr_id in asr_ids:
+            if asr_id not in ASR_ENGINES:
+                raise KeyError(asr_id)
+            seen[asr_id] = None
+        return list(seen)
+    return [MODE_TO_ASR_ID[mode or DEFAULT_TRANSCRIPTION_MODE]]

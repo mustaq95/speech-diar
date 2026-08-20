@@ -1,6 +1,6 @@
 // UI constants shared across the studio: the speaker color theme and the
 // default Settings/eval presets applied before any real evaluation exists.
-import type { ActiveMap, EvalConfig, ParamMap } from "./types";
+import type { ActiveMap, EvalConfig, ParamMap, StudioMode } from "./types";
 
 export const SPEAKER_COLORS = [
   "#4C9AFF", "#F5A623", "#2DD4BF", "#F471B5", "#A3E635",
@@ -30,3 +30,11 @@ export const DEFAULT_PARAMS: ParamMap = {
   nemo: { min: 1, max: 8, thr: 0.72, ovl: false },
   aws: { min: 1, max: 10, thr: 0.6, ovl: true },
 };
+
+/** The two evaluation surfaces the top-bar switcher offers, in display order.
+ * Lives here rather than in a component so the chrome (TopBar) and the surface
+ * itself can both label the control without importing each other. */
+export const STUDIO_MODES: Array<{ value: StudioMode; label: string }> = [
+  { value: "diarization", label: "Diarization" },
+  { value: "transcript", label: "Transcript" },
+];

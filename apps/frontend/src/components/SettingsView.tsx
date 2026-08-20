@@ -20,7 +20,6 @@ interface SettingsViewProps {
   onStreamInline: () => void;
   onGlow: () => void;
   onFeed: () => void;
-  onClear: () => void;
 }
 
 function Section({ title, sub, children }: { title: string; sub?: string; children: ReactNode }) {
@@ -63,7 +62,6 @@ export function SettingsView({
   onStreamInline,
   onGlow,
   onFeed,
-  onClear,
 }: SettingsViewProps) {
   return (
     <main className="page settings-page">
@@ -172,8 +170,15 @@ export function SettingsView({
       </Section>
 
       <Section title="Data">
-        <Row label="Saved recordings" desc={`${projects.length} recording${projects.length === 1 ? "" : "s"} stored locally on this device.`}>
-          <button className="danger-btn" type="button" onClick={onClear}>Clear history</button>
+        {/* No Clear button any more: recordings live in the database, not in this
+            browser, so "clear history" would either do nothing visible or have to
+            become a bulk delete. Removing one recording is a per-row action in
+            Projects, where you can see what you are deleting. */}
+        <Row
+          label="Saved recordings"
+          desc={`${projects.length} recording${projects.length === 1 ? "" : "s"} on this surface. Stored on the server — delete individually from Projects.`}
+        >
+          <span className="muted mono">{projects.length}</span>
         </Row>
       </Section>
     </main>

@@ -11,6 +11,7 @@ left alone (reworking a working model's runner is outside the live-speech
 change); if the canonical shape ever changes, both must move.
 """
 
+import io
 import os
 import shutil
 import subprocess
@@ -71,6 +72,51 @@ def ensure_canonical_wav(path: str) -> tuple[str, str | None]:
             os.unlink(out)
         raise RuntimeError(f"ffmpeg could not convert {path}: {proc.stderr.decode()[:300]}")
     return out, out
+
+
+def split_wav_fixed(path: str, segment_seconds: float) -> list[tuple[bytes, float, float]]:
+    """Cut a canonical WAV into fixed-length pieces: `(wav_bytes, start, end)`.
+
+    Boundaries are exactly on the interval and are never moved to land in a
+    silence. That is deliberate, not a shortcut: choosing cut points by
+    inspecting the audio is this code guessing on the engine's behalf, and every
+    guess it gets wrong would surface as a word error attributed to the engine.
+    A word straddling a boundary does split, and that cost belongs to the
+    transport being measured.
+
+    Pure `wave` arithmetic, no ffmpeg subprocess: the caller has already run the
+    file through `ensure_canonical_wav`, so a segment is just a frame-range
+    re-wrapped with its own header.
+
+    Returns a single whole-file piece when the audio already fits, so callers
+    have one code path regardless of length.
+    """
+    with wave.open(path, "rb") as wav:
+        channels, width, rate = wav.getnchannels(), wav.getsampwidth(), wav.getframerate()
+        total_frames = wav.getnframes()
+        frames = wav.readframes(total_frames)
+
+    duration = total_frames / float(rate)
+    if duration <= segment_seconds:
+        with open(path, "rb") as fh:
+            return [(fh.read(), 0.0, duration)]
+
+    bytes_per_frame = channels * width
+    frames_per_segment = max(1, int(segment_seconds * rate))
+    pieces: list[tuple[bytes, float, float]] = []
+    for start_frame in range(0, total_frames, frames_per_segment):
+        end_frame = min(start_frame + frames_per_segment, total_frames)
+        chunk = frames[start_frame * bytes_per_frame : end_frame * bytes_per_frame]
+        buffer = io.BytesIO()
+        # Each piece carries a real WAV header of its own: the gateway is handed
+        # a standalone file, not a headerless byte range it would misread.
+        with wave.open(buffer, "wb") as out:
+            out.setnchannels(channels)
+            out.setsampwidth(width)
+            out.setframerate(rate)
+            out.writeframes(chunk)
+        pieces.append((buffer.getvalue(), start_frame / float(rate), end_frame / float(rate)))
+    return pieces
 
 
 def read_pcm16(path: str) -> bytes:

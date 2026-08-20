@@ -245,6 +245,149 @@ class Settings(BaseSettings):
     # break Arabic ones. Only set it to force a known single-language batch.
     cohere_transcribe_language: str = ""
 
+    # --- Inception-STT (via the LiteLLM gateway) ---
+    # A request/response transcription gateway, OpenAI-compatible
+    # (/v1/audio/transcriptions: multipart `model` + `file` + optional
+    # `language`; JSON back with text/audio_duration/word_timestamps).
+    #
+    # Field names mirror the .env keys already in use, which came from the
+    # reference client this runner was ported from -- deliberately not renamed
+    # to an inception_stt_* scheme, so .env and code read the same.
+    litellm_base_url: str | None = None
+    litellm_api_key: str | None = None
+    stt_transcription_path: str = "/v1/audio/transcriptions"
+    stt_model: str = "inception-stt"
+    # "" or "auto" BOTH mean auto-detect, and both omit the field from the
+    # request entirely (see STT_AUTO_LANGUAGES in the runner). A real language
+    # code is a decoder prompt the model obeys over the audio, which is how
+    # cohere_transcribe_language above hallucinates Arabic across English
+    # recordings. Mixed ar/en audio must never force one.
+    stt_default_language: str = "auto"
+    stt_timeout_seconds: float = 120
+    # How long a piece of audio may be in ONE call to this gateway.
+    #
+    # This is not a comfort setting -- it decides how much of the transcript
+    # exists at all. The gateway silently drops content in a length-dependent,
+    # NON-MONOTONIC way: a longer clip can return fewer words than a clip it
+    # strictly contains, with a 200 and no warning. Measured 2026-08-19 over one
+    # fixed 100 s span of tests/samples/youtube_ar_32min_8spk.16k.wav, splitting
+    # the SAME audio at different lengths:
+    #
+    #     segment   calls   total words   blank segments
+    #        3 s      34         219          1/34
+    #        5 s      20         201          1/20
+    #        8 s      13          84          8/13
+    #       10 s      10          28          8/10
+    #       25 s       4          85          1/4
+    #      100 s       1          51          0/1
+    #
+    # 3 s recovers 4.3x the words of a single call and 2.6x that of 25 s
+    # segments; the 8-15 s band is the worst, returning nothing at all for most
+    # pieces. The extra words are real content, not boundary double-counting
+    # (0.5% local trigram repeats at 3 s), and the 25 s run visibly loses the
+    # opening of its own first segment.
+    #
+    # So this defaults into the only regime measured to be reliable, and matches
+    # live_chunk_default_sec below -- the live and stored paths chunk the same
+    # way, which is also what makes their numbers comparable. Raising it trades
+    # transcript away for fewer requests.
+    batch_segment_seconds: float = 3
+    batch_max_concurrency: int = 4
+    # How long an idle connection to the gateway is kept alive for reuse.
+    #
+    # This is a latency setting, not a resource one. httpx's module-level
+    # `post()` opens a new TCP+TLS connection per call, and measured against this
+    # gateway that handshake was 73 ms of a 107 ms round trip — 68% of a figure
+    # the scorecard attributes to the ENGINE. A pooled connection cut the median
+    # to 35 ms. Must comfortably exceed the live chunk interval, or the
+    # connection expires between chunks and every call pays the handshake again.
+    stt_keepalive_expiry_sec: float = 30
+    stt_max_connections: int = 16
+    # TLS for the gateway call only. LITELLM_CA_BUNDLE (a path) is preferred
+    # over disabling verification: it verifies properly against an internal CA
+    # instead of trusting anything. VERIFY_SSL keeps the .env name already in
+    # use, but is scoped to this one service like every other TLS flag here.
+    verify_ssl: bool = True
+    litellm_ca_bundle: str = ""
+
+    # --- Script generation (read-aloud reference text) ---
+    # An OpenAI-compatible chat-completions gateway, separate from the STT one
+    # above with NO cross-default between them: a silent fallback between two
+    # gateways is how the wrong model gets called.
+    llm_base_url: str | None = None
+    llm_api_key: str | None = None
+    llm_model: str | None = None
+    # No leading /v1: LLM_BASE_URL is expected to already carry its version
+    # prefix (OpenRouter's "…/api/v1" does), whereas the STT gateway's base URL
+    # does not and carries it in stt_transcription_path instead. The two
+    # gateways genuinely differ here, which is why these are separate settings
+    # and not one shared base URL.
+    llm_chat_path: str = "/chat/completions"
+    llm_max_tokens: int = 4096
+    llm_timeout_sec: float = 180
+    # Do NOT lower this to improve instruction-following on the even language mix;
+    # it does the opposite. Measured, four runs each at one attempt, share of
+    # scripts landing inside the 35-65% Arabic band:
+    #   temp 0.2 -> 0/4  (94/81/78/92% Arabic)
+    #   temp 0.5 -> 2/4  (71/48/44/74%)
+    #   temp 1.0 -> 4/4  (46/62/57/46%)
+    # At low temperature the model settles into its most-likely register, which is
+    # Arabic-dominant with English nouns dropped in. Higher temperature is what
+    # actually explores the alternating-clause structure the prompt asks for.
+    llm_temperature: float = 1.0
+    # How the prompt sizes a script for a requested number of minutes. Read-
+    # aloud pace with natural pauses, not conversational speed. The word count
+    # the API returns is always MEASURED from the generated text, never this
+    # estimate.
+    script_words_per_minute: int = 70
+    # An even language split is requested but not reliably obeyed. Measured over
+    # six runs at identical settings, the Arabic share came back 42/92/94% at one
+    # minute and 78/78/46% at three — bimodal, not drifting: the model either
+    # alternates clauses properly or reverts to Arabic sentences with English
+    # nouns dropped in. Prompt wording alone did not fix it, so a script whose
+    # measured split falls outside the band is regenerated. The band is a half-
+    # width around 50%: 0.15 accepts 35-65% Arabic.
+    script_mix_tolerance: float = 0.15
+    # Total attempts, not retries. 1 disables the check entirely; the last
+    # attempt is always returned even if it misses, because a script that is
+    # slightly unbalanced still beats no script.
+    script_mix_max_attempts: int = 3
+    # The script-length slider's stops, the language-mix buttons and the
+    # hard-case chips, all served to the browser by GET /config so none of
+    # them is a literal in the frontend.
+    script_length_options_min: str = "1,3,5,10"
+    script_language_mixes: str = "ar,mixed-50-50,en"
+    script_hard_cases: str = "code-switch-en,proper-nouns,numbers-dates,gulf-dialect,fast-speech"
+
+    # --- Live transcript sessions (the read-aloud comparison) ---
+    # The recorder's PCM rate, served to the browser: the mic tap resamples to
+    # it so both engines receive identical audio.
+    live_record_sample_rate: int = 16000
+    # Samples per microphone callback. A latency setting: at 16 kHz a 4096-sample
+    # block is 256 ms, so PCM reached the streaming engine in bursts of ~2.6 of
+    # its 100 ms frames rather than a smooth cadence, and a chunk was emitted up
+    # to 256 ms after its audio existed. 1024 samples is 64 ms — under one engine
+    # frame, so nothing waits on the block boundary.
+    #
+    # Must be a power of two between 256 and 16384 (Web Audio's constraint). The
+    # waveform's render rate is deliberately NOT tied to this; see the recorder.
+    live_record_block_samples: int = 1024
+    # Chunk interval for engines that cannot stream, as a default and the
+    # bounds of the UI control. This is the ONLY knob on chunking -- there is
+    # no lookback or silence threshold, by design (see batch_segment_seconds).
+    live_chunk_default_sec: float = 3
+    live_chunk_min_sec: float = 1
+    live_chunk_max_sec: float = 10
+    # How long a live session's accumulated text and latencies survive in Redis
+    # before expiry. Must exceed the longest recording anyone will read plus
+    # the time to finalize it.
+    live_session_ttl_sec: int = 7200
+    # How long to wait for a streaming engine's socket to open before giving up.
+    # Load-bearing: a misconfigured dev proxy drops the upgrade so the socket
+    # neither opens nor errors, and without a deadline the recorder waits on it
+    # forever and looks broken. A bounded wait turns that into a message.
+    live_socket_open_timeout_sec: float = 10
+
     # --- CTC forced aligner (in-process in the worker; both modes) ---
     # MahmoudAshraf97/ctc-forced-aligner's MMS-300m model, which romanizes
     # text before alignment and so handles code-switched audio. Runs on
@@ -293,6 +436,51 @@ class Settings(BaseSettings):
     def hamsa_ws_endpoint(self) -> str | None:
         """The Hamsa WebSocket URL, from either accepted setting name."""
         return self.hamsa_stt_url or self.hamsa_stt_ws_url
+
+    @property
+    def stt_endpoint_url(self) -> str | None:
+        """Full Inception-STT transcription URL, or None when unconfigured."""
+        if not self.litellm_base_url:
+            return None
+        return f"{self.litellm_base_url.rstrip('/')}{self.stt_transcription_path}"
+
+    @property
+    def llm_chat_url(self) -> str | None:
+        """Full script-generation chat-completions URL, or None when unconfigured.
+
+        Tolerates LLM_BASE_URL already carrying the endpoint path. Writing the
+        whole URL there is the natural reading of "base url", and the two
+        gateways this repo talks to disagree about it (OpenRouter's own docs
+        quote ".../api/v1/chat/completions"). Appending blindly turned that into
+        a doubled path and a bare 404 with nothing to point at. Checking is one
+        comparison; the alternative is a support question every time.
+        """
+        if not self.llm_base_url:
+            return None
+        base = self.llm_base_url.rstrip("/")
+        if base.endswith(self.llm_chat_path.rstrip("/")):
+            return base
+        return f"{base}{self.llm_chat_path}"
+
+    @property
+    def litellm_httpx_verify(self) -> bool | str:
+        """httpx `verify` for the gateway: a CA bundle path when one is set,
+        otherwise the on/off flag. A bundle always wins, so setting one is
+        enough to re-enable verification without also flipping VERIFY_SSL."""
+        return self.litellm_ca_bundle or self.verify_ssl
+
+    @property
+    def script_length_options(self) -> list[int]:
+        """The script-length slider's stops, in minutes."""
+        return [int(part) for part in self.script_length_options_min.split(",") if part.strip()]
+
+    @property
+    def script_language_mix_options(self) -> list[str]:
+        return [part.strip() for part in self.script_language_mixes.split(",") if part.strip()]
+
+    @property
+    def script_hard_case_options(self) -> list[str]:
+        return [part.strip() for part in self.script_hard_cases.split(",") if part.strip()]
 
 
 @lru_cache

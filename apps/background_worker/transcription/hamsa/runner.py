@@ -92,28 +92,11 @@ async def _stream(pcm: bytes) -> HamsaRawOutput:
     import websockets
 
     settings = get_settings()
-    ws_url = settings.hamsa_ws_endpoint
-    api_key = settings.hamsa_stt_key
-    if not ws_url or not api_key:
-        raise RuntimeError("Hamsa STT needs HAMSA_STT_WS_URL and HAMSA_STT_KEY in .env")
-
-    headers = {"x-api-key": api_key}
-    if settings.hamsa_stt_bearer_token:
-        headers["Authorization"] = f"Bearer {settings.hamsa_stt_bearer_token}"
-    kwargs: dict[str, Any] = {
-        "additional_headers": headers,
-        "ping_interval": 20,
-        "ping_timeout": 20,
-        "close_timeout": 5,
-        "max_size": None,  # a long file's final message can be large
-    }
-    ssl_ctx = _ssl_context(ws_url, settings.hamsa_stt_ssl_verify)
-    if ssl_ctx is not None:
-        kwargs["ssl"] = ssl_ctx
+    ws_url, kwargs = connect_kwargs()
 
     messages: HamsaRawOutput = []
     async with websockets.connect(ws_url, **kwargs) as ws:
-        await ws.send(_handshake(api_key, settings.hamsa_stt_bearer_token, settings.hamsa_stt_sample_rate))
+        await ws.send(handshake_payload())
         ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=10.0))
         if ack.get("type") != "handshake_ack":
             raise RuntimeError(f"Hamsa handshake rejected: {str(ack)[:300]}")
@@ -167,6 +150,51 @@ async def _stream(pcm: bytes) -> HamsaRawOutput:
                     task.cancel()
 
     return messages
+
+
+def connect_kwargs() -> tuple[str, dict[str, Any]]:
+    """The URL and connect options for a Hamsa socket, plus validation.
+
+    Extracted from `_stream` so the live relay opens its socket exactly the way a
+    stored-file run does — same headers, same TLS decision, same ping settings.
+    A second hand-rolled connection setup would be free to drift, and a
+    difference there would show up as a difference in the engine's measured
+    output.
+    """
+    settings = get_settings()
+    ws_url = settings.hamsa_ws_endpoint
+    api_key = settings.hamsa_stt_key
+    if not ws_url or not api_key:
+        raise RuntimeError("Hamsa STT needs HAMSA_STT_WS_URL and HAMSA_STT_KEY in .env")
+
+    headers = {"x-api-key": api_key}
+    if settings.hamsa_stt_bearer_token:
+        headers["Authorization"] = f"Bearer {settings.hamsa_stt_bearer_token}"
+    kwargs: dict[str, Any] = {
+        "additional_headers": headers,
+        "ping_interval": 20,
+        "ping_timeout": 20,
+        "close_timeout": 5,
+        "max_size": None,  # a long file's final message can be large
+    }
+    ssl_ctx = _ssl_context(ws_url, settings.hamsa_stt_ssl_verify)
+    if ssl_ctx is not None:
+        kwargs["ssl"] = ssl_ctx
+    return ws_url, kwargs
+
+
+def handshake_payload() -> str:
+    """The handshake for a Hamsa socket, from settings.
+
+    Shared with the live relay for the same reason as `connect_kwargs`: the
+    handshake carries the server's VAD/EOS contract, which determines where
+    segment boundaries fall. Two copies could disagree and silently change the
+    transcript.
+    """
+    settings = get_settings()
+    return _handshake(
+        settings.hamsa_stt_key, settings.hamsa_stt_bearer_token, settings.hamsa_stt_sample_rate
+    )
 
 
 def run(audio_path: str) -> HamsaRawOutput:

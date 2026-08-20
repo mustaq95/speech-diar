@@ -8,10 +8,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from apps.background_worker.transcription import (
     ASR_ENGINES,
+    COMPARISON_ASR_IDS,
     DEFAULT_TRANSCRIPTION_MODE,
     MODE_TO_ASR_ID,
+    transport_for,
 )
-from apps.backend_api.routers import evaluations, models, upload
+from apps.backend_api.routers import evaluations, models, recordings, transcript, upload
 from packages.config.logging import configure_logging
 from packages.config.settings import get_settings
 from packages.database.session import init_db
@@ -39,6 +41,8 @@ app.add_middleware(
 app.include_router(upload.router)
 app.include_router(evaluations.router)
 app.include_router(models.router)
+app.include_router(recordings.router)
+app.include_router(transcript.router)
 
 
 @app.get("/health")
@@ -66,6 +70,12 @@ def frontend_config() -> dict[str, object]:
     Which mode PRODUCED a given transcript is a different question, answered on
     each TranscriptResult row and never rewritten by config.
 
+    The `transcript` block serves the transcript-evaluation surface everything it
+    would otherwise hardcode: the engines it compares, the recorder's sample
+    rate, the chunk-interval bounds, and the script controls' options. None of
+    those are literals in the frontend — they are .env values, so moving
+    environments stays an .env-only change there too.
+
     Read from the process-wide `settings` captured at import, so changing an
     engine's credentials in .env takes effect on restart — the same contract as
     every other setting here.
@@ -79,5 +89,35 @@ def frontend_config() -> dict[str, object]:
                 "configured": ASR_ENGINES[asr_id].configured(settings),
             }
             for mode, asr_id in MODE_TO_ASR_ID.items()
+        },
+        "transcript": {
+            # One entry per compared engine, in display order. `transport` is
+            # here because the UI must label every figure with it: a streaming
+            # engine and a chunked one are not measuring the same thing, and the
+            # chunk statistics of the two are not comparable at all.
+            "engines": [
+                {
+                    "asrId": asr_id,
+                    "name": ASR_ENGINES[asr_id].name,
+                    "mode": ASR_ENGINES[asr_id].mode,
+                    "transport": transport_for(asr_id),
+                    "configured": ASR_ENGINES[asr_id].configured(settings),
+                }
+                for asr_id in COMPARISON_ASR_IDS
+                if asr_id in ASR_ENGINES
+            ],
+            "recordSampleRate": settings.live_record_sample_rate,
+            "recordBlockSamples": settings.live_record_block_samples,
+            "chunkIntervalSec": settings.live_chunk_default_sec,
+            "chunkIntervalMinSec": settings.live_chunk_min_sec,
+            "chunkIntervalMaxSec": settings.live_chunk_max_sec,
+            "socketOpenTimeoutSec": settings.live_socket_open_timeout_sec,
+            "scriptLengthsMin": settings.script_length_options,
+            "scriptLanguageMixes": settings.script_language_mix_options,
+            "scriptHardCases": settings.script_hard_case_options,
+            # Null when no script gateway is configured: the UI then offers the
+            # paste-a-reference path only, instead of a Generate button that
+            # cannot work.
+            "scriptModel": settings.llm_model if settings.llm_chat_url else None,
         },
     }

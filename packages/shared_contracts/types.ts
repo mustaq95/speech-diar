@@ -22,8 +22,29 @@ export type ModelLifecycleState = "unloaded" | "starting" | "ready" | "in_use" |
 export type TranscriptStage = "asr" | "align";
 
 /** Where the ASR ran. "online" streamed the audio to a remote endpoint; "offline" kept it
- * on the host. Derived from the engine that actually ran, not from the current setting. */
+ * on the host. Derived from the engine that actually ran, not from the current setting.
+ *
+ * No longer what SELECTS an engine — asrId is. Two engines are "online" (hamsa and
+ * inception-stt), so a mode cannot identify one. */
 export type TranscriptionMode = "online" | "offline";
+
+/** How a transcript was produced. "live" was captured chunk by chunk while someone read a
+ * script aloud; "batch" was run over stored audio. Not interchangeable — they are different
+ * measurements of the same engine. */
+export type TranscriptSource = "live" | "batch";
+
+/** What the audio travelled over for a given engine. "stream" is continuous with engine-side
+ * VAD; "chunks" is fixed-interval cuts. A chunked engine carries its boundary cost inside its
+ * own error rate, so every figure is labelled with this and the two transports' chunk
+ * statistics are NOT comparable to each other. */
+export type TranscriptTransport = "stream" | "chunks";
+
+/** Where a reference transcript came from. "script" was generated and read aloud, so the words
+ * were known before the audio existed; "pasted" was supplied by hand afterwards. */
+export type ReferenceSource = "script" | "pasted";
+
+/** One edit operation aligning hypothesis to reference. */
+export type AlignmentOp = "equal" | "sub" | "del" | "ins";
 
 /** One contiguous stretch of speech attributed to a single speaker. */
 export interface DiarizationSegment {
@@ -109,6 +130,122 @@ export interface TranscriptWord {
   score?: number;
 }
 
+/** One step of the reference-to-hypothesis alignment, for the word-level error highlight.
+ *
+ * From the WER edit-distance backtrace, NOT from any aligner or per-word timing: the boxed
+ * words in the UI are substitutions against the reference, which is a text comparison. */
+export interface TranscriptAlignmentOp {
+  op: AlignmentOp;
+  /** Reference word; undefined for an insertion. */
+  ref?: string;
+  /** Hypothesis word; undefined for a deletion. */
+  hyp?: string;
+  /** Index into the hypothesis word list, so the UI can mark the rendered word. */
+  hypIndex?: number;
+}
+
+/** How one engine's transcript scored against the recording's reference.
+ *
+ * Both normalized and raw rates are carried so the normalization toggle is a read rather than
+ * a recompute, and so normalization's own effect is visible.
+ *
+ * `rtf` is undefined when the transport cannot produce one: a real-time streaming protocol
+ * consumes audio at 1x by definition, so a figure for it would be invented. Render
+ * "real-time bound" for a missing value, never a number. */
+export interface TranscriptMetrics {
+  /** Word error rate on normalized text, 0..1+ (S+D+I over reference words). */
+  wer: number;
+  /** Character error rate on normalized text. */
+  cer: number;
+  /** Word error rate WITHOUT normalization. */
+  werRaw: number;
+  /** Character error rate WITHOUT normalization. */
+  cerRaw: number;
+  refWordCount: number;
+  hypWordCount: number;
+  subCount: number;
+  delCount: number;
+  insCount: number;
+  /** Processing time / audio duration; undefined when the transport is real-time bound. */
+  rtf?: number;
+}
+
+/** The ground truth a recording's engines are scored against. One per recording, never one per
+ * engine: comparability depends on every engine being scored against the same text. */
+export interface TranscriptReference {
+  audioFileId: number;
+  source: ReferenceSource;
+  text: string;
+  /** Measured from `text`, never taken from a request. */
+  wordCount: number;
+  /** For a generated script: the request that produced it, plus the generating model. */
+  params?: Record<string, unknown> | null;
+}
+
+/** Which evaluation surface produced a recording. Diarization recordings come from an
+ * upload; transcript recordings are read-aloud captures. Listed separately because they are
+ * different artifacts scored in different ways. */
+export type RecordingSurface = "diarization" | "transcript";
+
+/** One row of the recordings list.
+ *
+ * The counts are computed by aggregate query on the server, not derived here: the list used
+ * to be assembled by fetching every recording's full evaluation one request at a time, which
+ * is N requests to render one page.
+ *
+ * Deliberately absent: `payload` and `rawOutput`. Both are deferred columns holding a whole
+ * model's output, and a list has no use for either. */
+export interface RecordingSummary {
+  audioFileId: number;
+  surface: RecordingSurface;
+  /** Display name; not unique. */
+  filename: string;
+  durationSec: number;
+  /** ISO-8601; the list is ordered by this, newest first. */
+  createdAt: string;
+
+  // --- diarization recordings ---
+  /** Models that have a result row. */
+  modelCount: number;
+  /** Highest speaker count any model found. */
+  speakerCount: number;
+  doneCount: number;
+  failedCount: number;
+
+  // --- transcript recordings ---
+  /** ASR engines compared. */
+  engineCount: number;
+  /** Whether a reference exists and runs were scored. */
+  scored: boolean;
+  /** Lowest WER across engines; undefined when unscored. */
+  bestWer?: number;
+}
+
+/** What to generate a read-aloud script for. The options are served by GET /config from .env,
+ * so the slider stops and chips are not literals here. */
+export interface ScriptRequest {
+  /** Target read-aloud length in minutes. */
+  minutes: number;
+  /** One of GET /config transcript.scriptLanguageMixes. */
+  languageMix: string;
+  /** Subset of GET /config transcript.scriptHardCases. */
+  hardCases: string[];
+}
+
+/** A generated script, with the request that produced it.
+ *
+ * `wordCount` is MEASURED from `text`, never echoed from the request: it becomes the WER
+ * denominator, so a requested length must never be mistaken for a produced one. */
+export interface GeneratedScript {
+  text: string;
+  /** Measured from `text`. */
+  wordCount: number;
+  /** The model that actually generated it. */
+  generatorModel: string;
+  /** The request, plus finish reason and generation time. */
+  params: Record<string, unknown>;
+}
+
 /** One engine's live-speech transcript of one audio file: ASR text plus word-level
  * timings, with each stage's real measured cost. Separate from DiarizationModelRun
  * on purpose — this is transcription, and the diarization contract has no text.
@@ -139,6 +276,21 @@ export interface TranscriptRun {
   alignMs?: number;
   /** Failure reason when status === "failed". */
   error?: string;
+
+  // --- transcript evaluation: how this run was produced, and how it scored ---
+  /** live (read-aloud capture) or batch (stored audio). */
+  source: TranscriptSource;
+  /** stream or chunks — label every figure with it; the two are not comparable. */
+  transport?: TranscriptTransport;
+  /** Cut interval for a chunked transport; undefined for a stream. */
+  chunkIntervalSec?: number;
+  chunkCount?: number;
+  /** Measured latency of the first chunk/frame: the panel's "lag". */
+  firstLatencyMs?: number;
+  /** Mean measured chunk latency — the comparable headline figure. */
+  avgLatencyMs?: number;
+  /** Undefined until this recording has a reference and the run has finished. */
+  metrics?: TranscriptMetrics;
 }
 
 /** ModelRawOutput's counterpart for one ASR engine's transcript.
@@ -156,6 +308,12 @@ export interface TranscriptRawOutput {
   rawOutput?: Record<string, unknown> | unknown[] | null;
   /** The adapted transcript built from that raw output. */
   run?: TranscriptRun;
+}
+
+/** Body of `PATCH /evaluations/{audioFileId}` — the client's one-time measured upload time,
+ * persisted so it survives reopening the project. */
+export interface UploadTimingUpdate {
+  uploadMs: number;
 }
 
 /** One model's initial state right after being enqueued. */

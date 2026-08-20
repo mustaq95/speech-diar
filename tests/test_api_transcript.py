@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 from rq import Queue
 from sqlalchemy.orm import Session, sessionmaker
 
-from packages.database.models import AudioFile, TranscriptResult, User
+from packages.database.models import AudioFile, TranscriptReference, TranscriptResult, User
 from packages.database.session import DEV_USER_EMAIL
 from tests.conftest import make_wav_bytes
 
@@ -582,3 +582,127 @@ def test_transcript_raw_output_column_is_not_loaded_by_a_default_query(
         row = session.query(TranscriptResult).filter_by(audio_file_id=audio_file_id).one()
         assert "raw_output" in inspect(row).unloaded
         assert row.raw_output == {"big": "blob"}
+
+
+# --- reference transcripts (the transcript-evaluation surface) --------------
+
+def test_reference_is_404_until_one_is_set(client: TestClient, db_session_factory: sessionmaker[Session]) -> None:
+    audio_file_id = _recording(db_session_factory)
+    assert client.get(f"/evaluations/{audio_file_id}/reference").status_code == 404
+
+
+def test_put_reference_measures_its_own_word_count(client: TestClient, db_session_factory: sessionmaker[Session]) -> None:
+    """`wordCount` comes from the stored text, never from the request — a client
+    claiming a different count must not be able to change the WER denominator."""
+    audio_file_id = _recording(db_session_factory)
+    response = client.put(
+        f"/evaluations/{audio_file_id}/reference",
+        json={"text": "  one two   three  ", "source": "pasted"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["wordCount"] == 3
+    assert body["text"] == "one two   three"
+    assert body["source"] == "pasted"
+    assert client.get(f"/evaluations/{audio_file_id}/reference").json()["wordCount"] == 3
+
+
+def test_put_reference_rejects_empty_text(client: TestClient, db_session_factory: sessionmaker[Session]) -> None:
+    """An empty reference would score every engine at 100% error, which reads as
+    a model failure rather than a missing reference."""
+    audio_file_id = _recording(db_session_factory)
+    response = client.put(f"/evaluations/{audio_file_id}/reference", json={"text": "   "})
+    assert response.status_code == 422
+
+
+def test_replacing_the_reference_clears_stale_scores(client: TestClient, db_session_factory: sessionmaker[Session]) -> None:
+    """Scores are computed where a run finishes. A new reference makes the old
+    numbers wrong, so they are cleared rather than left to look current."""
+    audio_file_id = _recording(db_session_factory)
+    client.put(f"/evaluations/{audio_file_id}/reference", json={"text": "first reference"})
+    row = TranscriptResult(
+        audio_file_id=audio_file_id, asr_id="inception-stt", status="done",
+        text="hello", wer=0.25, cer=0.1, ref_word_count=2, hyp_word_count=1,
+        sub_count=1, del_count=0, ins_count=0,
+    )
+    with db_session_factory() as session:
+        session.add(row)
+        session.commit()
+    assert client.get(f"/evaluations/{audio_file_id}/transcript").json()[0]["metrics"]["wer"] == 0.25
+
+    client.put(f"/evaluations/{audio_file_id}/reference", json={"text": "a different reference"})
+
+    runs = client.get(f"/evaluations/{audio_file_id}/transcript").json()
+    assert runs[0]["metrics"] is None, "a stale score outlived the reference it was computed against"
+
+
+def test_unscored_run_reports_no_metrics_rather_than_zero(client: TestClient, db_session_factory: sessionmaker[Session]) -> None:
+    """None, not 0.0 — a 0.0 WER is a perfect transcript."""
+    audio_file_id = _recording(db_session_factory)
+    with db_session_factory() as session:
+        session.add(TranscriptResult(
+            audio_file_id=audio_file_id, asr_id="inception-stt", status="done", text="hi"))
+        session.commit()
+    assert client.get(f"/evaluations/{audio_file_id}/transcript").json()[0]["metrics"] is None
+
+
+def test_transport_is_labelled_per_engine(client: TestClient, db_session_factory: sessionmaker[Session]) -> None:
+    """A streaming engine and a chunked one are not measuring the same thing, so
+    every run carries the transport that produced it."""
+    audio_file_id = _recording(db_session_factory)
+    with db_session_factory() as session:
+        session.add_all([
+            TranscriptResult(audio_file_id=audio_file_id, asr_id="hamsa", status="done", text="a"),
+            TranscriptResult(audio_file_id=audio_file_id, asr_id="inception-stt", status="done", text="b"),
+        ])
+        session.commit()
+    by_id = {run["asrId"]: run for run in client.get(f"/evaluations/{audio_file_id}/transcript").json()}
+    assert by_id["hamsa"]["transport"] == "stream"
+    assert by_id["inception-stt"]["transport"] == "chunks"
+
+
+def test_deleting_a_recording_removes_its_reference(client: TestClient, db_session_factory: sessionmaker[Session]) -> None:
+    """The reference holds a FK to the recording; an orphan aborts the delete on
+    Postgres (SQLite in tests would not enforce it)."""
+    audio_file_id = _recording(db_session_factory)
+    client.put(f"/evaluations/{audio_file_id}/reference", json={"text": "some reference"})
+    assert client.delete(f"/evaluations/{audio_file_id}").status_code == 204
+    with db_session_factory() as session:
+        assert session.query(TranscriptReference).filter_by(audio_file_id=audio_file_id).count() == 0
+
+
+def test_plural_route_queues_one_job_per_engine(client: TestClient, db_session_factory: sessionmaker[Session], fake_queue: Queue) -> None:
+    audio_file_id = _recording(db_session_factory)
+    before = len(fake_queue.jobs)
+    response = client.post(f"/evaluations/{audio_file_id}/transcripts",
+                           json={"asrIds": ["hamsa", "inception-stt"]})
+    assert response.status_code == 200
+    runs = response.json()
+    assert [run["asrId"] for run in runs] == ["hamsa", "inception-stt"]
+    assert all(run["status"] == "queued" for run in runs)
+    assert len(fake_queue.jobs) - before == 2
+
+
+def test_plural_route_rejects_an_unknown_engine_before_queueing_anything(
+    client: TestClient, db_session_factory: sessionmaker[Session], fake_queue: Queue
+) -> None:
+    """All-or-nothing: a typo must not leave half a comparison running against a
+    scorecard that will never fill."""
+    audio_file_id = _recording(db_session_factory)
+    before = len(fake_queue.jobs)
+    response = client.post(f"/evaluations/{audio_file_id}/transcripts",
+                           json={"asrIds": ["hamsa", "nope"]})
+    assert response.status_code == 422
+    assert len(fake_queue.jobs) == before
+    assert client.get(f"/evaluations/{audio_file_id}/transcript").json() == []
+
+
+def test_plural_route_collapses_a_duplicated_engine(client: TestClient, db_session_factory: sessionmaker[Session], fake_queue: Queue) -> None:
+    """Two jobs writing to one row would race on the same transcript."""
+    audio_file_id = _recording(db_session_factory)
+    before = len(fake_queue.jobs)
+    response = client.post(f"/evaluations/{audio_file_id}/transcripts",
+                           json={"asrIds": ["hamsa", "hamsa"]})
+    assert response.status_code == 200
+    assert len(response.json()) == 1
+    assert len(fake_queue.jobs) - before == 1

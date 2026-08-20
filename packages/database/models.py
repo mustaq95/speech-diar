@@ -39,6 +39,18 @@ class AudioFile(Base):
     blob_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     blob_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     duration_sec: Mapped[float] = mapped_column(Float)
+    # Which evaluation surface produced this recording: a diarization upload, or a
+    # read-aloud capture from the transcript surface. Indexed because every listing
+    # query filters on it.
+    #
+    # A stored column rather than a derived signal. The alternatives were all
+    # accidents of implementation rather than statements of intent: guessing from
+    # `filename`, or from the absence of EvaluationResult rows, or from the presence
+    # of a TranscriptReference. Those coincide with the truth today and would drift
+    # the first time someone diarizes a read-aloud recording.
+    surface: Mapped[str] = mapped_column(
+        String(16), default="diarization", index=True
+    )  # diarization|transcript
     # Client-perceived upload time (browser upload start -> API response),
     # persisted via PATCH once the client has measured it.
     upload_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -137,9 +149,89 @@ class TranscriptResult(Base):
     raw_output: Mapped[dict | list | None] = mapped_column(JSON, nullable=True, deferred=True)
     asr_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     align_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # --- How this transcript was produced (the transcript-evaluation surface) ---
+    # "live"  — captured chunk by chunk while someone read a script aloud.
+    # "batch" — run over audio already in storage.
+    # Stored, not derived: a live and a batch number are different measurements
+    # of the same engine, and a scorecard that mixed them silently would be
+    # comparing two things while claiming to compare one.
+    source: Mapped[str] = mapped_column(String(8), default="batch")  # live|batch
+    # What the audio actually travelled over, for the engine that produced this
+    # row: "stream" (continuous, engine-side VAD) or "chunks" (fixed cuts).
+    # The two are NOT interchangeable and the UI labels each figure with it —
+    # a chunked engine carries its boundary cost in its own error rate.
+    transport: Mapped[str | None] = mapped_column(String(16), nullable=True)  # stream|chunks
+    chunk_interval_sec: Mapped[float | None] = mapped_column(Float, nullable=True)
+    chunk_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Latency of the FIRST chunk and the mean across all of them, measured
+    # send -> text-returned. Scalars rather than only the list below, because
+    # these two are what the panel shows and the transcript list is polled
+    # while a run is in flight.
+    first_latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    avg_latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Every chunk's measured latency, in order. Deferred: a 30-minute recording
+    # at a 3s interval is 600 entries that no polled response needs.
+    chunk_latencies_ms: Mapped[list | None] = mapped_column(JSON, nullable=True, deferred=True)
+    # Processing time / audio duration. NULL means "not measurable for this
+    # transport" rather than zero: a real-time streaming protocol consumes audio
+    # at 1x by definition, so an RTF for it would be an invention. The UI shows
+    # "real-time bound" for a null, never a number.
+    rtf: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # --- Scoring against the reference (see TranscriptReference) ---
+    # Both normalized and raw are kept so the UI's "normalization on" toggle is
+    # a read, not a recompute — and so the effect of normalization is itself
+    # visible instead of being an invisible preprocessing step.
+    wer: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cer: Mapped[float | None] = mapped_column(Float, nullable=True)
+    wer_raw: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cer_raw: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ref_word_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    hyp_word_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sub_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    del_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ins_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The per-word edit operations the UI highlights. Deferred for the same
+    # reason as chunk_latencies_ms: one entry per reference word.
+    alignment: Mapped[list | None] = mapped_column(JSON, nullable=True, deferred=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     asr_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     align_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    audio_file: Mapped[AudioFile] = relationship()
+
+
+class TranscriptReference(Base):
+    """The ground truth one recording is scored against: at most one per recording.
+
+    A separate table rather than a column on AudioFile, because a reference is
+    not a property of the audio — it is a claim about what was said, with its own
+    provenance. `source` records that provenance and is load-bearing: a WER
+    against a script someone actually read aloud means something different from a
+    WER against a transcript typed after the fact, and the scorecard says which.
+
+    One per recording, not one per engine: every engine is scored against the
+    same text, which is the only way their numbers are comparable.
+    """
+
+    __tablename__ = "transcript_references"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    audio_file_id: Mapped[int] = mapped_column(
+        ForeignKey("audio_files.id"), index=True, unique=True
+    )
+    # "script" — generated by the script generator and read aloud, so the words
+    #            were known before the audio existed.
+    # "pasted" — supplied by hand for a recording that already existed.
+    source: Mapped[str] = mapped_column(String(8))  # script|pasted
+    text: Mapped[str] = mapped_column(Text)
+    # For a generated script: the request that produced it (minutes, language
+    # mix, hard cases) plus the generating model. Kept so a score can be traced
+    # back to what was asked for, and so a script can be regenerated like-for-like.
+    params: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     audio_file: Mapped[AudioFile] = relationship()
 

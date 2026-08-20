@@ -129,6 +129,80 @@ def _content_hash_file(path: str) -> str:
     return h.hexdigest()[:32]
 
 
+def store_recording(
+    content: bytes,
+    filename: str,
+    db: Session,
+    owner: User,
+    *,
+    want_local: bool = True,
+    want_azure: bool = False,
+    surface: str = "diarization",
+) -> AudioFile:
+    """Canonicalize audio, store it per lane, and create its `AudioFile` row.
+
+    Extracted from `_ingest_audio` so the read-aloud path can reuse it. That path
+    needs a stored recording with a real duration and nothing else: no diarization
+    models (one person reading a script aloud makes a speaker comparison a
+    foregone conclusion) and no auto-enqueued transcript (it already HAS both
+    engines' transcripts, captured live). Reusing this rather than copying it keeps
+    one definition of the canonical stored shape.
+
+    `surface` records which evaluation surface produced the recording, so Projects
+    can list the two separately. Defaults to diarization, leaving both upload paths
+    unchanged.
+
+    Fully synchronous (blocking ffmpeg + storage IO), so callers run it via
+    `run_in_threadpool` to keep it off the event loop.
+    """
+    # Canonicalize to a 16 kHz mono 16-bit PCM WAV on disk so every downstream consumer
+    # sees one shape and a multi-hour file never lands wholesale in memory.
+    if _is_canonical_wav(content):
+        fd, canonical_path = tempfile.mkstemp(suffix=".wav")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(content)
+    else:
+        canonical_path = _transcode_to_wav_file(content)
+        if canonical_path is None:
+            raise HTTPException(status_code=415, detail="Unsupported or unreadable audio file")
+
+    try:
+        duration_sec = _wav_duration_file(canonical_path)
+        if duration_sec is None:
+            raise HTTPException(status_code=415, detail="Could not read audio duration")
+
+        # The stored object is always canonical .wav regardless of the source filename
+        # (which is kept only for display).
+        audio_file = AudioFile(
+            owner_id=owner.id, filename=filename, duration_sec=duration_sec, surface=surface
+        )
+        db.add(audio_file)
+        db.commit()
+
+        # Two independent writes, one per selected lane — never copied lane-to-lane.
+        # Each streams the canonical file from disk; nothing re-buffers it in memory.
+        if want_local:
+            key = f"audio/{audio_file.id}.wav"
+            with open(canonical_path, "rb") as fh:
+                s3_client.put_stream(fh, key)
+            audio_file.s3_key = key
+        if want_azure:
+            # Keyed by content hash, not audio_file.id: uploading the same file
+            # again (e.g. repeated Azure test runs) reuses the existing blob
+            # instead of re-uploading it.
+            blob_key = f"uploads/{_content_hash_file(canonical_path)}.wav"
+            if not azure_blob.blob_exists(blob_key):
+                with open(canonical_path, "rb") as fh:
+                    azure_blob.put_stream(fh, blob_key)
+            audio_file.blob_key = blob_key
+            audio_file.blob_url = azure_blob.blob_url(blob_key)
+        db.commit()
+    finally:
+        if os.path.exists(canonical_path):
+            os.unlink(canonical_path)
+    return audio_file
+
+
 def _ingest_audio(content: bytes, filename: str, models: str, db: Session, owner: User) -> UploadAck:
     """Shared ingestion core for both the browser upload and the pulled-recording
     paths: validate models, canonicalize to a 16 kHz mono WAV, store per lane,
@@ -156,49 +230,9 @@ def _ingest_audio(content: bytes, filename: str, models: str, db: Session, owner
             ),
         )
 
-    # Canonicalize to a 16 kHz mono 16-bit PCM WAV on disk so every downstream consumer
-    # sees one shape and a multi-hour file never lands wholesale in memory.
-    if _is_canonical_wav(content):
-        fd, canonical_path = tempfile.mkstemp(suffix=".wav")
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(content)
-    else:
-        canonical_path = _transcode_to_wav_file(content)
-        if canonical_path is None:
-            raise HTTPException(status_code=415, detail="Unsupported or unreadable audio file")
-
-    try:
-        duration_sec = _wav_duration_file(canonical_path)
-        if duration_sec is None:
-            raise HTTPException(status_code=415, detail="Could not read audio duration")
-
-        # The stored object is always canonical .wav regardless of the source filename
-        # (which is kept only for display).
-        audio_file = AudioFile(owner_id=owner.id, filename=filename, duration_sec=duration_sec)
-        db.add(audio_file)
-        db.commit()
-
-        # Two independent writes, one per selected lane — never copied lane-to-lane.
-        # Each streams the canonical file from disk; nothing re-buffers it in memory.
-        if local_ids:
-            key = f"audio/{audio_file.id}.wav"
-            with open(canonical_path, "rb") as fh:
-                s3_client.put_stream(fh, key)
-            audio_file.s3_key = key
-        if azure_ids:
-            # Keyed by content hash, not audio_file.id: uploading the same file
-            # again (e.g. repeated Azure test runs) reuses the existing blob
-            # instead of re-uploading it.
-            blob_key = f"uploads/{_content_hash_file(canonical_path)}.wav"
-            if not azure_blob.blob_exists(blob_key):
-                with open(canonical_path, "rb") as fh:
-                    azure_blob.put_stream(fh, blob_key)
-            audio_file.blob_key = blob_key
-            audio_file.blob_url = azure_blob.blob_url(blob_key)
-        db.commit()
-    finally:
-        if os.path.exists(canonical_path):
-            os.unlink(canonical_path)
+    audio_file = store_recording(
+        content, filename, db, owner, want_local=bool(local_ids), want_azure=bool(azure_ids)
+    )
 
     queued: list[QueuedModel] = []
     for model_id in valid_ids:

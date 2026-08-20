@@ -23,7 +23,31 @@ TranscriptStage = Literal["asr", "align"]
 #: Where the ASR ran. `online` streamed the audio to a remote endpoint;
 #: `offline` kept it on this host. On a produced transcript this is derived from
 #: the engine that actually ran, not from the mode a new run would use.
+#:
+#: No longer what SELECTS an engine -- `asr_id` is. Two engines are `online`
+#: (hamsa and inception-stt), so a mode cannot identify one. It remains an
+#: honest statement about where the audio goes.
 TranscriptionMode = Literal["online", "offline"]
+
+#: How a transcript was produced. `live` was captured chunk by chunk while
+#: someone read a script aloud; `batch` was run over stored audio. Not
+#: interchangeable: they are different measurements of the same engine.
+TranscriptSource = Literal["live", "batch"]
+
+#: What the audio travelled over for a given engine. `stream` is continuous with
+#: engine-side VAD; `chunks` is fixed-interval cuts. A chunked engine carries its
+#: boundary cost inside its own error rate, so every figure is labelled with this
+#: and the two transports' chunk statistics are NOT comparable to each other.
+TranscriptTransport = Literal["stream", "chunks"]
+
+#: Where a reference transcript came from. `script` was generated and read aloud,
+#: so the words were known before the audio existed; `pasted` was supplied by
+#: hand afterwards. A WER means something different against each.
+ReferenceSource = Literal["script", "pasted"]
+
+#: One edit operation aligning hypothesis to reference. `equal` words matched;
+#: the rest are the three error classes WER counts.
+AlignmentOp = Literal["equal", "sub", "del", "ins"]
 
 
 class ContractModel(BaseModel):
@@ -126,6 +150,136 @@ class TranscriptWord(ContractModel):
     )
 
 
+class TranscriptAlignmentOp(ContractModel):
+    """One step of the reference-to-hypothesis alignment, for the word-level
+    error highlight.
+
+    This comes from the WER edit-distance backtrace, NOT from any aligner or
+    per-word timing: the boxed words in the UI are substitutions against the
+    reference, which is a text comparison and needs no audio.
+    """
+
+    op: AlignmentOp
+    ref: str | None = Field(default=None, description="Reference word; None for an insertion")
+    hyp: str | None = Field(default=None, description="Hypothesis word; None for a deletion")
+    #: Index into the hypothesis word list, so the UI can mark the rendered word.
+    hyp_index: int | None = Field(default=None, ge=0)
+
+
+class TranscriptMetrics(ContractModel):
+    """How one engine's transcript scored against the recording's reference.
+
+    Both normalized and raw rates are carried so the UI's normalization toggle
+    is a read rather than a recompute, and so normalization's own effect is
+    visible instead of being invisible preprocessing.
+
+    `rtf` is None when the engine's transport cannot produce one: a real-time
+    streaming protocol consumes audio at 1x by definition, so a figure for it
+    would be invented. The UI shows "real-time bound" for a null, never a number.
+    """
+
+    wer: float = Field(ge=0, description="Word error rate, normalized text, 0..1+ (S+D+I over reference words)")
+    cer: float = Field(ge=0, description="Character error rate, normalized text")
+    wer_raw: float = Field(ge=0, description="Word error rate WITHOUT normalization")
+    cer_raw: float = Field(ge=0, description="Character error rate WITHOUT normalization")
+    ref_word_count: int = Field(ge=0)
+    hyp_word_count: int = Field(ge=0)
+    sub_count: int = Field(ge=0)
+    del_count: int = Field(ge=0)
+    ins_count: int = Field(ge=0)
+    rtf: float | None = Field(
+        default=None,
+        ge=0,
+        description="Processing time / audio duration; None when the transport is real-time bound",
+    )
+
+
+class TranscriptReference(ContractModel):
+    """The ground truth a recording's engines are scored against.
+
+    One per recording, never one per engine: comparability depends on every
+    engine being scored against the same text.
+    """
+
+    audio_file_id: int
+    source: ReferenceSource
+    text: str
+    word_count: int = Field(ge=0, description="Measured from `text`, never taken from a request")
+    params: dict | None = Field(
+        default=None,
+        description="For a generated script: the request that produced it, plus the generating model",
+    )
+
+
+#: Which evaluation surface produced a recording. Diarization recordings come from
+#: an upload; transcript recordings are read-aloud captures. They are listed
+#: separately because they are different artifacts scored in different ways.
+RecordingSurface = Literal["diarization", "transcript"]
+
+
+class RecordingSummary(ContractModel):
+    """One row of the recordings list.
+
+    Carries what a list row needs and nothing more. The counts are computed by
+    aggregate query on the server rather than derived client-side: the list used to
+    be assembled by fetching every recording's full evaluation one request at a
+    time, which is N requests to render one page.
+
+    Deliberately NOT here: `payload` and `raw_output`. Both are deferred columns
+    holding a whole model's output, and a list has no use for either.
+    """
+
+    audio_file_id: int
+    surface: RecordingSurface
+    filename: str = Field(description="Display name; not unique")
+    duration_sec: float = Field(ge=0)
+    created_at: str = Field(description="ISO-8601; the list is ordered by this, newest first")
+
+    # --- diarization recordings ---
+    model_count: int = Field(default=0, ge=0, description="Models that have a result row")
+    speaker_count: int = Field(default=0, ge=0, description="Highest speaker count any model found")
+    done_count: int = Field(default=0, ge=0)
+    failed_count: int = Field(default=0, ge=0)
+
+    # --- transcript recordings ---
+    engine_count: int = Field(default=0, ge=0, description="ASR engines compared")
+    scored: bool = Field(default=False, description="Whether a reference exists and runs were scored")
+    best_wer: float | None = Field(
+        default=None, ge=0, description="Lowest WER across engines; None when unscored"
+    )
+
+
+class ScriptRequest(ContractModel):
+    """What to generate a read-aloud script for.
+
+    The options are served by `GET /config` from `.env`, so the UI's slider stops
+    and chips are not literals in the frontend and this request cannot ask for a
+    combination the host was never configured to offer.
+    """
+
+    minutes: float = Field(gt=0, le=60, description="Target read-aloud length")
+    language_mix: str = Field(
+        default="mixed-70-30", description="One of GET /config transcript.scriptLanguageMixes"
+    )
+    hard_cases: list[str] = Field(
+        default_factory=list, description="Subset of GET /config transcript.scriptHardCases"
+    )
+
+
+class GeneratedScript(ContractModel):
+    """A generated script, with the request that produced it.
+
+    `wordCount` is MEASURED from `text`, never echoed from the request: it becomes
+    the WER denominator, so a requested length must never be mistaken for a
+    produced one.
+    """
+
+    text: str
+    word_count: int = Field(ge=0, description="Measured from `text`")
+    generator_model: str = Field(description="The model that actually generated it")
+    params: dict = Field(description="The request, plus finish reason and generation time")
+
+
 class TranscriptRun(ContractModel):
     """One engine's live-speech transcript of one audio file: ASR text plus
     word-level timings, with each stage's real measured cost.
@@ -154,6 +308,27 @@ class TranscriptRun(ContractModel):
     asr_ms: int | None = Field(default=None, description="Measured wall-clock time of the ASR stage in ms")
     align_ms: int | None = Field(default=None, description="Measured wall-clock time of the alignment stage in ms")
     error: str | None = Field(default=None, description="Failure reason when status == 'failed'")
+
+    # --- transcript evaluation: how this run was produced, and how it scored ---
+    source: TranscriptSource = Field(
+        default="batch", description="live (read-aloud capture) or batch (stored audio)"
+    )
+    transport: TranscriptTransport | None = Field(
+        default=None, description="stream or chunks — label every figure with it; the two are not comparable"
+    )
+    chunk_interval_sec: float | None = Field(
+        default=None, gt=0, description="Cut interval for a chunked transport; None for a stream"
+    )
+    chunk_count: int | None = Field(default=None, ge=0)
+    first_latency_ms: int | None = Field(
+        default=None, ge=0, description="Measured latency of the first chunk/frame: the panel's 'lag'"
+    )
+    avg_latency_ms: int | None = Field(
+        default=None, ge=0, description="Mean measured chunk latency — the comparable headline figure"
+    )
+    metrics: TranscriptMetrics | None = Field(
+        default=None, description="None until this recording has a reference and the run has finished"
+    )
 
 
 class TranscriptRawOutput(ContractModel):

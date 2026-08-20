@@ -83,6 +83,40 @@ export function SliderControl({ value, min, max, step, label, format, onChange, 
   );
 }
 
+interface SegmentedProps<T extends string> {
+  value: T;
+  options: Array<T | { value: T; label: string }>;
+  onChange: (value: T) => void;
+  label: string;
+  disabled?: boolean;
+}
+
+/** Segmented pill group. Same option shape as SelectControl above, so a control
+ * can move between the two without its caller changing. */
+export function Segmented<T extends string>({ value, options, onChange, label, disabled = false }: SegmentedProps<T>) {
+  return (
+    <div className="segmented" role="tablist" aria-label={label}>
+      {options.map((option) => {
+        const optionValue = typeof option === "string" ? option : option.value;
+        const text = typeof option === "string" ? option : option.label;
+        return (
+          <button
+            key={optionValue}
+            type="button"
+            disabled={disabled}
+            className={value === optionValue ? "is-active" : ""}
+            onClick={() => onChange(optionValue)}
+            role="tab"
+            aria-selected={value === optionValue}
+          >
+            {text}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 export function SegmentedMetric({
   value,
   onChange,
@@ -93,23 +127,7 @@ export function SegmentedMetric({
   disabled?: boolean;
 }) {
   const options: Metric[] = ["DER", "JER", "WDER"];
-  return (
-    <div className="segmented" role="tablist" aria-label="Primary metric">
-      {options.map((option) => (
-        <button
-          key={option}
-          type="button"
-          disabled={disabled}
-          className={value === option ? "is-active" : ""}
-          onClick={() => onChange(option)}
-          role="tab"
-          aria-selected={value === option}
-        >
-          {option}
-        </button>
-      ))}
-    </div>
-  );
+  return <Segmented value={value} options={options} onChange={onChange} label="Primary metric" disabled={disabled} />;
 }
 
 export function Stepper({

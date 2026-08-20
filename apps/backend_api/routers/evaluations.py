@@ -18,6 +18,8 @@ from apps.background_worker.models import REGISTRY
 from apps.background_worker.pipelines.azure_pipeline import _fixed_key
 from apps.background_worker.queue_app import queue
 from apps.background_worker.transcription import (
+    resolve_asr_ids,
+    transport_for,
     ALIGNER_NAME,
     DEFAULT_TRANSCRIPTION_MODE,
     asr_id_for_mode,
@@ -27,13 +29,22 @@ from apps.background_worker.transcription.pipeline import get_transcript_row, ru
 from apps.background_worker.worker import run_model
 from apps.backend_api.dependencies import get_current_user, get_db
 from packages.config.settings import get_settings
-from packages.database.models import AudioFile, EvaluationResult, TranscriptResult, User
+from packages.database.models import (
+    AudioFile,
+    EvaluationResult,
+    TranscriptReference,
+    TranscriptResult,
+    User,
+)
 from packages.shared_contracts.schemas import (
     DiarizationEvaluation,
     DiarizationModelRun,
     ModelRawOutput,
+    ReferenceSource,
     TranscriptionMode,
+    TranscriptMetrics,
     TranscriptRawOutput,
+    TranscriptReference as TranscriptReferenceContract,
     TranscriptRun,
     TranscriptWord,
     UploadTimingUpdate,
@@ -225,6 +236,53 @@ def _transcript_run(row: TranscriptResult) -> TranscriptRun:
         asr_ms=row.asr_ms,
         align_ms=row.align_ms,
         error=row.error,
+        source=row.source or "batch",
+        # From the engine's registry entry, not the row: the transport is a fact
+        # about the engine, and a row written before this column existed should
+        # still be labelled correctly rather than showing blank.
+        transport=row.transport or transport_for(row.asr_id),
+        chunk_interval_sec=row.chunk_interval_sec,
+        chunk_count=row.chunk_count,
+        first_latency_ms=row.first_latency_ms,
+        avg_latency_ms=row.avg_latency_ms,
+        metrics=_transcript_metrics(row),
+    )
+
+
+def _reference_contract(row: TranscriptReference) -> TranscriptReferenceContract:
+    """Row -> contract. `word_count` is MEASURED from the stored text, never
+    carried over from whatever a request claimed it would be."""
+    return TranscriptReferenceContract(
+        audio_file_id=row.audio_file_id,
+        source=row.source,
+        text=row.text,
+        word_count=len(row.text.split()),
+        params=row.params,
+    )
+
+
+def _transcript_metrics(row: TranscriptResult) -> TranscriptMetrics | None:
+    """Scores for this run, or None when it has not been scored.
+
+    None means "no reference, or not finished" — never zero. A 0.0 WER is a
+    perfect transcript and must not be how "unscored" renders.
+    """
+    if row.wer is None:
+        return None
+    return TranscriptMetrics(
+        wer=row.wer,
+        cer=row.cer or 0.0,
+        wer_raw=row.wer_raw if row.wer_raw is not None else row.wer,
+        cer_raw=row.cer_raw if row.cer_raw is not None else (row.cer or 0.0),
+        ref_word_count=row.ref_word_count or 0,
+        hyp_word_count=row.hyp_word_count or 0,
+        sub_count=row.sub_count or 0,
+        del_count=row.del_count or 0,
+        ins_count=row.ins_count or 0,
+        # Deliberately passed through as-is, including None: a real-time bound
+        # transport has no measurable RTF, and 0.0 would read as "infinitely
+        # fast" instead of "not applicable".
+        rtf=row.rtf,
     )
 
 
@@ -254,6 +312,105 @@ def get_transcripts(
         .order_by(TranscriptResult.asr_id)
         .all()
     )
+    return [_transcript_run(row) for row in rows]
+
+
+def _queue_transcript(
+    db: Session, audio_file: AudioFile, asr_id: str, settings
+) -> TranscriptResult:
+    """Reset (or create) one engine's row for this recording and enqueue its job.
+
+    Keyed on (recording, engine) throughout, so queueing one engine never
+    touches another's text, timings or scores — that side-by-side is the whole
+    comparison. Raises the same 409/422 the single-engine route always did.
+    """
+    engine = engine_for(asr_id)
+    if engine is None or not engine.configured(settings):
+        raise HTTPException(
+            status_code=422, detail=f"{asr_id!r} is not configured on this host"
+        )
+
+    row = db.query(TranscriptResult).filter_by(audio_file_id=audio_file.id, asr_id=asr_id).one_or_none()
+    if row is None:
+        row = TranscriptResult(audio_file_id=audio_file.id, asr_id=asr_id, status="queued")
+        db.add(row)
+    else:
+        if row.status in ("queued", "running"):
+            raise HTTPException(
+                status_code=409, detail=f"{engine.name} transcript is already {row.status}"
+            )
+        row.status = "queued"
+        row.stage = None
+        row.error = None
+        row.text = None
+        row.words = None
+        row.raw_output = None
+        row.asr_ms = None
+        row.align_ms = None
+        row.asr_started_at = None
+        row.align_started_at = None
+        # A re-run invalidates the previous run's measurements and scores too.
+        # Leaving stale numbers beside fresh text would show a WER computed
+        # against a transcript that no longer exists.
+        row.chunk_count = None
+        row.chunk_interval_sec = None
+        row.chunk_latencies_ms = None
+        row.first_latency_ms = None
+        row.avg_latency_ms = None
+        row.rtf = None
+        row.wer = None
+        row.cer = None
+        row.wer_raw = None
+        row.cer_raw = None
+        row.ref_word_count = None
+        row.hyp_word_count = None
+        row.sub_count = None
+        row.del_count = None
+        row.ins_count = None
+        row.alignment = None
+    row.source = "batch"
+    row.transport = transport_for(asr_id)
+    return row
+
+
+@router.post("/{audio_file_id}/transcripts", response_model=list[TranscriptRun], response_model_by_alias=True)
+def start_transcripts(
+    audio_file_id: int,
+    asr_ids: list[str] = Body(..., embed=True, alias="asrIds"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[TranscriptRun]:
+    """Run several engines over stored audio — the transcript-evaluation fan-out.
+
+    Plural sibling of `POST /{id}/transcript`, rather than that route learning to
+    return either an object or a list depending on its body. One endpoint, one
+    response shape: the singular route stays exactly what the Live Speech panel
+    already calls, and this one is what the comparison surface calls.
+
+    One job per engine, mirroring the platform's one-job-per-model rule, so a
+    slow engine never gates a fast one and each row reaches done|failed on its
+    own.
+
+    All-or-nothing on validation: an unknown or unconfigured engine is rejected
+    before ANY job is queued, so a typo cannot leave half the comparison running
+    against a scorecard that will never fill.
+    """
+    audio_file = _get_audio_file(db, audio_file_id, current_user)
+    if not audio_file.s3_key:
+        raise HTTPException(
+            status_code=400, detail="This recording has no local-lane audio, so it cannot be transcribed"
+        )
+    try:
+        resolved = resolve_asr_ids(asr_ids)
+    except KeyError as exc:
+        raise HTTPException(status_code=422, detail=f"Unknown ASR engine {exc.args[0]!r}") from exc
+
+    settings = get_settings()
+    rows = [_queue_transcript(db, audio_file, asr_id, settings) for asr_id in resolved]
+    db.commit()
+    for asr_id in resolved:
+        queue.enqueue(run_asr, audio_file.id, asr_id)
+    logger.info("Queued transcripts (%s) for audio_file_id=%s", ",".join(resolved), audio_file.id)
     return [_transcript_run(row) for row in rows]
 
 
@@ -288,35 +445,90 @@ def start_transcript(
     asr_id = asr_id_for_mode(mode)
     engine = engine_for(asr_id)
     if engine is None or not engine.configured(settings):
+        # Kept as its own check so the message still names the MODE the caller
+        # asked for; the shared helper only knows the engine id it was handed.
         raise HTTPException(
             status_code=422,
             detail=f"{mode} mode selects {asr_id!r}, which is not configured on this host",
         )
 
-    row = db.query(TranscriptResult).filter_by(audio_file_id=audio_file.id, asr_id=asr_id).one_or_none()
-    if row is None:
-        row = TranscriptResult(audio_file_id=audio_file.id, asr_id=asr_id, status="queued")
-        db.add(row)
-    else:
-        if row.status in ("queued", "running"):
-            raise HTTPException(
-                status_code=409, detail=f"{engine.name} transcript is already {row.status}"
-            )
-        row.status = "queued"
-        row.stage = None
-        row.error = None
-        row.text = None
-        row.words = None
-        row.raw_output = None
-        row.asr_ms = None
-        row.align_ms = None
-        row.asr_started_at = None
-        row.align_started_at = None
+    row = _queue_transcript(db, audio_file, asr_id, settings)
     db.commit()
 
     queue.enqueue(run_asr, audio_file.id, asr_id)
     logger.info("Queued transcript (%s) for audio_file_id=%s", asr_id, audio_file.id)
     return _transcript_run(row)
+
+
+@router.get("/{audio_file_id}/reference", response_model=TranscriptReferenceContract,
+            response_model_by_alias=True)
+def get_reference(
+    audio_file_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TranscriptReferenceContract:
+    """The ground truth this recording's engines are scored against.
+
+    404 when there is none: without a reference there is no WER to report, and a
+    fabricated empty reference would score every engine at 100% error.
+    """
+    audio_file = _get_audio_file(db, audio_file_id, current_user)
+    row = db.query(TranscriptReference).filter_by(audio_file_id=audio_file.id).one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="This recording has no reference transcript")
+    return _reference_contract(row)
+
+
+@router.put("/{audio_file_id}/reference", response_model=TranscriptReferenceContract,
+            response_model_by_alias=True)
+def put_reference(
+    audio_file_id: int,
+    text: str = Body(..., embed=True),
+    source: ReferenceSource = Body("pasted", embed=True),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TranscriptReferenceContract:
+    """Set or replace the reference for a recording that already exists.
+
+    The read-aloud flow supplies its reference at finalize; this is the other
+    entry point — scoring audio that was already here, against a transcript
+    supplied by hand.
+
+    Replacing the reference deliberately does NOT rescore existing runs here.
+    Scores are computed where the run finishes, so silently recomputing them from
+    a request would put two different code paths in charge of the same number.
+    The affected rows' scores are cleared instead, and the surface offers a
+    re-run — an empty score is honest, a stale one is not.
+    """
+    audio_file = _get_audio_file(db, audio_file_id, current_user)
+    cleaned = text.strip()
+    if not cleaned:
+        raise HTTPException(status_code=422, detail="A reference transcript cannot be empty")
+
+    row = db.query(TranscriptReference).filter_by(audio_file_id=audio_file.id).one_or_none()
+    if row is None:
+        row = TranscriptReference(audio_file_id=audio_file.id, source=source, text=cleaned)
+        db.add(row)
+    else:
+        row.source = source
+        row.text = cleaned
+        row.params = None
+
+    for result in db.query(TranscriptResult).filter_by(audio_file_id=audio_file.id).all():
+        result.wer = None
+        result.cer = None
+        result.wer_raw = None
+        result.cer_raw = None
+        result.ref_word_count = None
+        result.hyp_word_count = None
+        result.sub_count = None
+        result.del_count = None
+        result.ins_count = None
+        result.alignment = None
+    db.commit()
+    logger.info("Reference (%s, %d words) set for audio_file_id=%s",
+                source, len(cleaned.split()), audio_file.id)
+    return _reference_contract(row)
 
 
 @router.get(
@@ -388,6 +600,10 @@ def delete_evaluation(
 
     db.query(EvaluationResult).filter_by(audio_file_id=audio_file.id).delete()
     db.query(TranscriptResult).filter_by(audio_file_id=audio_file.id).delete()
+    # Before db.delete(audio_file): this row holds a FK to it, so leaving it
+    # would abort the delete on Postgres (SQLite in tests does not enforce FKs
+    # by default and would have let the orphan through).
+    db.query(TranscriptReference).filter_by(audio_file_id=audio_file.id).delete()
     db.delete(audio_file)
     db.commit()
 

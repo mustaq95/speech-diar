@@ -8,9 +8,18 @@ import { ProjectsView } from "./components/ProjectsView";
 import { SettingsView } from "./components/SettingsView";
 import { MIN_PX_PER_SEC, Studio } from "./components/Studio";
 import { TopBar } from "./components/TopBar";
+import { TranscriptStudio } from "./components/TranscriptStudio";
 import { UploadingScreen } from "./components/UploadingScreen";
-import { boundsFor, fmt, loadModelActive, loadProjects, saveModelActive, saveProjects } from "./utils";
-import { buildReportHtml, computeReport, downloadReport, type ReportEntry } from "./report";
+import { boundsFor, fmt, loadModelActive, saveModelActive } from "./utils";
+import {
+  buildReportHtml,
+  buildTranscriptAggregateReportHtml,
+  computeReport,
+  computeTranscriptReport,
+  downloadReport,
+  type ReportEntry,
+  type TranscriptReportEntry,
+} from "./report";
 import {
   DEMO_AUDIO_FILE_ID,
   audioStreamUrl,
@@ -20,12 +29,15 @@ import {
   fetchEvaluation,
   fetchModelCatalog,
   fetchModelStatus,
+  fetchRecordings,
+  fetchReference,
   fetchRuntimeConfig,
   fetchTranscripts,
   ingestRecording,
   mergeActiveWithCatalog,
   modelRunFromMetadata,
   patchUploadTiming,
+  projectFromRecording,
   retryModel,
   startTranscript,
   uploadAudio,
@@ -33,7 +45,7 @@ import {
 import type { RuntimeConfig } from "./adapters";
 import { speakerSignature, decodeWaveformPeaks } from "./playback";
 import { isInFlight } from "./timing";
-import type { ActiveMap, AvailableMap, DiarizationEvaluation, EvalConfig, ModelId, ModelMetadata, ModelRun, Nav, ParamMap, Project, Workflow } from "./types";
+import type { ActiveMap, AvailableMap, DiarizationEvaluation, EvalConfig, ModelId, ModelMetadata, ModelRun, Nav, ParamMap, Project, StudioMode, Workflow } from "./types";
 import type { ModelContainerStatus, TranscriptionMode, TranscriptRun, UploadAck } from "./types/diarization";
 
 const FLAT_WAVE_PEAKS = Array.from({ length: 210 }, () => 0.3);
@@ -70,12 +82,31 @@ export default function App() {
   );
 
   const [nav, setNav] = useState<Nav>("upload");
+  // Which surface Projects lists. Derived from `nav` so the toggle drives it with
+  // no second piece of state to keep in step: the transcript surface is the only
+  // nav destination that means "transcript", and Projects keeps whichever was last
+  // chosen so switching to Projects does not reset it.
+  const [listSurface, setListSurface] = useState<StudioMode>("diarization");
+  // Which primary tab the transcript page counts as. That page serves BOTH
+  // activities for its surface — the record UI when nothing is open, the stored
+  // comparison when a recording is — so the tab cannot be derived from the page.
+  //
+  // Tracked from the click rather than inferred from whether a recording is open,
+  // which is what an earlier version did: clicking Dashboard with nothing recorded
+  // then highlighted Upload, because "nothing to view" was inferred as "you must be
+  // creating". The user's click is the truth about which tab they are on.
+  const [transcriptTab, setTranscriptTab] = useState<Nav>("upload");
   const [workflow, setWorkflow] = useState<Workflow>("idle");
   const [uploadPct, setUploadPct] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
   const [zoom, setZoom] = useState(1);
-  const [projects, setProjects] = useState<Project[]>(() => loadProjects());
+  // Fetched from the backend, not read from localStorage. The list is now
+  // "recordings that exist", not "recordings this browser remembers".
+  const [projects, setProjects] = useState<Project[]>([]);
+  // Ids created in THIS browser session, which is what the NEW badge means. A ref
+  // rather than state: it only ever decorates a list that is refetched anyway.
+  const freshIdsRef = useRef<Set<number>>(new Set());
   const [current, setCurrent] = useState<Project | null>(null);
   const [active, setActive] = useState<ActiveMap>({});
   const [evalCfg, setEvalCfg] = useState<EvalConfig>(() => deriveDefaultEval({ audioFileId: 0, durationSec: 0, models: [] }));
@@ -239,12 +270,18 @@ export default function App() {
   // because of a completely different evaluation's job. Poll continuously,
   // independent of `hasInFlight`, starting immediately rather than waiting
   // out the first interval tick.
+  //
+  // Only while the dashboard is open, because that is the only place either
+  // consumer of `modelStatus` renders — this strip and the Studio's per-model
+  // lifecycle chips. Elsewhere it was a request every 1.5s to update nothing, and
+  // on the transcript surface it competed for the event loop with live chunk calls.
   useEffect(() => {
+    if (nav !== "dashboard") return;
     const poll = () => fetchModelStatus().then(setModelStatus).catch((error: Error) => console.error("Model status poll failed:", error));
     void poll();
     const id = window.setInterval(poll, pollIntervalMs);
     return () => window.clearInterval(id);
-  }, [pollIntervalMs]);
+  }, [pollIntervalMs, nav]);
 
   // Re-fetch runtime config on the same cadence. Transcription availability is a
   // live signal: the offline engine's container can finish its (minutes-long)
@@ -274,73 +311,41 @@ export default function App() {
     if (workflow === "processing" && evaluation && !hasInFlight && !hasFailed) setWorkflow("idle");
   }, [workflow, evaluation, hasInFlight, hasFailed]);
 
-  // The saved project's speaker and model counts are captured at upload time
-  // (before any model has run) — refresh them from the real evaluation once it
-  // settles so the Projects list doesn't keep showing a stale "0 speakers
-  // detected" or a model count that a later per-model retry has since changed.
+  const refreshRecordings = useCallback(
+    async (surface: StudioMode) => {
+      try {
+        const rows = await fetchRecordings(surface);
+        setProjects(rows.map((row) => projectFromRecording(row, freshIdsRef.current.has(row.audioFileId))));
+      } catch (error) {
+        console.error("Could not load recordings:", error);
+      }
+    },
+    [],
+  );
+
+  // One request per surface change, and again after a create or delete. This
+  // replaces an effect that fired one fetchEvaluation PER ROW on every visit to
+  // Projects, purely to refresh counts the server can now compute itself.
+  useEffect(() => {
+    void refreshRecordings(listSurface);
+  }, [listSurface, refreshRecordings]);
+
+  // The open recording's counts are captured at upload time, before any model has
+  // run. Once the evaluation settles, refresh them — otherwise the list keeps
+  // showing "0 speakers detected" or a model count a later retry has changed.
+  //
+  // Refetching rather than patching a local copy: the list is server state now, and
+  // maintaining a second version of it in the client is what the old reconcile
+  // effect did one request per row at a time.
   useEffect(() => {
     if (!evaluation || isDemo || hasInFlight || !current || current.audioFileId !== evaluation.audioFileId) return;
     const speakers = Math.max(0, ...evaluation.models.map((run) => run.numSpk));
     const modelCount = evaluation.models.length;
     if (speakers === current.speakers && modelCount === current.models) return;
-    const updated: Project = { ...current, speakers, models: modelCount };
-    setCurrent(updated);
-    setProjects((prev) => {
-      const next = prev.map((project) => (project.id === updated.id ? updated : project));
-      saveProjects(next);
-      return next;
-    });
-  }, [evaluation, isDemo, hasInFlight, current]);
+    setCurrent({ ...current, speakers, models: modelCount });
+    void refreshRecordings("diarization");
+  }, [evaluation, isDemo, hasInFlight, current, refreshRecordings]);
 
-  // Keep a ref to the latest projects so the reconcile effect below can depend
-  // on `nav` alone — it also updates `projects`, so depending on `projects`
-  // would loop.
-  const projectsRef = useRef(projects);
-  useEffect(() => { projectsRef.current = projects; }, [projects]);
-
-  // On entering the Projects tab, refresh each row's model + speaker counts from
-  // the real backend evaluation. `project.models` is a localStorage snapshot
-  // taken at upload; running or retrying models later changes the true run
-  // count, and the list must reflect that for every recording — not just the
-  // one currently open (which the effect above already keeps live). Fetches run
-  // in parallel; rows update as they resolve. A stale card whose backend row is
-  // gone (404) is left untouched.
-  useEffect(() => {
-    if (nav !== "projects") return;
-    let cancelled = false;
-    const snapshot = projectsRef.current.filter((project) => Number.isFinite(project.audioFileId));
-    Promise.all(
-      snapshot.map(async (project) => {
-        try {
-          const evalr = await fetchEvaluation(project.audioFileId);
-          return {
-            id: project.id,
-            models: evalr.models.length,
-            speakers: Math.max(0, ...evalr.models.map((run) => run.numSpk)),
-          };
-        } catch {
-          return null;
-        }
-      }),
-    ).then((results) => {
-      if (cancelled) return;
-      const byId = new Map(results.filter((r): r is NonNullable<typeof r> => r !== null).map((r) => [r.id, r]));
-      setProjects((prev) => {
-        let changed = false;
-        const next = prev.map((project) => {
-          const fresh = byId.get(project.id);
-          if (fresh && (fresh.models !== project.models || fresh.speakers !== project.speakers)) {
-            changed = true;
-            return { ...project, models: fresh.models, speakers: fresh.speakers };
-          }
-          return project;
-        });
-        if (changed) saveProjects(next);
-        return changed ? next : prev;
-      });
-    });
-    return () => { cancelled = true; };
-  }, [nav]);
 
   // Live "now" for elapsed-time labels, ticking only while something is running.
   useEffect(() => {
@@ -464,37 +469,80 @@ export default function App() {
     syncDom(time);
   }, [time, syncDom, speakerTick]);
 
-  const persistProjects = (next: Project[]) => {
-    setProjects(next);
-    saveProjects(next);
-  };
-
   const [reportBusy, setReportBusy] = useState(false);
+
+  // Two fetches per recording (its reference and its per-engine runs) rather than
+  // one aggregate route. A report is a rare, deliberate action over a handful of
+  // recordings, so the round trips are not worth a bespoke endpoint — unlike the
+  // Projects list, which paid this cost on every visit and now does not.
+  const generateTranscriptReport = async () => {
+    setReportBusy(true);
+    try {
+      const settled = await Promise.all(
+        projects.map(async (project): Promise<TranscriptReportEntry | null> => {
+          try {
+            const [reference, runs] = await Promise.all([
+              fetchReference(project.audioFileId),
+              fetchTranscripts(project.audioFileId),
+            ]);
+            return { project, reference, runs };
+          } catch (error) {
+            console.error(`Skipping ${project.name} in the transcript report:`, error);
+            return null;
+          }
+        }),
+      );
+      const entries = settled.filter((entry): entry is TranscriptReportEntry => entry !== null);
+      if (entries.length === 0) {
+        window.alert("Could not load any recordings for the report.");
+        return;
+      }
+      if (!entries.some((entry) => entry.runs.some((run) => run.metrics))) {
+        // A report of nothing but dashes is worse than saying why.
+        window.alert(
+          "None of these recordings has been scored yet, so there is nothing to report. "
+            + "Record a read-aloud session, or set a reference on an existing recording.",
+        );
+        return;
+      }
+      downloadReport(
+        buildTranscriptAggregateReportHtml(computeTranscriptReport(entries)),
+        "transcript-report.html",
+      );
+    } finally {
+      setReportBusy(false);
+    }
+  };
 
   // Delete a recording end to end: the backend drops its DB rows and stored
   // audio, then we remove it from the local project list. If it's the one
   // currently open, clear the loaded session so the dashboard doesn't point at
   // a recording that no longer exists.
   const handleDeleteProject = async (project: Project) => {
-    // Older localStorage cards can predate the audioFileId field; there's no
-    // backend row to delete, so just drop the card. A real id still deletes the
-    // backend evidence (deleteEvaluation treats a 404 as already-gone).
-    if (Number.isFinite(project.audioFileId)) {
-      await deleteEvaluation(project.audioFileId);
-    }
-    persistProjects(projects.filter((entry) => entry.id !== project.id));
-    if (current?.id === project.id) {
+    await deleteEvaluation(project.audioFileId);
+    // Refetch rather than splice: the server decides what the list contains, and a
+    // local filter would be a second opinion that can drift from it.
+    await refreshRecordings(listSurface);
+    if (current?.audioFileId === project.audioFileId) {
       audioRef.current?.pause();
       setEvaluation(null);
       setCurrent(null);
     }
   };
 
-  // Build one aggregate HTML report over every remaining recording, computed
-  // from each project's real evaluation. Recordings that fail to load are
-  // skipped rather than aborting the whole report.
+  // One aggregate report per surface, because the two surfaces measure different
+  // things. Diarization has no ground truth, so its report is descriptive — what the
+  // models produced and where they disagree. Transcript recordings are read from a
+  // known script, so its report scores accuracy and breaks it down by the language
+  // the script was in.
+  //
+  // Recordings that fail to load are skipped rather than aborting the whole report.
   const handleGenerateReport = async () => {
     if (reportBusy || projects.length === 0) return;
+    if (listSurface === "transcript") {
+      await generateTranscriptReport();
+      return;
+    }
     setReportBusy(true);
     try {
       const settled = await Promise.all(
@@ -533,18 +581,27 @@ export default function App() {
     setActive(Object.fromEntries(withUpload.models.map((model) => [model.id, true])));
     setParams(deriveDefaultParams(withUpload));
     setEvalCfg(deriveDefaultEval(withUpload));
-    const project: Project = {
-      id: Date.now(),
-      audioFileId: ack.audioFileId,
-      name: displayName,
-      date: new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }),
-      duration: fmt(withUpload.durationSec),
-      models: withUpload.models.length,
-      speakers: Math.max(0, ...withUpload.models.map((run) => run.numSpk)),
-      fresh: true,
-    };
-    persistProjects([project, ...projects]);
+    // The backend row already exists, so the list comes from it rather than from a
+    // locally-assembled copy. Marked fresh for the NEW badge, then refetched.
+    freshIdsRef.current.add(ack.audioFileId);
+    const project = projectFromRecording(
+      {
+        audioFileId: ack.audioFileId,
+        surface: "diarization",
+        filename: displayName,
+        durationSec: withUpload.durationSec,
+        createdAt: new Date().toISOString(),
+        modelCount: withUpload.models.length,
+        speakerCount: Math.max(0, ...withUpload.models.map((run) => run.numSpk)),
+        doneCount: 0,
+        failedCount: 0,
+        engineCount: 0,
+        scored: false,
+      },
+      true,
+    );
     setCurrent(project);
+    void refreshRecordings("diarization");
     timeRef.current = 0;
     sigRef.current = "";
     setTime(0);
@@ -645,10 +702,37 @@ export default function App() {
     });
   }, []);
 
+  // A finished read-aloud capture. The backend row already exists; this marks it
+  // fresh for the NEW badge and refetches so it appears in the list — which it
+  // never did before, because the transcript surface wrote nothing to it.
+  const handleRecorded = useCallback((audioFileId: number) => {
+    freshIdsRef.current.add(audioFileId);
+    setListSurface("transcript");
+    // There is now a result on screen, so this page is the viewer.
+    setTranscriptTab("dashboard");
+    void refreshRecordings("transcript");
+  }, [refreshRecordings]);
+
   const openProject = (project: Project) => {
     const requestId = ++openRequestRef.current;
     audioRef.current?.pause();
     setCurrent(project);
+
+    // A transcript recording has no EvaluationResult rows at all, so
+    // fetchEvaluation would return an evaluation with zero models — a timeline with
+    // nothing on it. Its stored comparison (reference, per-engine transcripts,
+    // scorecard) is what StoredRecordingScorer renders from the recording id alone,
+    // so there is nothing here to fetch.
+    if (project.surface === "transcript") {
+      setEvaluation(null);
+      setPlaying(false);
+      setWorkflow("idle");
+      setListSurface("transcript");
+      setTranscriptTab("dashboard");
+      setNav("transcript");
+      return;
+    }
+
     setEvaluation(null);
     setPlaying(false);
     timeRef.current = 0;
@@ -691,6 +775,10 @@ export default function App() {
   // Clears the loaded session and sends the user to a fresh Upload tab —
   // used by "+ New recording", not by the Upload tab button itself (which
   // must never destroy a loaded recording just for switching tabs).
+  // "+ New recording" means "create one on the surface I am looking at". For
+  // diarization that is the upload page; for transcript it is a FRESH read-aloud
+  // page — `current` cleared, so TranscriptStudio is in record mode rather than
+  // showing a stored comparison.
   const startNewUpload = () => {
     audioRef.current?.pause();
     timeRef.current = 0;
@@ -698,7 +786,8 @@ export default function App() {
     setTime(0);
     setCurrent(null);
     setEvaluation(null);
-    setNav("upload");
+    setTranscriptTab("upload");
+    setNav(listSurface === "transcript" ? "transcript" : "upload");
     setWorkflow("idle");
     setUploadPct(0);
     setPlaying(false);
@@ -729,6 +818,10 @@ export default function App() {
     setParams((all) => ({ ...all, [id]: { ...all[id], [key]: value } }));
   };
 
+  // Set by hand below so `handleTab` can call the latest `handleNav` without
+  // depending on it, which keeps the two declarations in reading order.
+  const handleNavRef = useRef<(next: Nav) => void>(() => {});
+
   // Every tab is driven by `nav` alone — no other tab's state gates access to it.
   const handleNav = useCallback((next: Nav) => {
     setNav(next);
@@ -737,6 +830,60 @@ export default function App() {
       audioRef.current?.pause();
     }
   }, []);
+  handleNavRef.current = handleNav;
+
+  // A primary-nav click, resolved through the active surface.
+  //
+  // The tabs name an ACTIVITY (view / create / list), not a page, so which page
+  // that activity lands on depends on which surface is selected. Without this,
+  // clicking Dashboard while Transcript was active rendered the diarization
+  // timeline with the toggle still reading "Transcript" — the toggle lying about
+  // what was on screen.
+  //
+  // Projects and Settings are surface-agnostic containers: they render the same
+  // page either way and the toggle re-scopes their contents, so they pass through.
+  const handleTab = useCallback((tab: Nav) => {
+    if (tab === "dashboard" || tab === "upload") {
+      if (listSurface === "transcript") {
+        // One page, two activities. Remember which was asked for so the tab
+        // reflects the click.
+        setTranscriptTab(tab);
+        handleNavRef.current("transcript");
+        return;
+      }
+      handleNavRef.current(tab);
+      return;
+    }
+    handleNavRef.current(tab);
+  }, [listSurface]);
+
+  // The center-of-dashboard toggle writes straight to `nav` rather than to a
+  // second piece of state: the surface showing IS the nav destination, and two
+  // variables tracking that would be one too many to keep in step.
+  const handleStudioMode = useCallback((next: StudioMode) => {
+    // Always the surface, for both the studio and the recordings list.
+    setListSurface(next);
+    // Nav is WHAT you are doing; the toggle is WHICH evaluation. So switching
+    // surface keeps you doing the same thing on the other surface:
+    //
+    //   • creating (upload / a fresh transcript page) -> the other surface's
+    //     create page. Diarization creates by uploading a file; transcript creates
+    //     by reading a script aloud.
+    //   • viewing (dashboard / an opened transcript recording) -> the other
+    //     surface's viewer.
+    //   • listing (projects, settings) -> stay, just re-scope.
+    const creating = nav === "upload" || (nav === "transcript" && transcriptTab === "upload");
+    const viewing = nav === "dashboard" || (nav === "transcript" && transcriptTab === "dashboard");
+    if (creating) {
+      setTranscriptTab("upload");
+      setCurrent(null);
+      setEvaluation(null);
+      handleNav(next === "transcript" ? "transcript" : "upload");
+    } else if (viewing) {
+      setTranscriptTab("dashboard");
+      handleNav(next === "transcript" ? "transcript" : "dashboard");
+    }
+  }, [handleNav, nav, transcriptTab]);
   return (
     <div className="app">
       {catalogError && <div className="catalog-error">{catalogError}</div>}
@@ -758,8 +905,22 @@ export default function App() {
           }}
         />
       )}
-      <TopBar nav={nav} onNav={handleNav} />
-      <ModelStatusStrip catalog={catalog} status={modelStatus} />
+      <TopBar
+        nav={nav}
+        onNav={handleTab}
+        onStudioMode={handleStudioMode}
+        listSurface={listSurface}
+        // Which tab the transcript page counts as, from the click that got here.
+        transcriptTab={transcriptTab}
+      />
+      {/* Dashboard only. This strip is the GPU residency state of the diarization
+          models, which is worth watching exactly where you can see those models run:
+          the timeline. On Projects, Upload and Settings it was chrome reporting on
+          something none of those pages shows, and on the transcript surface it was
+          reporting on models that surface does not use at all — TryHamsa and
+          Inception-STT are remote, with no container to load or slot to hold. Each
+          ASR engine's availability appears in its own engine panel instead. */}
+      {nav === "dashboard" && <ModelStatusStrip catalog={catalog} status={modelStatus} />}
 
       {nav === "projects" && (
         <ProjectsView
@@ -769,6 +930,7 @@ export default function App() {
           onDelete={handleDeleteProject}
           onGenerateReport={handleGenerateReport}
           reportBusy={reportBusy}
+          surface={listSurface}
         />
       )}
       {nav === "settings" && (
@@ -788,7 +950,26 @@ export default function App() {
           onStreamInline={() => setStreamInline((value) => !value)}
           onGlow={() => setGlow((value) => !value)}
           onFeed={() => setFeed((value) => !value)}
-          onClear={() => { persistProjects([]); setCurrent(null); }}
+        />
+      )}
+
+      {nav === "transcript" && (
+        <TranscriptStudio
+          runtimeConfig={runtimeConfig}
+          onRecorded={handleRecorded}
+          // Prefer the OPENED recording over the loaded evaluation. A transcript
+          // recording has no evaluation at all — that path deliberately skips
+          // fetchEvaluation, because zero diarization models is not a timeline
+          // worth loading — so deriving the id from `evaluation` left the stored
+          // comparison unrendered for exactly the recordings it exists to show.
+          audioFileId={
+            current?.surface === "transcript"
+              ? current.audioFileId
+              : evaluation && !isDemo
+                ? evaluation.audioFileId
+                : null
+          }
+          fileName={current?.surface === "transcript" ? current.name : fileName}
         />
       )}
 
@@ -812,6 +993,9 @@ export default function App() {
           onSettings={() => handleNav("settings")}
           onOpenProject={openProject}
           onProjects={() => handleNav("projects")}
+          // Goes to the transcript surface, so the surface has to move with it —
+          // otherwise Projects would still be listing diarization recordings.
+          onTranscript={() => handleStudioMode("transcript")}
         />
       )}
       {nav === "upload" && workflow === "uploading" && <UploadingScreen fileName={uploadName} pct={uploadPct} />}

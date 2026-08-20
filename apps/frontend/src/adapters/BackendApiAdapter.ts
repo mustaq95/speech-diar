@@ -1,5 +1,17 @@
 /// <reference types="vite/client" />
-import type { DiarizationEvaluation, ModelContainerStatus, ModelMetadata, TranscriptRun, TranscriptionMode, UploadAck } from "../types/diarization";
+import type {
+  DiarizationEvaluation,
+  GeneratedScript,
+  ModelContainerStatus,
+  RecordingSummary,
+  RecordingSurface,
+  ModelMetadata,
+  ScriptRequest,
+  TranscriptReference,
+  TranscriptRun,
+  TranscriptionMode,
+  UploadAck,
+} from "../types/diarization";
 import { normalizeModelRun, type DiarizationAdapter } from "./DiarizationAdapter";
 
 /**
@@ -52,10 +64,46 @@ export interface ModeAvailability {
  * own engine, and none of this may relabel it. `defaultTranscriptionMode` only
  * seeds the toggle's initial position.
  */
+/** One engine in the transcript comparison, as the host reports it.
+ *
+ * `transport` is not decoration: a streaming engine and a chunked one are not
+ * measuring the same thing, so every figure rendered for an engine has to be
+ * labelled with it. */
+export interface TranscriptEngineInfo {
+  asrId: string;
+  name: string;
+  mode: TranscriptionMode;
+  transport: "stream" | "chunks";
+  configured: boolean;
+}
+
+/** Everything the transcript surface would otherwise hardcode. All of it comes
+ * from .env via GET /config, so none of these are literals in the frontend. */
+export interface TranscriptConfig {
+  engines: TranscriptEngineInfo[];
+  recordSampleRate: number;
+  /** Samples per microphone callback. Smaller means PCM reaches a streaming
+   * engine sooner; the waveform's render rate is independent of it. */
+  recordBlockSamples: number;
+  chunkIntervalSec: number;
+  chunkIntervalMinSec: number;
+  chunkIntervalMaxSec: number;
+  /** Deadline for a streaming engine's socket to open. A dropped upgrade neither
+   * opens nor errors, so without this the recorder would wait forever. */
+  socketOpenTimeoutSec: number;
+  scriptLengthsMin: number[];
+  scriptLanguageMixes: string[];
+  scriptHardCases: string[];
+  /** Null when no script gateway is configured: the UI then offers only the
+   * paste-a-reference path, instead of a Generate button that cannot work. */
+  scriptModel: string | null;
+}
+
 export interface RuntimeConfig {
   pollIntervalMs: number;
   defaultTranscriptionMode: TranscriptionMode;
   transcriptionModes: Record<TranscriptionMode, ModeAvailability>;
+  transcript: TranscriptConfig;
 }
 
 export async function fetchRuntimeConfig(): Promise<RuntimeConfig> {
@@ -216,6 +264,142 @@ export async function startTranscript(audioFileId: number, mode: TranscriptionMo
 }
 
 /** One origin for playback and waveform decoding — the API streams from whichever lane owns the audio. */
+/** Every recording on one surface, newest first.
+ *
+ * One request for the whole list. It replaces a pattern where the page assembled its
+ * list from localStorage and then fetched each recording's full evaluation to refresh
+ * the counts — N requests to render one page, showing whatever a particular browser
+ * happened to remember rather than what exists. */
+export async function fetchRecordings(surface: RecordingSurface): Promise<RecordingSummary[]> {
+  const response = await fetch(`${API_BASE_URL}/recordings?surface=${surface}`);
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return (await response.json()) as RecordingSummary[];
+}
+
+/** Generate a script to read aloud, which becomes the scoring reference. */
+export async function generateScript(request: ScriptRequest): Promise<GeneratedScript> {
+  const response = await fetch(`${API_BASE_URL}/transcript/script`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return (await response.json()) as GeneratedScript;
+}
+
+/** What a freshly opened live session reports back about itself. */
+export interface LiveSessionAck {
+  sessionId: string;
+  asrIds: string[];
+  chunkIntervalSec: number;
+  sampleRate: number;
+  engines: Array<{ asrId: string; name: string; transport: "stream" | "chunks" }>;
+}
+
+/** Open a live read-aloud session. The transcripts accumulate server-side, next
+ * to the calls that produce them — see the backend router for why. */
+export async function openLiveSession(
+  asrIds: string[],
+  chunkIntervalSec: number,
+  referenceText: string,
+): Promise<LiveSessionAck> {
+  const response = await fetch(`${API_BASE_URL}/transcript/session`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ asrIds, chunkIntervalSec, referenceText }),
+  });
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return (await response.json()) as LiveSessionAck;
+}
+
+/** Send one chunk to a request/response engine. The returned latency is the same
+ * value the server records, so the panel and the scorecard cannot disagree. */
+export async function sendLiveChunk(
+  sessionId: string,
+  asrId: string,
+  chunkIndex: number,
+  wav: Blob,
+): Promise<{ text: string; latencyMs: number; chunkIndex: number }> {
+  const form = new FormData();
+  form.append("sessionId", sessionId);
+  form.append("asrId", asrId);
+  form.append("chunkIndex", String(chunkIndex));
+  form.append("file", wav, `chunk${chunkIndex}.wav`);
+  const response = await fetch(`${API_BASE_URL}/transcript/chunk`, { method: "POST", body: form });
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return await response.json();
+}
+
+/** WebSocket URL for a streaming engine's relay. Derived from API_BASE_URL so it
+ * follows the same origin and dev proxy as every other call. */
+export function liveStreamUrl(sessionId: string, asrId: string): string {
+  const base = API_BASE_URL.startsWith("http")
+    ? API_BASE_URL
+    : `${window.location.origin}${API_BASE_URL}`;
+  return `${base.replace(/^http/, "ws")}/transcript/live/${sessionId}/${encodeURIComponent(asrId)}`;
+}
+
+/** Persist a finished session: the recording, its reference, and each engine's
+ * captured transcript with its measured timings and scores. Nothing is re-run. */
+export async function finalizeLiveSession(
+  sessionId: string,
+  recording: Blob,
+  referenceText: string,
+  referenceSource: "script" | "pasted",
+  scriptParams: Record<string, unknown> | null,
+): Promise<TranscriptRun[]> {
+  const form = new FormData();
+  form.append("file", recording, "read-aloud.wav");
+  form.append("referenceText", referenceText);
+  form.append("referenceSource", referenceSource);
+  if (scriptParams) form.append("scriptParams", JSON.stringify(scriptParams));
+  const response = await fetch(`${API_BASE_URL}/transcript/session/${sessionId}/finalize`, {
+    method: "POST",
+    body: form,
+  });
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return (await response.json()) as TranscriptRun[];
+}
+
+/** The reference a recording is scored against, or null when it has none. */
+export async function fetchReference(audioFileId: number): Promise<TranscriptReference | null> {
+  const response = await fetch(`${API_BASE_URL}/evaluations/${audioFileId}/reference`);
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return (await response.json()) as TranscriptReference;
+}
+
+/** Set the reference for a recording that already exists. Existing scores are
+ * cleared by the backend rather than recomputed, so nothing shows a stale WER. */
+export async function putReference(
+  audioFileId: number,
+  text: string,
+  source: "script" | "pasted" = "pasted",
+): Promise<TranscriptReference> {
+  const response = await fetch(`${API_BASE_URL}/evaluations/${audioFileId}/reference`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, source }),
+  });
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return (await response.json()) as TranscriptReference;
+}
+
+/** Run several engines over stored audio — one job per engine, all-or-nothing on
+ * validation so a typo cannot leave half a comparison running. */
+export async function startTranscripts(
+  audioFileId: number,
+  asrIds: string[],
+): Promise<TranscriptRun[]> {
+  const response = await fetch(`${API_BASE_URL}/evaluations/${audioFileId}/transcripts`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ asrIds }),
+  });
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return (await response.json()) as TranscriptRun[];
+}
+
 export function audioStreamUrl(audioFileId: number): string {
   return `${API_BASE_URL}/evaluations/${audioFileId}/audio`;
 }
