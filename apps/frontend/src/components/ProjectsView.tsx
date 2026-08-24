@@ -72,14 +72,23 @@ export function ProjectsView({
               {/* A transcript recording has no speakers to detect and no models to
                   count; what it has is engines compared and, once a reference exists,
                   an error rate. Showing "0 speakers detected" would read as a failure
-                  rather than as a category that does not apply. */}
+                  rather than as a category that does not apply.
+
+                  A saved script has no audio at all, so its duration is not 0:00 — it
+                  is nothing that was ever measured, and printing a clock there would
+                  be inventing a figure. */}
               <small>
-                {project.date} · {project.duration} ·{" "}
-                {isTranscript
-                  ? project.scored && project.bestWer != null
-                    ? `best WER ${(project.bestWer * 100).toFixed(1)}%`
-                    : "not scored"
-                  : `${project.speakers} speakers detected`}
+                {project.date}
+                {project.hasAudio ? ` · ${project.duration}` : ""} ·{" "}
+                {!project.hasAudio
+                  ? project.ttsCount > 0
+                    ? `TTS · ${project.ttsCount} clip${project.ttsCount === 1 ? "" : "s"}`
+                    : "script saved, not recorded yet"
+                  : isTranscript
+                    ? project.scored && project.bestWer != null
+                      ? `best WER ${(project.bestWer * 100).toFixed(1)}%`
+                      : "not scored"
+                    : `${project.speakers} speakers detected`}
               </small>
             </span>
             <span className="project-colors">
@@ -88,9 +97,11 @@ export function ProjectsView({
               ))}
             </span>
             <span className="muted">
-              {isTranscript
-                ? `${project.engines} engine${project.engines === 1 ? "" : "s"}`
-                : `${project.models} models`}
+              {!project.hasAudio
+                ? "read it aloud"
+                : isTranscript
+                  ? `${project.engines} engine${project.engines === 1 ? "" : "s"}`
+                  : `${project.models} models`}
             </span>
             <DeleteControls onDelete={() => onDelete(project)} />
             <span className="row-arrow">›</span>

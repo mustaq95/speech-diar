@@ -15,6 +15,7 @@ import {
 import { startRecording, type Recorder } from "../recording";
 import { StoredRecordingScorer } from "./StoredRecordingScorer";
 import { TranscriptScorecard } from "./TranscriptScorecard";
+import { TtsStudio } from "./TtsStudio";
 
 /** Human labels for the .env-supplied option ids. An id with no label here still
  * renders (as itself), so adding one to .env never blanks a control. */
@@ -24,10 +25,13 @@ const MIX_LABELS: Record<string, string> = {
   en: "English",
 };
 const HARD_CASE_LABELS: Record<string, string> = {
-  "code-switch-en": "Code-switch EN",
   "proper-nouns": "Proper nouns",
   "numbers-dates": "Numbers & dates",
-  "gulf-dialect": "Gulf dialect",
+  "emirati-dialect": "Emirati dialect",
+  // Retired id, same instruction under its old name. Labelled identically because
+  // the distinction is internal; without an entry a stale config would render the
+  // raw id as the chip text.
+  "gulf-dialect": "Emirati dialect",
   "fast-speech": "Fast speech",
 };
 
@@ -49,10 +53,23 @@ interface TranscriptStudioProps {
    * the second entry point: scoring stored audio against a pasted reference. */
   audioFileId?: number | null;
   fileName?: string;
+  /** Whether the opened recording has audio yet. False for an entry created when
+   * its script was generated but never read aloud: that one opens ready to RECORD,
+   * not ready to play back. */
+  hasAudio?: boolean;
+  /** Which sub-activity this page is doing: scoring STT engines live, or
+   * comparing TTS engines' synthesis of the same reference. Explicit state owned
+   * by App.tsx, never inferred from what happens to be open. */
+  transcriptSubMode: "stt" | "tts";
+  onTranscriptSubMode: (next: "stt" | "tts") => void;
   /** Called once a capture is finalized and its backend row exists, so the
    * recordings list can pick it up. Without this the recording was stored but
    * never appeared anywhere in the UI. */
   onRecorded?: (audioFileId: number) => void;
+  /** Called when a generated script is saved, so the list picks up the new entry.
+   * Distinct from `onRecorded`: nothing has been recorded, and the user is still on
+   * this page, so it must refresh the list without navigating away. */
+  onScriptSaved?: (audioFileId: number) => void;
 }
 
 function fmtMs(ms: number): string {
@@ -82,13 +99,19 @@ export function TranscriptStudio({
   runtimeConfig,
   audioFileId,
   fileName,
+  hasAudio = true,
+  transcriptSubMode,
+  onTranscriptSubMode,
   onRecorded,
+  onScriptSaved,
 }: TranscriptStudioProps) {
   const config = runtimeConfig?.transcript ?? null;
   const engines = useMemo<TranscriptEngineInfo[]>(
     () => (config?.engines ?? []).filter((engine) => engine.configured),
     [config],
   );
+  // Only for the header caption; TtsStudio owns the TTS panel itself.
+  const ttsEngineCount = (runtimeConfig?.tts?.engines ?? []).filter((engine) => engine.configured).length;
 
   // --- a saved recording, restored ----------------------------------------
   // Opening one puts the whole session back: the script it was read from, the
@@ -103,6 +126,7 @@ export function TranscriptStudio({
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
   useEffect(() => {
+    setDraftEdit(null);
     if (audioFileId == null) {
       setSavedRef(null);
       setSavedRuns([]);
@@ -128,11 +152,15 @@ export function TranscriptStudio({
     return () => { cancelled = true; };
   }, [audioFileId]);
 
-  // Everything is pre-filled when a recording carries its own reference. That is
-  // also the signal that the paste-and-score panel is unnecessary — it only earns
-  // its place on a recording that has no ground truth yet, e.g. a diarization
-  // upload being scored for the first time.
-  const viewingSaved = audioFileId != null && savedRef != null;
+  // A recording with a stored reference AND audio is a finished comparison: play it
+  // back, show its scorecard, no paste-and-score panel (that only earns its place on
+  // a recording with no ground truth yet, e.g. a diarization upload).
+  const viewingSaved = audioFileId != null && savedRef != null && hasAudio;
+
+  // A stored reference with NO audio is a script that was generated and never read.
+  // Same pre-filled script and settings, but the recorder is live: this entry is a
+  // work item, and Stop attaches the recording to this very row.
+  const resumingScript = audioFileId != null && savedRef != null && !hasAudio;
 
   // The controls are restored from the params the script was generated with, so a
   // reopened recording shows what was actually asked for rather than the defaults.
@@ -155,7 +183,11 @@ export function TranscriptStudio({
     hardCases ?? savedParams?.hardCases ?? config?.scriptHardCases?.slice(0, 4) ?? [];
 
   const [script, setScript] = useState<GeneratedScript | null>(null);
-  const [pastedScript, setPastedScript] = useState("");
+  // The script box's contents. `null` means "follow whatever is stored"; any
+  // string means the operator has typed and owns the value until it is saved.
+  // Replaces the old paste-only box: the script is editable whether it was
+  // generated, restored, or typed here.
+  const [draftEdit, setDraftEdit] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
   const [scriptError, setScriptError] = useState<string | null>(null);
 
@@ -182,7 +214,22 @@ export function TranscriptStudio({
    * fast audio moves from how often the waveform repaints. */
   const peaksRef = useRef<number[]>([]);
 
-  const referenceText = savedRef?.text ?? script?.text ?? pastedScript.trim();
+  // Same precedence as `shownScript` below. Generating is an explicit action, so a
+  // fresh script outranks a stored one; otherwise the panel showed the new script
+  // while the run was scored against the old text.
+  // What is STORED for this recording, before any local edit.
+  const storedText = script?.text ?? savedRef?.text ?? "";
+  const draft = draftEdit ?? storedText;
+  // What the engines are scored against: the draft, since that is what will be
+  // read aloud and what finalize writes as the reference.
+  const referenceText = draft.trim();
+  const dirty = referenceText !== storedText.trim();
+
+  /** The recording row this capture belongs to: the one created with the script just
+   * generated, or the script-only entry being resumed. Null for a pasted reference,
+   * which has no row until finalize creates one. */
+  const pendingAudioFileId =
+    script?.audioFileId ?? (resumingScript ? audioFileId ?? null : null);
   const referenceWords = referenceText ? referenceText.split(/\s+/).length : 0;
   const chunkInterval = config?.chunkIntervalSec ?? 3;
   const socketTimeoutSec = config?.socketOpenTimeoutSec ?? 10;
@@ -254,7 +301,19 @@ export function TranscriptStudio({
         hardCases: effectiveHardCases,
       });
       setScript(generated);
+      setDraftEdit(null);
       setResults(null);
+      // Drop the explicit picks so the controls fall through to the saved
+      // params: what the script was actually generated with, which is also what
+      // the other sub-mode reads. Without this each side keeps its own picks and
+      // the two disagree about settings for one shared script.
+      setMinutes(null);
+      setMix(null);
+      setHardCases(null);
+
+      // The script is saved server-side as it is generated, so the entry exists now
+      // rather than at Stop. Tell the list without leaving the page.
+      onScriptSaved?.(generated.audioFileId);
     } catch (error) {
       setScriptError((error as Error).message);
     } finally {
@@ -426,8 +485,9 @@ export function TranscriptStudio({
         sessionId,
         wav,
         referenceText,
-        script ? "script" : "pasted",
+        script || savedRef?.source === "script" ? "script" : "pasted",
         script?.params ?? null,
+        pendingAudioFileId,
       );
       setResults(runs);
       const recordedId = runs[0]?.audioFileId;
@@ -442,6 +502,21 @@ export function TranscriptStudio({
 
   const unconfigured = (config?.engines ?? []).filter((engine) => !engine.configured);
 
+  // Switching sub-mode while a live capture is running must tear it down the
+  // same way unmounting does — the microphone and sockets are real resources
+  // and a switch is not a reason to leave them running unseen.
+  const handleSubModeChange = (next: "stt" | "tts") => {
+    if (next === transcriptSubMode) return;
+    if (recording) {
+      cleanupRun();
+      void recorderRef.current?.stop();
+      recorderRef.current = null;
+      sessionRef.current = null;
+      setRecording(false);
+    }
+    onTranscriptSubMode(next);
+  };
+
   return (
     <main className="page transcript-page">
       <div className="transcript-head">
@@ -449,24 +524,48 @@ export function TranscriptStudio({
           <span className="eyebrow">Evaluation</span>
           <h1>Transcript</h1>
           <p>
-            Generate a script, read it aloud, and compare what each engine returned against it.
-            Every figure here is measured, so each engine runs on its own native transport.
+            {transcriptSubMode === "tts"
+              ? "Generate a script, synthesize it with both engines, and compare the audio they return. Every figure here is measured."
+              : "Read a script aloud; each engine is scored on its own native transport."}
           </p>
+        </div>
+        <div className="transcript-mode-toggle">
+          <Segmented
+            value={transcriptSubMode}
+            options={[
+              { value: "stt", label: "STT" },
+              { value: "tts", label: "TTS" },
+            ]}
+            onChange={handleSubModeChange}
+            label="Transcript sub-mode"
+          />
+          {/* Counted from what /config actually returned, so an unconfigured host
+              says "1 engine" rather than claiming a comparison it cannot run. */}
+          <small className="mono muted transcript-mode-caption">
+            {transcriptSubMode === "tts"
+              ? `speech synthesis · ${ttsEngineCount} ${ttsEngineCount === 1 ? "engine" : "engines"}`
+              : `speech recognition · ${engines.length} ${engines.length === 1 ? "engine" : "engines"}`}
+          </small>
         </div>
       </div>
 
+      {transcriptSubMode === "tts" ? (
+        <TtsStudio
+          runtimeConfig={runtimeConfig}
+          audioFileId={pendingAudioFileId ?? audioFileId ?? null}
+          onScriptSaved={onScriptSaved}
+        />
+      ) : (
+      <>
       {unconfigured.length > 0 && (
         <p className="transcript-notice">
-          Not configured on this host: {unconfigured.map((engine) => engine.name).join(", ")} — check .env
+          Not configured: {unconfigured.map((engine) => engine.name).join(", ")} (check .env)
         </p>
       )}
 
       <section className="transcript-grid">
         <div className="panel script-controls">
           <h2>Read it out</h2>
-          <p className="muted">
-            Generate a script, read it aloud, and watch each engine transcribe you in realtime.
-          </p>
 
           {lengths.length > 0 && (
             <SliderControl
@@ -491,13 +590,13 @@ export function TranscriptStudio({
                 label="Language mix"
                 disabled={recording}
               />
-              <small className="muted">Shapes the script only — the engines always auto-detect.</small>
+              <small className="muted">Script only; engines auto-detect.</small>
             </div>
           ) : null}
 
           {config?.scriptHardCases?.length ? (
             <div className="control-block">
-              <span className="control-label">Include hard cases</span>
+              <span className="control-label">Hard cases</span>
               <div className="chip-row">
                 {config.scriptHardCases.map((id) => (
                   <button
@@ -532,43 +631,45 @@ export function TranscriptStudio({
           {scriptError && <p className="transcript-error">{scriptError}</p>}
         </div>
 
+        {/* One editable box whether the script was generated, restored or typed
+            here -- the same control the TTS side uses, so the identical script
+            wraps identically on both. It was a read-only justified <p> when a
+            script existed, which both blocked editing and broke lines
+            differently from the textarea. Read-only only once the recording
+            exists: the scores on screen were measured against this exact text,
+            and editing it there would leave them describing something else. */}
         <div className="panel script-body">
-          {shownScript ? (
-            <>
-              <div className="script-meta">
-                <span className="mono">
-                  {shownScript.label} · {shownScript.minutes} min · {shownScript.wordCount} words
-                  {/* The MEASURED split, not the requested one. A language mix is an
-                      instruction the model follows loosely — asking for even halves
-                      lands anywhere from 36% to 57% Arabic — so the card reports what
-                      came back rather than repeating the label on the button. */}
-                  {shownScript.split
-                    ? ` · ${Math.round(shownScript.split.arabic * 100)}% AR / ${Math.round(shownScript.split.english * 100)}% EN measured`
-                    : null}
-                </span>
-                {/* The model that actually generated it, from the response — not
-                    a hardcoded vendor name. */}
-                {shownScript.generatorModel && (
-                  <span className="script-model">{shownScript.generatorModel}</span>
-                )}
-              </div>
-              <p className="script-text" dir="auto">{shownScript.text}</p>
-            </>
-          ) : (
-            <>
-              <div className="script-meta">
-                <span className="mono">REFERENCE · {referenceWords} words</span>
-              </div>
-              <textarea
-                className="script-paste"
-                dir="auto"
-                placeholder="Generate a script, or paste the text you are going to read so the engines can be scored against it."
-                value={pastedScript}
-                onChange={(event) => setPastedScript(event.target.value)}
-                disabled={recording}
-              />
-            </>
-          )}
+          <div className="script-meta">
+            <span className="mono">
+              {shownScript
+                ? `${shownScript.label} · ${shownScript.minutes} min · ${shownScript.wordCount} words`
+                : `REFERENCE · ${referenceWords} words`}
+              {/* The MEASURED split, not the requested one. A language mix is an
+                  instruction the model follows loosely — asking for even halves
+                  lands anywhere from 36% to 57% Arabic — so the card reports what
+                  came back rather than repeating the label on the button. */}
+              {shownScript?.split && !dirty
+                ? ` · ${Math.round(shownScript.split.arabic * 100)}% AR / ${Math.round(shownScript.split.english * 100)}% EN measured`
+                : null}
+            </span>
+            {/* The model that actually generated it, from the response — not
+                a hardcoded vendor name. */}
+            {shownScript?.generatorModel && !dirty && (
+              <span className="script-model">{shownScript.generatorModel}</span>
+            )}
+            {dirty && !viewingSaved && (
+              <span className="script-dirty mono">unsaved — recording will save it</span>
+            )}
+          </div>
+          <textarea
+            className="script-paste"
+            dir="auto"
+            placeholder="Generate a script, or paste the text you will read."
+            value={draft}
+            onChange={(event) => setDraftEdit(event.target.value)}
+            disabled={recording}
+            readOnly={viewingSaved}
+          />
         </div>
       </section>
 
@@ -735,16 +836,18 @@ export function TranscriptStudio({
       )}
 
       {/* Only for a recording that has NO reference yet — a diarization upload being
-          scored for the first time. A read-aloud recording arrives with its script,
-          its transcripts and its scores already on screen, so offering to paste a
-          reference and re-run would be asking for something it already has. */}
-      {audioFileId != null && !viewingSaved && !loadingSaved && (
+          scored for the first time. Keyed on the reference, not on `viewingSaved`: a
+          saved script HAS a reference and no audio, so offering to paste one over the
+          script you are about to read asks for something it already has. */}
+      {audioFileId != null && savedRef == null && !loadingSaved && (
         <StoredRecordingScorer
           audioFileId={audioFileId}
           fileName={fileName ?? "this recording"}
           engines={engines}
           pollIntervalMs={runtimeConfig?.pollIntervalMs ?? 1500}
         />
+      )}
+      </>
       )}
     </main>
   );

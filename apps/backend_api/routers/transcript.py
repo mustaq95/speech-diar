@@ -56,9 +56,15 @@ from apps.backend_api.dependencies import get_current_user, get_db
 from apps.backend_api.routers.evaluations import _transcript_run as transcript_run_contract
 from packages import script_gen
 from packages.config.settings import get_settings
-from apps.backend_api.routers.upload import store_recording
-from packages.shared_contracts.schemas import GeneratedScript, ScriptRequest, TranscriptRun
+from apps.backend_api.routers.upload import attach_audio, store_recording
+from packages.shared_contracts.schemas import (
+    GeneratedScript,
+    ScriptRequest,
+    TranscriptReference as TranscriptReferenceContract,
+    TranscriptRun,
+)
 from packages.database.models import (
+    AudioFile,
     TranscriptReference,
     TranscriptResult,
     User,
@@ -71,12 +77,20 @@ router = APIRouter(prefix="/transcript", tags=["transcript"])
 @router.post("/script", response_model=GeneratedScript, response_model_by_alias=True)
 def generate_script(
     request: ScriptRequest,
+    db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> GeneratedScript:
     """Generate a script to read aloud, which becomes the reference for scoring.
 
-    Stateless: the browser holds the script and submits it at finalize, so there
-    is no script table and an abandoned script costs nothing.
+    The script is SAVED as it is generated: a transcript recording row plus its
+    `TranscriptReference`, so it appears in Projects immediately and a script is
+    never lost by regenerating or leaving the page. The row has no audio yet
+    (`s3_key` null, `duration_sec` 0) and `finalize` attaches the recording to this
+    same row, which is why the browser gets its id back.
+
+    One row per generation, so every script generated is kept. A script that is
+    never read aloud stays in the list as a script-only row until it is deleted;
+    that is the cost of not losing any, and per-row delete already exists.
 
     503 when no gateway is configured, rather than a placeholder script — a
     fabricated reference would produce fabricated error rates.
@@ -104,11 +118,90 @@ def generate_script(
     except script_gen.ScriptGatewayError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    # `recording_` from the start, even though nothing has been recorded yet:
+    # one naming scheme for every row on this surface. Whether audio exists is
+    # already carried by `has_audio`, so the filename does not need to say it,
+    # and a row that renamed itself later made the same artifact look like two.
+    audio_file = AudioFile(
+        owner_id=current_user.id,
+        filename=f"recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        # Not a measured duration and not presented as one: `has_audio` is False
+        # until a recording exists. The column is non-nullable, so 0 is the only
+        # value available, and no route reports it while has_audio is False.
+        duration_sec=0.0,
+        surface="transcript",
+    )
+    db.add(audio_file)
+    db.flush()
+    db.add(
+        TranscriptReference(
+            audio_file_id=audio_file.id,
+            source="script",
+            text=script.text,
+            params=script.params,
+        )
+    )
+    db.commit()
+
     return GeneratedScript(
         text=script.text,
         word_count=script.word_count,
         generator_model=script.generator_model,
         params=script.params,
+        audio_file_id=audio_file.id,
+    )
+
+
+@router.post(
+    "/reference", response_model=TranscriptReferenceContract, response_model_by_alias=True,
+    status_code=201,
+)
+def create_reference(
+    text: str = Body(..., embed=True),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TranscriptReferenceContract:
+    """Save a script the operator brought themselves, with no LLM involved.
+
+    The same row shape `generate_script` writes -- an audio-less AudioFile plus
+    its TranscriptReference -- so a pasted script is a first-class recording
+    from the moment it exists: it appears in Projects, it can be read aloud on
+    the STT side, and it can be synthesized on the TTS side. The only
+    difference is `source="pasted"`, which is what tells the UI not to claim a
+    generator model it never used.
+
+    Needed because TTS synthesis reads its text from a stored reference, and
+    until now the only way to get one was to generate it. `PUT
+    /evaluations/{id}/reference` replaces the text of a row that already
+    exists; this creates the row.
+    """
+    cleaned = text.strip()
+    if not cleaned:
+        raise HTTPException(status_code=422, detail="Reference text is empty")
+
+    audio_file = AudioFile(
+        owner_id=current_user.id,
+        # Same `recording_` scheme as generate_script; see the note there.
+        filename=f"recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        duration_sec=0.0,
+        surface="transcript",
+    )
+    db.add(audio_file)
+    db.flush()
+    reference = TranscriptReference(
+        audio_file_id=audio_file.id, source="pasted", text=cleaned, params=None
+    )
+    db.add(reference)
+    db.commit()
+
+    return TranscriptReferenceContract(
+        audio_file_id=audio_file.id,
+        source="pasted",
+        # Measured here, never taken from the request -- same rule as every
+        # other count this platform reports.
+        text=cleaned,
+        word_count=len(cleaned.split()),
+        params=None,
     )
 
 
@@ -400,6 +493,7 @@ async def finalize_session(
     reference_text: str = Form("", alias="referenceText"),
     reference_source: str = Form("script", alias="referenceSource"),
     script_params: str = Form("", alias="scriptParams"),
+    audio_file_id: int | None = Form(None, alias="audioFileId"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[TranscriptRun]:
@@ -438,11 +532,41 @@ async def finalize_session(
     # `filename` has no unique constraint (only s3_key does, and that is keyed on the
     # row id), so two recordings finished inside the same second share a display name.
     # Harmless, and not worth a counter.
-    recording_name = f"recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    audio_file = await run_in_threadpool(
-        partial(store_recording, surface="transcript"),
-        payload, recording_name, db, current_user,
-    )
+    if audio_file_id is not None:
+        # Attach to the row created when the script was generated, so one script
+        # produces ONE Projects entry rather than a script-only row plus a separate
+        # recorded one. Ownership and surface are checked here rather than trusted:
+        # the id comes from the browser.
+        audio_file = (
+            db.query(AudioFile)
+            .filter(
+                AudioFile.id == audio_file_id,
+                AudioFile.owner_id == current_user.id,
+                AudioFile.surface == "transcript",
+            )
+            .one_or_none()
+        )
+        if audio_file is None:
+            raise HTTPException(status_code=404, detail="Unknown recording")
+        if audio_file.s3_key:
+            # Re-recording over stored audio would leave the transcripts and scores
+            # of the previous take pointing at different audio.
+            raise HTTPException(
+                status_code=409, detail="This recording already has audio; delete it to re-record"
+            )
+        audio_file = await run_in_threadpool(attach_audio, payload, audio_file, db)
+    else:
+        # No row yet: a session opened from a pasted reference rather than a
+        # generated script. Same ingest as an upload.
+        #
+        # `filename` has no unique constraint (only s3_key does, and that is keyed on
+        # the row id), so two recordings finished inside the same second share a
+        # display name. Harmless, and not worth a counter.
+        recording_name = f"recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        audio_file = await run_in_threadpool(
+            partial(store_recording, surface="transcript"),
+            payload, recording_name, db, current_user,
+        )
 
     # The reference row is written inside _persist_session, not here: an earlier
     # refactor left a copy in both places and SQLAlchemy batched them into one
@@ -480,12 +604,33 @@ def _persist_session(
     awaiting a dozen small ones.
     """
     if reference:
-        db.add(TranscriptReference(
-            audio_file_id=audio_file.id,
-            source=reference_source if reference_source in ("script", "pasted") else "script",
-            text=reference,
-            params=json.loads(script_params) if script_params else None,
-        ))
+        source = reference_source if reference_source in ("script", "pasted") else "script"
+        params = json.loads(script_params) if script_params else None
+        # Update, not insert, when the row is already there: a generated script
+        # writes its reference at generation time, and `audio_file_id` is unique.
+        # A blind add here batched into a multi-VALUES INSERT is what 500'd every
+        # finalize once before, so this branch is load-bearing rather than defensive.
+        existing = (
+            db.query(TranscriptReference)
+            .filter(TranscriptReference.audio_file_id == audio_file.id)
+            .one_or_none()
+        )
+        if existing is None:
+            db.add(TranscriptReference(
+                audio_file_id=audio_file.id,
+                source=source,
+                text=reference,
+                params=params,
+            ))
+        else:
+            # The operator can edit the box before reading, so the text submitted at
+            # finalize is the one that was actually read and wins over the generated
+            # one. `params` only when supplied, so an edit does not erase how the
+            # script was generated.
+            existing.source = source
+            existing.text = reference
+            if params is not None:
+                existing.params = params
 
     rows: list[TranscriptResult] = []
     for asr_id in session["asr_ids"]:

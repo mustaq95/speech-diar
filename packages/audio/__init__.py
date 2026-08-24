@@ -12,12 +12,14 @@ change); if the canonical shape ever changes, both must move.
 """
 
 import io
+import json
 import os
 import shutil
 import subprocess
 import tempfile
 import wave
 from contextlib import suppress
+from dataclasses import dataclass
 
 SAMPLE_RATE = 16000
 
@@ -125,3 +127,108 @@ def read_pcm16(path: str) -> bytes:
     is canonical."""
     with wave.open(path, "rb") as wav:
         return wav.readframes(wav.getnframes())
+
+
+@dataclass(frozen=True)
+class AudioProbe:
+    """What could actually be READ out of a payload's own bytes. Every field is
+    independently nullable because they are independently knowable: a container
+    ffprobe cannot parse yields all-None, and a codec that carries no explicit
+    bit depth (MP3 is the case here) yields a real sample rate beside a null
+    `bit_depth`. A null means "this payload does not say", never zero and never
+    a default — the caller renders the absence, it does not fill it in.
+    """
+
+    sample_rate: int | None = None
+    duration_sec: float | None = None
+    channels: int | None = None
+    bit_depth: int | None = None
+
+
+#: ffprobe's `sample_fmt` names, mapped to the bit depth they denote. Only the
+#: PCM formats a TTS engine here can actually return are listed; anything else
+#: leaves `bit_depth` None rather than guessing a width for a codec whose
+#: samples are not fixed-width at all (MP3 reports `fltp`, which is a DECODER
+#: output format, not a property of the encoded file — so it is deliberately
+#: absent from this map).
+_SAMPLE_FMT_BITS: dict[str, int] = {"u8": 8, "s16": 16, "s32": 32, "s64": 64}
+
+
+def probe_audio(payload: bytes) -> AudioProbe:
+    """Everything readable out of arbitrary audio bytes, as an `AudioProbe`.
+
+    Used by the TTS engines, whose containers are not always a canonical WAV
+    (Inception-TTS can return real MP3): ffprobe reads any container ffmpeg
+    understands, so it is tried first. `wave` is a fallback for a WAV host
+    without ffprobe installed, not a replacement for it.
+
+    Never raises on non-audio bytes and never estimates duration from bitrate
+    — an unreadable payload is reported as unknown, not guessed at.
+    """
+    fd, path = tempfile.mkstemp(suffix=".bin")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+
+        if shutil.which("ffprobe") is not None:
+            proc = subprocess.run(
+                [
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "stream=sample_rate,channels,bits_per_raw_sample,sample_fmt",
+                    "-show_entries", "format=duration",
+                    "-of", "json", path,
+                ],
+                capture_output=True,
+            )
+            if proc.returncode == 0:
+                with suppress(ValueError, KeyError, TypeError, IndexError, json.JSONDecodeError):
+                    info = json.loads(proc.stdout)
+                    stream = info["streams"][0]
+                    # Each field is pulled independently: a stream can report a
+                    # sample rate while saying nothing about bit depth, and one
+                    # missing field must not discard the ones that ARE present.
+                    # .get, never [] : ffprobe OMITS a key it has no value for
+                    # rather than emitting null, and an unguarded KeyError here
+                    # escapes to the outer suppress and discards the fields that
+                    # WERE present. MP3 reports no bits_per_raw_sample at all,
+                    # so indexing it threw away the rate and duration too.
+                    bit_depth: int | None = None
+                    with suppress(ValueError, TypeError):
+                        raw_bits = stream.get("bits_per_raw_sample")
+                        bit_depth = int(raw_bits) if raw_bits not in (None, "N/A") else None
+                    if bit_depth is None:
+                        bit_depth = _SAMPLE_FMT_BITS.get(stream.get("sample_fmt", ""))
+                    channels: int | None = None
+                    with suppress(ValueError, TypeError):
+                        channels = int(stream["channels"]) if stream.get("channels") is not None else None
+                    duration: float | None = None
+                    with suppress(ValueError, TypeError):
+                        duration = float(info.get("format", {}).get("duration"))
+                    sample_rate: int | None = None
+                    with suppress(ValueError, TypeError):
+                        sample_rate = int(stream["sample_rate"]) if stream.get("sample_rate") else None
+                    # Nothing readable at all means fall through to `wave`, not
+                    # return an empty probe that stops the fallback running.
+                    if sample_rate is None and duration is None:
+                        raise KeyError("ffprobe returned no usable fields")
+                    return AudioProbe(
+                        sample_rate=sample_rate,
+                        duration_sec=duration,
+                        channels=channels,
+                        bit_depth=bit_depth,
+                    )
+
+        with suppress(Exception):
+            with wave.open(path, "rb") as wav:
+                rate = wav.getframerate()
+                frames = wav.getnframes()
+                return AudioProbe(
+                    sample_rate=rate,
+                    duration_sec=(frames / float(rate) if rate else None),
+                    channels=wav.getnchannels(),
+                    bit_depth=wav.getsampwidth() * 8,
+                )
+    finally:
+        with suppress(OSError):
+            os.unlink(path)
+    return AudioProbe()

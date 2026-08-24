@@ -10,6 +10,8 @@ import type {
   TranscriptReference,
   TranscriptRun,
   TranscriptionMode,
+  TtsDelivery,
+  TtsRun,
   UploadAck,
 } from "../types/diarization";
 import { normalizeModelRun, type DiarizationAdapter } from "./DiarizationAdapter";
@@ -99,11 +101,37 @@ export interface TranscriptConfig {
   scriptModel: string | null;
 }
 
+/** One TTS engine in the comparison, as the host reports it.
+ *
+ * `delivery` is not decoration, same reasoning as `TranscriptEngineInfo.transport`:
+ * a single-shot response and a streamed body do not measure "time to first audio"
+ * the same way, so every figure rendered for an engine is labelled with it. */
+export interface TtsEngineInfo {
+  ttsId: string;
+  name: string;
+  delivery: TtsDelivery;
+  configured: boolean;
+  voices: string[];
+  defaultVoice: string;
+  /** Engine-level synthesis settings, true of EVERY voice this engine offers.
+   * Neither gateway has a list-voices endpoint, so there is no per-voice
+   * metadata anywhere; this must never be rendered as a property of one voice. */
+  synthesisParams: Record<string, string>;
+}
+
+/** Everything the TTS comparison surface would otherwise hardcode, from .env via
+ * GET /config. */
+export interface TtsConfig {
+  engines: TtsEngineInfo[];
+  maxInputChars: number;
+}
+
 export interface RuntimeConfig {
   pollIntervalMs: number;
   defaultTranscriptionMode: TranscriptionMode;
   transcriptionModes: Record<TranscriptionMode, ModeAvailability>;
   transcript: TranscriptConfig;
+  tts?: TtsConfig;
 }
 
 export async function fetchRuntimeConfig(): Promise<RuntimeConfig> {
@@ -340,19 +368,25 @@ export function liveStreamUrl(sessionId: string, asrId: string): string {
 }
 
 /** Persist a finished session: the recording, its reference, and each engine's
- * captured transcript with its measured timings and scores. Nothing is re-run. */
+ * captured transcript with its measured timings and scores. Nothing is re-run.
+ *
+ * `audioFileId` is the row the script was saved to when it was generated; passing it
+ * attaches this recording to that entry instead of creating a second one. Omitted for
+ * a session started from a pasted reference, which has no row yet. */
 export async function finalizeLiveSession(
   sessionId: string,
   recording: Blob,
   referenceText: string,
   referenceSource: "script" | "pasted",
   scriptParams: Record<string, unknown> | null,
+  audioFileId: number | null,
 ): Promise<TranscriptRun[]> {
   const form = new FormData();
   form.append("file", recording, "read-aloud.wav");
   form.append("referenceText", referenceText);
   form.append("referenceSource", referenceSource);
   if (scriptParams) form.append("scriptParams", JSON.stringify(scriptParams));
+  if (audioFileId != null) form.append("audioFileId", String(audioFileId));
   const response = await fetch(`${API_BASE_URL}/transcript/session/${sessionId}/finalize`, {
     method: "POST",
     body: form,
@@ -365,6 +399,19 @@ export async function finalizeLiveSession(
 export async function fetchReference(audioFileId: number): Promise<TranscriptReference | null> {
   const response = await fetch(`${API_BASE_URL}/evaluations/${audioFileId}/reference`);
   if (response.status === 404) return null;
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return (await response.json()) as TranscriptReference;
+}
+
+/** Save a script the operator supplied, creating the recording row it needs.
+ * `putReference` replaces the text on a row that already exists; this is the
+ * one that brings the row into being, so a pasted script can be synthesized. */
+export async function createReference(text: string): Promise<TranscriptReference> {
+  const response = await fetch(`${API_BASE_URL}/transcript/reference`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
   if (!response.ok) throw new Error(await errorDetail(response));
   return (await response.json()) as TranscriptReference;
 }
@@ -402,4 +449,48 @@ export async function startTranscripts(
 
 export function audioStreamUrl(audioFileId: number): string {
   return `${API_BASE_URL}/evaluations/${audioFileId}/audio`;
+}
+
+/** Synthesize this recording's reference text with one TTS engine. One engine per
+ * call, always — never both in one request, so a hamsa-tts failure cannot take
+ * inception-tts's result down with it. A "failed" run still comes back as a
+ * TtsRun (status "failed", error set), never a thrown error for that case. */
+export async function synthesizeTts(audioFileId: number, ttsId: string, voice?: string): Promise<TtsRun> {
+  const response = await fetch(`${API_BASE_URL}/evaluations/${audioFileId}/tts/${encodeURIComponent(ttsId)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ voice: voice ?? null }),
+  });
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return (await response.json()) as TtsRun;
+}
+
+/** Every TTS engine's synthesis of one recording's reference — at most one per
+ * engine. Empty when no engine has synthesized it yet. */
+export async function fetchTtsRuns(audioFileId: number): Promise<TtsRun[]> {
+  const response = await fetch(`${API_BASE_URL}/evaluations/${audioFileId}/tts`);
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return (await response.json()) as TtsRun[];
+}
+
+/** One engine's synthesized clip, Range-capable. `download` adds a
+ * Content-Disposition header so this can be used directly as an <a href>. */
+/** `version` busts the browser cache after a re-synthesis: the URL is otherwise
+ * identical for a clip whose bytes have been replaced, so the player and the
+ * waveform would both keep serving the previous take. The server ignores it. */
+export function ttsAudioUrl(
+  audioFileId: number,
+  ttsId: string,
+  download?: boolean,
+  version?: number,
+  voice?: string,
+): string {
+  const params = new URLSearchParams();
+  if (download) params.set("download", "1");
+  if (version) params.set("v", String(version));
+  // An engine can hold one clip per voice; the route only serves an unnamed
+  // one while there is exactly one, so always name it when we know it.
+  if (voice) params.set("voice", voice);
+  const suffix = params.toString() ? `?${params}` : "";
+  return `${API_BASE_URL}/evaluations/${audioFileId}/tts/${encodeURIComponent(ttsId)}/audio${suffix}`;
 }

@@ -59,9 +59,6 @@ LANGUAGE_MIX_PROMPTS: dict[str, str] = {
 
 #: What each hard-case chip adds. Keys match SCRIPT_HARD_CASES in .env.
 HARD_CASE_PROMPTS: dict[str, str] = {
-    "code-switch-en": (
-        "Switch between Arabic and English inside single sentences, not only between them."
-    ),
     "proper-nouns": (
         "Include several Emirati personal names and Abu Dhabi place names, alongside a "
         "few Western names, of the kind a speech recognizer could plausibly "
@@ -72,9 +69,18 @@ HARD_CASE_PROMPTS: dict[str, str] = {
         "Include specific numbers, percentages, times, and dates, written as words or digits "
         "the way someone would actually say them aloud."
     ),
+    "emirati-dialect": (
+        "Use Emirati dialect vocabulary and sentence particles as spoken in the UAE, "
+        "rather than Modern Standard Arabic or the broader Gulf register."
+    ),
+    # Retired id, kept because recordings generated before the rename store it in
+    # `TranscriptReference.params`. `build_prompt` drops unknown ids silently, so
+    # without this entry an old id would produce a script with no dialect
+    # instruction and nothing would say so. Not in SCRIPT_HARD_CASES, so it is
+    # never offered as a chip.
     "gulf-dialect": (
-        "Use Gulf/Emirati dialect vocabulary and sentence particles rather than Modern "
-        "Standard Arabic."
+        "Use Emirati dialect vocabulary and sentence particles as spoken in the UAE, "
+        "rather than Modern Standard Arabic or the broader Gulf register."
     ),
     "fast-speech": (
         "Include a few long run-on sentences with little punctuation, of the kind that get "

@@ -48,6 +48,12 @@ export type ReferenceSource = "script" | "pasted";
 /** One edit operation aligning hypothesis to reference. */
 export type AlignmentOp = "equal" | "sub" | "del" | "ins";
 
+/** How a TTS engine delivers its audio. "stream" is a single POST whose BODY streams
+ * (hamsa-tts); "single" is a request/response call that still arrives chunked but with
+ * no meaningful front-loading (inception-tts). Deliberately not the STT side's
+ * "transport" vocabulary — neither describes the other direction correctly. */
+export type TtsDelivery = "stream" | "single";
+
 /** One contiguous stretch of speech attributed to a single speaker. */
 export interface DiarizationSegment {
   /** Zero-based speaker index, stable within one model run. */
@@ -205,6 +211,10 @@ export interface RecordingSummary {
   durationSec: number;
   /** ISO-8601; the list is ordered by this, newest first. */
   createdAt: string;
+  /** Whether a recording exists yet. False for a transcript row created when its script was
+   * generated but never read aloud: durationSec is 0 because nothing was measured, not
+   * because the audio is zero-length. */
+  hasAudio: boolean;
 
   // --- diarization recordings ---
   /** Models that have a result row. */
@@ -221,6 +231,8 @@ export interface RecordingSummary {
   scored: boolean;
   /** Lowest WER across engines; undefined when unscored. */
   bestWer?: number;
+  /** TTS engines that have synthesized this recording's reference. */
+  ttsCount: number;
 }
 
 /** What to generate a read-aloud script for. The options are served by GET /config from .env,
@@ -246,6 +258,9 @@ export interface GeneratedScript {
   generatorModel: string;
   /** The request, plus finish reason and generation time. */
   params: Record<string, unknown>;
+  /** The recording row this script was saved to. Created with the script so it appears in
+   * Projects before anything has been recorded; finalize attaches the audio to this same row. */
+  audioFileId: number;
 }
 
 /** One engine's live-speech transcript of one audio file: ASR text plus word-level
@@ -310,6 +325,61 @@ export interface TranscriptRawOutput {
   rawOutput?: Record<string, unknown> | unknown[] | null;
   /** The adapted transcript built from that raw output. */
   run?: TranscriptRun;
+}
+
+/** One TTS engine's synthesis of one recording's reference text.
+ *
+ * Mirrors TranscriptRun's per-engine shape on the other axis: a recording holds one run
+ * per TTS engine at once (hamsa-tts AND inception-tts), which is the comparison this
+ * surface makes. `GET /evaluations/{id}/tts` returns an array of these. */
+export interface TtsRun {
+  audioFileId: number;
+  /** Engine that ran: "hamsa-tts" | "inception-tts". */
+  ttsId: string;
+  /** Display name of the TTS engine. */
+  ttsName: string;
+  /** done|failed. */
+  status: string;
+  /** Failure reason when status === "failed". */
+  error?: string;
+  /** The voice used for this synthesis. */
+  voice?: string;
+  delivery: TtsDelivery;
+  /** Length of the text synthesized. */
+  textChars?: number;
+  /** wav|mp3; undefined when status === "failed". */
+  audioFormat?: string;
+  /** Exact size of the rendered audio. */
+  sizeBytes?: number;
+  /** Measured from the rendered audio. */
+  nativeSampleRate?: number;
+  /** Measured duration of the rendered audio. */
+  audioSec?: number;
+  /** Read from the rendered container. */
+  channels?: number;
+  /** Read from the rendered container; undefined when it carries none (MP3). */
+  bitDepth?: number;
+  /** Measured time to first audio. */
+  firstAudioMs?: number;
+  /** Measured total synthesis wall-clock time. */
+  synthMs?: number;
+  /** synthMs / audioSec; undefined when audioSec is unknown. */
+  rtf?: number;
+}
+
+/** ModelRawOutput's counterpart for one TTS engine's synthesis.
+ *
+ * `rawOutput` here is response metadata (status code, headers), never the audio bytes —
+ * the audio itself is served by `GET /evaluations/{id}/tts/{ttsId}/audio`. */
+export interface TtsRawOutput {
+  /** Engine that ran: "hamsa-tts" | "inception-tts". */
+  ttsId: string;
+  /** done|failed. */
+  status: string;
+  /** The engine's response metadata, verbatim. */
+  rawOutput?: Record<string, unknown> | null;
+  /** The adapted contract built from that run. */
+  run?: TtsRun;
 }
 
 /** Body of `PATCH /evaluations/{audioFileId}` — the client's one-time measured upload time,

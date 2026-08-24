@@ -34,6 +34,7 @@ from packages.database.models import (
     EvaluationResult,
     TranscriptReference,
     TranscriptResult,
+    TtsResult,
     User,
 )
 from packages.shared_contracts.schemas import (
@@ -499,6 +500,12 @@ def put_reference(
     a request would put two different code paths in charge of the same number.
     The affected rows' scores are cleared instead, and the surface offers a
     re-run — an empty score is honest, a stale one is not.
+
+    A TTS engine's clips were synthesized FROM the old text, so an edit here
+    invalidates them outright rather than merely their scores (there is nothing
+    to rescore -- the audio itself no longer matches the reference). Their rows
+    are deleted, same as a "never synthesized" recording, and their storage is
+    cleaned up best-effort, same as `delete_evaluation`.
     """
     audio_file = _get_audio_file(db, audio_file_id, current_user)
     cleaned = text.strip()
@@ -525,7 +532,23 @@ def put_reference(
         result.del_count = None
         result.ins_count = None
         result.alignment = None
+
+    stale_tts_s3_keys = [
+        key for (key,) in db.query(TtsResult.s3_key)
+        .filter_by(audio_file_id=audio_file.id)
+        .filter(TtsResult.s3_key.is_not(None))
+        .all()
+    ]
+    db.query(TtsResult).filter_by(audio_file_id=audio_file.id).delete()
     db.commit()
+    for tts_s3_key in stale_tts_s3_keys:
+        try:
+            s3_client.delete_object(tts_s3_key)
+        except Exception:
+            logger.warning(
+                "Failed to delete stale TTS S3 object %s for audio_file_id=%s",
+                tts_s3_key, audio_file_id, exc_info=True,
+            )
     logger.info("Reference (%s, %d words) set for audio_file_id=%s",
                 source, len(cleaned.split()), audio_file.id)
     return _reference_contract(row)
@@ -597,9 +620,18 @@ def delete_evaluation(
     blob_shared = bool(blob_key) and (
         db.query(AudioFile.id).filter(AudioFile.blob_key == blob_key, AudioFile.id != audio_file.id).first() is not None
     )
+    # Each engine's clip lives at its own s3_key (not content-addressed like the
+    # Azure lane), so every one of them needs its own best-effort cleanup below.
+    tts_s3_keys = [
+        key for (key,) in db.query(TtsResult.s3_key)
+        .filter_by(audio_file_id=audio_file.id)
+        .filter(TtsResult.s3_key.is_not(None))
+        .all()
+    ]
 
     db.query(EvaluationResult).filter_by(audio_file_id=audio_file.id).delete()
     db.query(TranscriptResult).filter_by(audio_file_id=audio_file.id).delete()
+    db.query(TtsResult).filter_by(audio_file_id=audio_file.id).delete()
     # Before db.delete(audio_file): this row holds a FK to it, so leaving it
     # would abort the delete on Postgres (SQLite in tests does not enforce FKs
     # by default and would have let the orphan through).
@@ -612,6 +644,11 @@ def delete_evaluation(
             s3_client.delete_object(s3_key)
         except Exception:
             logger.warning("Failed to delete S3 object %s for deleted audio_file_id=%s", s3_key, audio_file_id, exc_info=True)
+    for tts_s3_key in tts_s3_keys:
+        try:
+            s3_client.delete_object(tts_s3_key)
+        except Exception:
+            logger.warning("Failed to delete S3 object %s for deleted audio_file_id=%s", tts_s3_key, audio_file_id, exc_info=True)
     if blob_key and not blob_shared:
         for key in (blob_key, _fixed_key(blob_key)):
             try:

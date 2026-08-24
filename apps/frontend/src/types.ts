@@ -42,6 +42,11 @@ export interface Project {
   engines: number;
   scored: boolean;
   bestWer?: number;
+  /** Transcript: TTS engines that have synthesized this recording's reference. */
+  ttsCount: number;
+  /** False for a transcript entry whose script was generated but never read aloud.
+   * `duration` is meaningless for such a row: nothing was measured. */
+  hasAudio: boolean;
   fresh?: boolean;
 }
 

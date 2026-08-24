@@ -28,6 +28,7 @@ from packages.database.models import (
     EvaluationResult,
     TranscriptReference,
     TranscriptResult,
+    TtsResult,
     User,
 )
 from packages.shared_contracts.schemas import RecordingSurface, RecordingSummary
@@ -79,6 +80,12 @@ def list_recordings(
         .correlate(AudioFile)
         .scalar_subquery()
     )
+    tts_count = (
+        select(func.count(TtsResult.id))
+        .where(TtsResult.audio_file_id == AudioFile.id)
+        .correlate(AudioFile)
+        .scalar_subquery()
+    )
     # MIN over a nullable column: NULL for an unscored run, so this is the best score
     # among the runs that HAVE one, and None when none do.
     best_wer = (
@@ -101,12 +108,19 @@ def list_recordings(
             AudioFile.duration_sec,
             AudioFile.created_at,
             AudioFile.surface,
+            # Whether a recording exists. A transcript row is created when its script
+            # is generated, before anything is recorded, and until then it has no
+            # stored object. Selected rather than derived from duration, which is 0
+            # for such a row because nothing was measured.
+            AudioFile.s3_key,
+            AudioFile.blob_key,
             model_count.label("model_count"),
             done_count.label("done_count"),
             failed_count.label("failed_count"),
             engine_count.label("engine_count"),
             best_wer.label("best_wer"),
             has_reference.label("has_reference"),
+            tts_count.label("tts_count"),
         )
         .where(AudioFile.owner_id == current_user.id, AudioFile.surface == surface)
         .order_by(AudioFile.created_at.desc(), AudioFile.id.desc())
@@ -124,6 +138,7 @@ def list_recordings(
             filename=row.filename,
             duration_sec=row.duration_sec,
             created_at=row.created_at.isoformat() if row.created_at else "",
+            has_audio=bool(row.s3_key or row.blob_key),
             model_count=row.model_count,
             speaker_count=speaker_counts.get(row.id, 0),
             done_count=row.done_count,
@@ -133,6 +148,7 @@ def list_recordings(
             # against it" — a reference alone does not make the numbers exist.
             scored=bool(row.has_reference) and row.best_wer is not None,
             best_wer=row.best_wer,
+            tts_count=row.tts_count,
         )
         for row in rows
     ]

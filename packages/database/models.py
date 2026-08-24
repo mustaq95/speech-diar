@@ -204,7 +204,11 @@ class TranscriptResult(Base):
 
 
 class TranscriptReference(Base):
-    """The ground truth one recording is scored against: at most one per recording.
+    """The canonical text of this recording: the ground truth one recording is
+    scored against, whether read by a person or synthesized. Read-aloud and
+    stt-comparison flows treat the text as ground truth to be matched; the TTS
+    comparison flow treats it as input, the words meant to be spoken. At most
+    one per recording either way.
 
     A separate table rather than a column on AudioFile, because a reference is
     not a property of the audio — it is a claim about what was said, with its own
@@ -232,6 +236,94 @@ class TranscriptReference(Base):
     # back to what was asked for, and so a script can be regenerated like-for-like.
     params: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    audio_file: Mapped[AudioFile] = relationship()
+
+
+class TtsResult(Base):
+    """One TTS engine's synthesis of one recording's reference text into audio.
+
+    Keyed per (audio_file, tts_id), the same shape `TranscriptResult` uses per
+    ASR engine: a comparison tool, so hamsa-tts and inception-tts synthesizing
+    the same script must coexist, and re-running one engine resets only its own
+    row. Hangs off the SAME `AudioFile`/`TranscriptReference` a read-aloud run
+    would use -- there is no separate TTS "recording"; the reference text is
+    shared between "read this aloud" and "synthesize this".
+
+    `status` ("done" | "failed") exists for the same reason every other result
+    table has one: without it, a failed engine leaves no row at all, and "never
+    tried" becomes indistinguishable from "failed" -- so a failed synthesis
+    still writes a row, with `error` set and the audio-shaped columns null.
+
+    `raw_output` here is metadata only (status code, response headers) -- never
+    the audio bytes. Base64ing minutes of audio into a JSON column would be a
+    multi-MB unreadable duplicate of the object store, so the audio itself lives
+    at `s3_key` and this column stays small enough to leave un-deferred (unlike
+    `TranscriptResult.raw_output`, which holds a whole transcript/frame log and
+    is polled while a run is in flight -- nothing polls this table).
+
+    This is a brand new table, so `create_all` builds its current shape with no
+    entry in `_ADDED_COLUMNS` (session.py) needed. That is only true at
+    creation: a column added to this table LATER would need one, exactly like
+    every other table here -- `test_added_columns_shim_matches_the_models`
+    checks the direction that would otherwise fail silently, but cannot catch a
+    forgotten shim entry for a column that already exists on every fresh DB.
+    """
+
+    __tablename__ = "tts_results"
+    # One clip per (recording, engine, VOICE): each voice keeps its own stored
+    # take, so switching voice in the UI reveals that voice's clip instead of
+    # overwriting the last one. Re-running the SAME voice still replaces in
+    # place -- that is the get-or-reset path in routers/tts.py.
+    __table_args__ = (
+        UniqueConstraint(
+            "audio_file_id", "tts_id", "voice", name="uq_tts_results_audio_file_tts_voice"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    audio_file_id: Mapped[int] = mapped_column(ForeignKey("audio_files.id"), index=True)
+    # "hamsa-tts" | "inception-tts" -- half the row's identity, the other half
+    # being audio_file_id; see the unique constraint above.
+    tts_id: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(16))  # done|failed
+    error: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    # --- what was asked for ---
+    # NOT NULL is load-bearing, not tidiness: Postgres treats NULLs as distinct
+    # inside a UNIQUE, so a null voice here would let unlimited duplicate rows
+    # through uq_tts_results_audio_file_tts_voice.
+    voice: Mapped[str] = mapped_column(String(64), nullable=False)
+    # "stream" | "single", copied from TTS_DELIVERY (apps/background_worker/tts)
+    # at write time by the route -- not imported here, since packages/database
+    # importing apps/background_worker would be a layering violation.
+    delivery: Mapped[str] = mapped_column(String(16))
+    text_chars: Mapped[int] = mapped_column(Integer)
+
+    # --- what came back, only present when status == "done" ---
+    s3_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    audio_format: Mapped[str | None] = mapped_column(String(16), nullable=True)  # wav|mp3
+    # Exact payload size in bytes. Named size_bytes, not bytes: `bytes` shadows
+    # the builtin and this repo's other tables spell out what a count measures
+    # (e.g. TranscriptResult.chunk_count) rather than leaving it to the type.
+    size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    native_sample_rate: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    audio_sec: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Read out of the returned container alongside the rate, not assumed from
+    # the platform's canonical shape: these are what the ENGINE chose to emit,
+    # and the two engines do not agree. Null when the container does not say
+    # (MP3 carries no fixed sample width), never defaulted to 1/16.
+    channels: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    bit_depth: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    first_audio_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    synth_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # (synth_ms/1000) / audio_sec; None when audio_sec is unknown (e.g. a
+    # failed run), never a fabricated ratio.
+    rtf: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # The engine's response metadata, verbatim (status code, headers) -- never
+    # the audio itself. See the class docstring for why this is not deferred.
+    raw_output: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     audio_file: Mapped[AudioFile] = relationship()
 

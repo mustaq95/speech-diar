@@ -17,6 +17,18 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _split_csv(raw: str) -> list[str]:
+    """A comma-separated .env value as a clean list.
+
+    Drops empty entries and strips whitespace, so a trailing comma or a stray
+    space never becomes a list item. That matters beyond tidiness: a TTS
+    speaker name with a trailing comma is accepted by the vendor with a 200
+    and then dropped mid-stream, which looks like a network fault rather than
+    the config typo it is.
+    """
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=str(REPO_ROOT / ".env"),
@@ -310,6 +322,57 @@ class Settings(BaseSettings):
     verify_ssl: bool = True
     litellm_ca_bundle: str = ""
 
+    # --- TTS synthesis engines (script -> read-aloud audio) ---
+    # Two synthesis engines, mirroring the two STT engines above: TryHamsa TTS
+    # (streaming) and Inception-TTS (single-shot, via the same LiteLLM gateway
+    # as inception-stt). Both are compared the same way the STT engines are:
+    # each fed in its own native delivery mode, nothing smoothed to match.
+
+    # --- TryHamsa TTS (streaming) ---
+    hamsa_tts_api_url: str | None = None
+    hamsa_tts_key: str | None = None
+    hamsa_tts_bearer_token: str | None = None
+    # A COMMA LIST, and entry 0 is the default voice. One field rather than a
+    # separate default + list pair: the pair let the two disagree, and setting
+    # the list value on the singular field produced a speaker name the pod
+    # accepts with a 200 and then drops the stream on, which reads as a network
+    # fault rather than a config typo. See hamsa_tts_speaker_options below.
+    hamsa_tts_speaker: str = "Ruba"
+    hamsa_tts_dialect: str = "uae"
+    hamsa_tts_language_id: str = "ar"
+    # ASSUMPTION, not a measurement: this API never states its sample rate
+    # in-band, in the response headers or the payload. 16000 is chosen because
+    # it matches this same vendor's own declared native STT rate
+    # (hamsa_stt_sample_rate above) and the exact 3200-byte/100ms chunk-size
+    # symmetry between this stream and Hamsa's STT input convention. Kept as a
+    # settings field, not a code constant, precisely so it can be corrected if
+    # that assumption turns out wrong.
+    hamsa_tts_sample_rate: int = 16000
+    # Per-service TLS switch, matching hamsa_stt_ssl_verify's own pattern
+    # exactly: NOT the bare SSL_VERIFY some clients read, so disabling
+    # verification for this one endpoint can never silently weaken another
+    # service's TLS.
+    hamsa_tts_ssl_verify: bool = True
+    hamsa_tts_timeout_sec: float = 120
+
+    # --- Inception-TTS (via the LiteLLM gateway; single-shot) ---
+    tts_speech_path: str = "/v1/audio/speech"
+    inception_tts_model: str = "inception-tts"
+    # A COMMA LIST, entry 0 is the default. Same shape as hamsa_tts_speaker.
+    inception_tts_voice: str = "alloy"
+    # Confirmed by ffprobe against the real gateway: "wav" is genuinely honored
+    # (real RIFF/WAVE, pcm_s16le, mono, 24000Hz) despite the gateway's
+    # Content-Type header always claiming audio/mpeg. Never trust that header;
+    # see the adapter's magic-byte sniff.
+    inception_tts_response_format: str = "wav"
+    # Must comfortably exceed the longest allowed script's synthesis time —
+    # this engine has no meaningful streaming (~6.7s wall clock measured for a
+    # 10-word Arabic sentence, whole body buffered before any bytes arrive).
+    inception_tts_timeout_sec: float = 180
+    # 422 guard so a runaway script fails fast at the request, not as a
+    # gateway timeout minutes later.
+    tts_max_input_chars: int = 4000
+
     # --- Script generation (read-aloud reference text) ---
     # An OpenAI-compatible chat-completions gateway, separate from the STT one
     # above with NO cross-default between them: a silent fallback between two
@@ -357,7 +420,7 @@ class Settings(BaseSettings):
     # them is a literal in the frontend.
     script_length_options_min: str = "1,3,5,10"
     script_language_mixes: str = "ar,mixed-50-50,en"
-    script_hard_cases: str = "code-switch-en,proper-nouns,numbers-dates,gulf-dialect,fast-speech"
+    script_hard_cases: str = "proper-nouns,numbers-dates,emirati-dialect,fast-speech"
 
     # --- Live transcript sessions (the read-aloud comparison) ---
     # The recorder's PCM rate, served to the browser: the mic tap resamples to
@@ -430,7 +493,7 @@ class Settings(BaseSettings):
 
     @property
     def cors_origins_list(self) -> list[str]:
-        return [origin.strip() for origin in self.cors_allow_origins.split(",") if origin.strip()]
+        return _split_csv(self.cors_allow_origins)
 
     @property
     def hamsa_ws_endpoint(self) -> str | None:
@@ -443,6 +506,40 @@ class Settings(BaseSettings):
         if not self.litellm_base_url:
             return None
         return f"{self.litellm_base_url.rstrip('/')}{self.stt_transcription_path}"
+
+    @property
+    def tts_speech_url(self) -> str | None:
+        """Full Inception-TTS synthesis URL, or None when unconfigured."""
+        if not self.litellm_base_url:
+            return None
+        return f"{self.litellm_base_url.rstrip('/')}{self.tts_speech_path}"
+
+    @property
+    def hamsa_tts_speaker_options(self) -> list[str]:
+        """Every voice this host offers for hamsa-tts, in .env order.
+
+        Never empty: an empty list would leave the dropdown unopenable and make
+        `hamsa_tts_default_speaker` raise IndexError at request time, so a value
+        that splits to nothing falls back to itself, stripped.
+        """
+        return _split_csv(self.hamsa_tts_speaker) or [self.hamsa_tts_speaker.strip()]
+
+    @property
+    def hamsa_tts_default_speaker(self) -> str:
+        """The voice used when the caller does not choose one: entry 0.
+
+        Reading position 0 rather than the raw field is what stops a list value
+        being posted verbatim as one speaker name.
+        """
+        return self.hamsa_tts_speaker_options[0]
+
+    @property
+    def inception_tts_voice_options(self) -> list[str]:
+        return _split_csv(self.inception_tts_voice) or [self.inception_tts_voice.strip()]
+
+    @property
+    def inception_tts_default_voice(self) -> str:
+        return self.inception_tts_voice_options[0]
 
     @property
     def llm_chat_url(self) -> str | None:
@@ -472,15 +569,15 @@ class Settings(BaseSettings):
     @property
     def script_length_options(self) -> list[int]:
         """The script-length slider's stops, in minutes."""
-        return [int(part) for part in self.script_length_options_min.split(",") if part.strip()]
+        return [int(part) for part in _split_csv(self.script_length_options_min)]
 
     @property
     def script_language_mix_options(self) -> list[str]:
-        return [part.strip() for part in self.script_language_mixes.split(",") if part.strip()]
+        return _split_csv(self.script_language_mixes)
 
     @property
     def script_hard_case_options(self) -> list[str]:
-        return [part.strip() for part in self.script_hard_cases.split(",") if part.strip()]
+        return _split_csv(self.script_hard_cases)
 
 
 @lru_cache

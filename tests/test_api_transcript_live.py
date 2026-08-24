@@ -351,3 +351,169 @@ def test_open_session_rejects_an_out_of_range_chunk_interval(
 def test_open_session_rejects_an_unknown_engine(client: TestClient, live_session) -> None:
     response = client.post("/transcript/session", json={"asrIds": ["nope"]})
     assert response.status_code == 422
+
+
+# --- attaching a recording to the row its script already created ----------------
+#
+# A generated script creates its own recording row (see test_api_transcript_script.py),
+# so finalize must fill THAT row in rather than insert a second one. Both failure modes
+# here are invisible from a 200: a duplicate row gives one script two Projects entries,
+# and a duplicate reference trips the unique index on audio_file_id.
+
+
+def _script_only_row(
+    factory: sessionmaker[Session], *, reference: str = REFERENCE, filename: str = "recording_20260820_120000"
+) -> int:
+    """The row a generated script leaves behind: no audio, reference already written.
+
+    Named `recording_...` because that is what generate_script writes now -- one
+    scheme for every row on this surface, with `has_audio` carrying whether
+    audio exists rather than the filename.
+    """
+    with factory() as session:
+        row = AudioFile(
+            owner_id=session.query(User).filter_by(email=DEV_USER_EMAIL).one().id,
+            filename=filename,
+            duration_sec=0.0,
+            surface="transcript",
+        )
+        session.add(row)
+        session.flush()
+        session.add(
+            TranscriptReference(audio_file_id=row.id, source="script", text=reference, params={"minutes": 1})
+        )
+        session.commit()
+        return row.id
+
+
+def test_finalize_attaches_to_the_scripts_existing_row(
+    client: TestClient, db_session_factory: sessionmaker[Session], live_session, stub_s3
+) -> None:
+    """One script, one Projects entry. A second AudioFile row here is the bug."""
+    audio_file_id = _script_only_row(db_session_factory)
+    live_session.create(["hamsa", "inception-stt"], 3.0)
+
+    response = client.post(
+        "/transcript/session/test-session/finalize",
+        data={"referenceText": REFERENCE, "referenceSource": "script", "audioFileId": str(audio_file_id)},
+        files={"file": ("read-aloud.wav", make_wav_bytes(duration_sec=2.0), "audio/wav")},
+    )
+
+    assert response.status_code == 200, response.text
+    assert {run["audioFileId"] for run in response.json()} == {audio_file_id}
+    with db_session_factory() as session:
+        assert session.query(AudioFile).filter_by(surface="transcript").count() == 1
+        row = session.get(AudioFile, audio_file_id)
+        # The half that was missing is now filled in, with a MEASURED duration.
+        assert row.s3_key == f"audio/{audio_file_id}.wav"
+        assert row.duration_sec == pytest.approx(2.0, abs=0.05)
+        # ...and it is a recording now, so it is named like one, keeping its timestamp.
+        # Unchanged: the row was already named this, so finalize renames nothing
+        # and the name still matches the row's own created_at.
+        assert row.filename == "recording_20260820_120000"
+
+
+def test_finalize_updates_the_scripts_reference_instead_of_inserting_a_second(
+    client: TestClient, db_session_factory: sessionmaker[Session], live_session, stub_s3
+) -> None:
+    """`audio_file_id` is unique on transcript_references. The reference row already
+    exists by now, so a blind insert 500s the whole route."""
+    audio_file_id = _script_only_row(db_session_factory, reference="original script text")
+    live_session.create(["hamsa"], 3.0)
+
+    response = client.post(
+        "/transcript/session/test-session/finalize",
+        data={"referenceText": REFERENCE, "referenceSource": "script", "audioFileId": str(audio_file_id)},
+        files={"file": ("read-aloud.wav", make_wav_bytes(duration_sec=2.0), "audio/wav")},
+    )
+
+    assert response.status_code == 200, response.text
+    with db_session_factory() as session:
+        rows = session.query(TranscriptReference).filter_by(audio_file_id=audio_file_id).all()
+    assert len(rows) == 1
+    # The text submitted at finalize is what was actually read, so it wins over the
+    # text stored at generation (the operator can edit the box before reading).
+    assert rows[0].text == REFERENCE
+
+
+def test_finalize_refuses_to_record_over_existing_audio(
+    client: TestClient, db_session_factory: sessionmaker[Session], live_session, stub_s3
+) -> None:
+    """Overwriting the audio would leave the previous take's transcripts and scores
+    pointing at different audio than they were measured from."""
+    audio_file_id = _script_only_row(db_session_factory)
+    live_session.create(["hamsa"], 3.0)
+    first = client.post(
+        "/transcript/session/test-session/finalize",
+        data={"referenceText": REFERENCE, "audioFileId": str(audio_file_id)},
+        files={"file": ("read-aloud.wav", make_wav_bytes(duration_sec=2.0), "audio/wav")},
+    )
+    assert first.status_code == 200, first.text
+
+    live_session.create(["hamsa"], 3.0)
+    second = client.post(
+        "/transcript/session/test-session/finalize",
+        data={"referenceText": REFERENCE, "audioFileId": str(audio_file_id)},
+        files={"file": ("read-aloud.wav", make_wav_bytes(duration_sec=2.0), "audio/wav")},
+    )
+
+    assert second.status_code == 409, second.text
+
+
+def test_finalize_rejects_an_unknown_audio_file_id(
+    client: TestClient, live_session, stub_s3
+) -> None:
+    """The id comes from the browser, so ownership and surface are checked, not trusted."""
+    live_session.create(["hamsa"], 3.0)
+
+    response = client.post(
+        "/transcript/session/test-session/finalize",
+        data={"referenceText": REFERENCE, "audioFileId": "424242"},
+        files={"file": ("read-aloud.wav", make_wav_bytes(duration_sec=2.0), "audio/wav")},
+    )
+
+    assert response.status_code == 404, response.text
+
+
+def test_finalize_without_an_audio_file_id_still_creates_a_row(
+    client: TestClient, db_session_factory: sessionmaker[Session], live_session, stub_s3
+) -> None:
+    """A session opened from a pasted reference has no row yet, so the original path
+    must keep working unchanged."""
+    live_session.create(["hamsa"], 3.0)
+
+    response = _finalize(client, source="pasted")
+
+    assert response.status_code == 200, response.text
+    audio_file_id = response.json()[0]["audioFileId"]
+    with db_session_factory() as session:
+        row = session.get(AudioFile, audio_file_id)
+    assert row is not None
+    assert row.s3_key == f"audio/{audio_file_id}.wav"
+    assert row.filename.startswith("recording_")
+
+
+def test_finalize_leaves_a_legacy_script_named_row_alone(
+    client: TestClient, db_session_factory: sessionmaker[Session], live_session, stub_s3
+) -> None:
+    """Rows created before the `recording_` scheme keep the name they have.
+
+    `attach_audio` used to rewrite `script_...` to `recording_...` on finalize.
+    That rename is gone, and it should stay gone: renaming a row here would
+    change a name someone may already have referenced, to fix nothing that
+    `has_audio` does not already answer.
+    """
+    audio_file_id = _script_only_row(db_session_factory, filename="script_20260820_120000")
+    live_session.create(["hamsa", "inception-stt"], 3.0)
+
+    response = client.post(
+        "/transcript/session/test-session/finalize",
+        data={"referenceText": REFERENCE, "referenceSource": "script", "audioFileId": str(audio_file_id)},
+        files={"file": ("read-aloud.wav", make_wav_bytes(duration_sec=2.0), "audio/wav")},
+    )
+    assert response.status_code == 200, response.text
+
+    with db_session_factory() as session:
+        row = session.get(AudioFile, audio_file_id)
+        assert row.filename == "script_20260820_120000"
+        assert row.s3_key, "the recording still attached, only the name was left alone"

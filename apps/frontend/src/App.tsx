@@ -96,6 +96,11 @@ export default function App() {
   // then highlighted Upload, because "nothing to view" was inferred as "you must be
   // creating". The user's click is the truth about which tab they are on.
   const [transcriptTab, setTranscriptTab] = useState<Nav>("upload");
+  // Which sub-activity the Transcript surface is doing: scoring STT engines live
+  // against a reference, or comparing TTS engines' synthesis of that same
+  // reference. A toggle inside the transcript page, not a nav destination or a
+  // second surface — `nav`/`studioMode`/`listSurface` stay exactly as they were.
+  const [transcriptSubMode, setTranscriptSubMode] = useState<"stt" | "tts">("stt");
   const [workflow, setWorkflow] = useState<Workflow>("idle");
   const [uploadPct, setUploadPct] = useState(0);
   const [playing, setPlaying] = useState(false);
@@ -312,12 +317,20 @@ export default function App() {
   }, [workflow, evaluation, hasInFlight, hasFailed]);
 
   const refreshRecordings = useCallback(
-    async (surface: StudioMode) => {
+    async (surface: StudioMode): Promise<Project[]> => {
       try {
         const rows = await fetchRecordings(surface);
-        setProjects(rows.map((row) => projectFromRecording(row, freshIdsRef.current.has(row.audioFileId))));
+        const mapped = rows.map((row) =>
+          projectFromRecording(row, freshIdsRef.current.has(row.audioFileId)),
+        );
+        setProjects(mapped);
+        // Returned as well as stored: a caller that just created a row needs the
+        // mapped Project for it, and reading `projects` back would see the
+        // previous render's value.
+        return mapped;
       } catch (error) {
         console.error("Could not load recordings:", error);
+        return [];
       }
     },
     [],
@@ -597,6 +610,12 @@ export default function App() {
         failedCount: 0,
         engineCount: 0,
         scored: false,
+        // A diarization upload has no TTS runs; that count only applies to the
+        // transcript surface's read-aloud reference.
+        ttsCount: 0,
+        // An upload always arrives with its audio; only a generated-but-unrecorded
+        // transcript script does not.
+        hasAudio: true,
       },
       true,
     );
@@ -713,6 +732,21 @@ export default function App() {
     void refreshRecordings("transcript");
   }, [refreshRecordings]);
 
+  const handleScriptSaved = useCallback(async (audioFileId: number) => {
+    freshIdsRef.current.add(audioFileId);
+    const rows = await refreshRecordings("transcript");
+    // Generating a script CREATES a recording, so the studio moves onto it. Left
+    // on the previous row, the next action (record, or synthesize) would attach
+    // to a recording the operator is no longer looking at, and the new entry
+    // would sit in Projects with nothing pointing at it.
+    //
+    // Still no nav or tab change: the operator is already on the page they want,
+    // and only which recording is open changes. Both sub-modes read the id from
+    // here, so the script and its settings survive the STT/TTS toggle.
+    const created = rows.find((row) => row.audioFileId === audioFileId);
+    if (created) setCurrent(created);
+  }, [refreshRecordings]);
+
   const openProject = (project: Project) => {
     const requestId = ++openRequestRef.current;
     audioRef.current?.pause();
@@ -728,7 +762,12 @@ export default function App() {
       setPlaying(false);
       setWorkflow("idle");
       setListSurface("transcript");
-      setTranscriptTab("dashboard");
+      setTranscriptTab(project.hasAudio ? "dashboard" : "upload");
+      // A row with synthesized TTS clips but no STT engine run yet was opened
+      // from the TTS side of the workflow; land there instead of on the STT
+      // record page it has no results for. Explicit, from this row's own
+      // counts — never inferred from the absence of something else.
+      setTranscriptSubMode(project.ttsCount > 0 && project.engines === 0 ? "tts" : "stt");
       setNav("transcript");
       return;
     }
@@ -863,6 +902,9 @@ export default function App() {
   const handleStudioMode = useCallback((next: StudioMode) => {
     // Always the surface, for both the studio and the recordings list.
     setListSurface(next);
+    // Leaving the transcript surface always lands back on STT, so returning to
+    // Transcript later never shows TTS with no click that asked for it.
+    if (next !== "transcript") setTranscriptSubMode("stt");
     // Nav is WHAT you are doing; the toggle is WHICH evaluation. So switching
     // surface keeps you doing the same thing on the other surface:
     //
@@ -956,7 +998,13 @@ export default function App() {
       {nav === "transcript" && (
         <TranscriptStudio
           runtimeConfig={runtimeConfig}
+          transcriptSubMode={transcriptSubMode}
+          onTranscriptSubMode={setTranscriptSubMode}
           onRecorded={handleRecorded}
+          onScriptSaved={handleScriptSaved}
+          // A transcript entry with no audio is a saved script: the studio opens it
+          // ready to record rather than ready to play.
+          hasAudio={current?.surface === "transcript" ? current.hasAudio : true}
           // Prefer the OPENED recording over the loaded evaluation. A transcript
           // recording has no evaluation at all — that path deliberately skips
           // fetchEvaluation, because zero diarization models is not a timeline

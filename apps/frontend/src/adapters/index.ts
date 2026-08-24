@@ -10,6 +10,8 @@ export type {
   RuntimeConfig,
   TranscriptConfig,
   TranscriptEngineInfo,
+  TtsConfig,
+  TtsEngineInfo,
 } from "./BackendApiAdapter";
 export { DEMO_AUDIO_FILE_ID, normalizeModelRun } from "./DiarizationAdapter";
 export {
@@ -22,6 +24,7 @@ export {
   generateScript,
   liveStreamUrl,
   openLiveSession,
+  createReference,
   putReference,
   sendLiveChunk,
   startTranscripts,
@@ -31,11 +34,14 @@ export {
   fetchModelStatus,
   fetchRuntimeConfig,
   fetchTranscripts,
+  fetchTtsRuns,
   ingestRecording,
   parseBlobInput,
   patchUploadTiming,
   retryModel,
   startTranscript,
+  synthesizeTts,
+  ttsAudioUrl,
   uploadAudio,
 } from "./BackendApiAdapter";
 
@@ -91,6 +97,8 @@ export function projectFromRecording(
     engines: recording.engineCount,
     scored: recording.scored,
     bestWer: recording.bestWer,
+    ttsCount: recording.ttsCount,
+    hasAudio: recording.hasAudio,
     fresh,
   };
 }

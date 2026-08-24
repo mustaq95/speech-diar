@@ -49,6 +49,13 @@ ReferenceSource = Literal["script", "pasted"]
 #: the rest are the three error classes WER counts.
 AlignmentOp = Literal["equal", "sub", "del", "ins"]
 
+#: How a TTS engine delivers its audio. `stream` is a single POST whose BODY
+#: streams (hamsa-tts); `single` is a request/response call that still arrives
+#: chunked but with no meaningful front-loading (inception-tts). Deliberately
+#: not the STT side's `transport` vocabulary -- neither describes the other
+#: direction correctly.
+TtsDelivery = Literal["stream", "single"]
+
 
 class ContractModel(BaseModel):
     """Base for all shared contracts: camelCase on the wire, snake_case in Python."""
@@ -234,6 +241,14 @@ class RecordingSummary(ContractModel):
     filename: str = Field(description="Display name; not unique")
     duration_sec: float = Field(ge=0)
     created_at: str = Field(description="ISO-8601; the list is ordered by this, newest first")
+    has_audio: bool = Field(
+        default=True,
+        description=(
+            "Whether a recording exists yet. False for a transcript row created when its "
+            "script was generated but never read aloud: `duration_sec` is 0 because nothing "
+            "was measured, not because the audio is zero-length."
+        ),
+    )
 
     # --- diarization recordings ---
     model_count: int = Field(default=0, ge=0, description="Models that have a result row")
@@ -247,6 +262,7 @@ class RecordingSummary(ContractModel):
     best_wer: float | None = Field(
         default=None, ge=0, description="Lowest WER across engines; None when unscored"
     )
+    tts_count: int = Field(default=0, ge=0, description="TTS engines that have synthesized this recording's reference")
 
 
 class ScriptRequest(ContractModel):
@@ -278,6 +294,13 @@ class GeneratedScript(ContractModel):
     word_count: int = Field(ge=0, description="Measured from `text`")
     generator_model: str = Field(description="The model that actually generated it")
     params: dict = Field(description="The request, plus finish reason and generation time")
+    audio_file_id: int = Field(
+        description=(
+            "The recording row this script was saved to. Created with the script so it "
+            "appears in Projects before anything has been recorded; finalize attaches the "
+            "audio to this same row."
+        ),
+    )
 
 
 class TranscriptRun(ContractModel):
@@ -351,6 +374,52 @@ class TranscriptRawOutput(ContractModel):
     run: TranscriptRun | None = Field(
         default=None, description="The adapted transcript built from that raw output"
     )
+
+
+class TtsRun(ContractModel):
+    """One TTS engine's synthesis of one recording's reference text.
+
+    Mirrors `TranscriptRun`'s per-engine shape, on the other axis: a recording
+    holds one run per TTS engine at once (hamsa-tts AND inception-tts), which is
+    the comparison this surface makes. `GET /evaluations/{id}/tts` returns a
+    list of these.
+    """
+
+    audio_file_id: int
+    tts_id: str = Field(description="Engine that ran: 'hamsa-tts' | 'inception-tts'")
+    tts_name: str = Field(description="Display name of the TTS engine")
+    status: str = Field(description="done|failed")
+    error: str | None = Field(default=None, description="Failure reason when status == 'failed'")
+    voice: str | None = Field(default=None, description="The voice used for this synthesis")
+    delivery: TtsDelivery
+    text_chars: int | None = Field(default=None, ge=0, description="Length of the text synthesized")
+    audio_format: str | None = Field(default=None, description="wav|mp3; None when status == 'failed'")
+    size_bytes: int | None = Field(default=None, ge=0, description="Exact size of the rendered audio")
+    native_sample_rate: int | None = Field(default=None, ge=0, description="Measured from the rendered audio")
+    audio_sec: float | None = Field(default=None, ge=0, description="Measured duration of the rendered audio")
+    channels: int | None = Field(default=None, ge=0, description="Read from the rendered container")
+    bit_depth: int | None = Field(
+        default=None, ge=0, description="Read from the rendered container; None when it carries none (MP3)"
+    )
+    first_audio_ms: int | None = Field(default=None, ge=0, description="Measured time to first audio")
+    synth_ms: int | None = Field(default=None, ge=0, description="Measured total synthesis wall-clock time")
+    rtf: float | None = Field(
+        default=None, ge=0, description="synth_ms / audio_sec; None when audio_sec is unknown"
+    )
+
+
+class TtsRawOutput(ContractModel):
+    """`ModelRawOutput`'s counterpart for one TTS engine's synthesis.
+
+    `raw_output` here is response metadata (status code, headers), never the
+    audio bytes -- the audio itself is served by `GET
+    /evaluations/{id}/tts/{ttsId}/audio`.
+    """
+
+    tts_id: str = Field(description="Engine that ran: 'hamsa-tts' | 'inception-tts'")
+    status: str = Field(description="done|failed")
+    raw_output: dict | None = Field(default=None, description="The engine's response metadata, verbatim")
+    run: TtsRun | None = Field(default=None, description="The adapted contract built from that run")
 
 
 class QueuedModel(ContractModel):

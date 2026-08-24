@@ -13,7 +13,8 @@ from apps.background_worker.transcription import (
     MODE_TO_ASR_ID,
     transport_for,
 )
-from apps.backend_api.routers import evaluations, models, recordings, transcript, upload
+from apps.background_worker.tts import COMPARISON_TTS_IDS, TTS_DELIVERY, TTS_ENGINES
+from apps.backend_api.routers import evaluations, models, recordings, transcript, tts, upload
 from packages.config.logging import configure_logging
 from packages.config.settings import get_settings
 from packages.database.session import init_db
@@ -43,6 +44,7 @@ app.include_router(evaluations.router)
 app.include_router(models.router)
 app.include_router(recordings.router)
 app.include_router(transcript.router)
+app.include_router(tts.router)
 
 
 @app.get("/health")
@@ -119,5 +121,26 @@ def frontend_config() -> dict[str, object]:
             # paste-a-reference path only, instead of a Generate button that
             # cannot work.
             "scriptModel": settings.llm_model if settings.llm_chat_url else None,
+        },
+        "tts": {
+            "engines": [
+                {
+                    "ttsId": tts_id,
+                    "name": TTS_ENGINES[tts_id].name,
+                    "delivery": TTS_DELIVERY[tts_id],
+                    "configured": TTS_ENGINES[tts_id].configured(settings),
+                    "voices": TTS_ENGINES[tts_id].voices(settings),
+                    "defaultVoice": TTS_ENGINES[tts_id].default_voice(settings),
+                    # Engine-level synthesis settings, true of every voice this
+                    # engine offers. The UI shows them beside the voice picker;
+                    # neither gateway exposes per-voice metadata (no
+                    # list-voices endpoint exists), so nothing here is
+                    # per-voice and the UI must not present it as such.
+                    "synthesisParams": TTS_ENGINES[tts_id].synthesis_params(settings),
+                }
+                for tts_id in COMPARISON_TTS_IDS
+                if tts_id in TTS_ENGINES
+            ],
+            "maxInputChars": settings.tts_max_input_chars,
         },
     }

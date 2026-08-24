@@ -125,7 +125,8 @@ def test_field_names_match_the_typescript_interface(model_name, ts_path, parsed)
 @pytest.mark.parametrize(
     "alias_name",
     ["ModelStatus", "TranscriptStage", "TranscriptionMode", "TranscriptSource",
-     "TranscriptTransport", "ReferenceSource", "AlignmentOp", "ModelLifecycleState"],
+     "TranscriptTransport", "ReferenceSource", "AlignmentOp", "ModelLifecycleState",
+     "TtsDelivery"],
 )
 @pytest.mark.parametrize("ts_path", TS_FILES, ids=lambda p: p.name)
 def test_literal_unions_exist_in_typescript(alias_name, ts_path, parsed) -> None:

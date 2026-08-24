@@ -44,6 +44,7 @@ def init_db() -> None:
     """
     Base.metadata.create_all(bind=engine)
     _ensure_added_columns()
+    _migrate_tts_results_per_voice()
     _backfill_recording_surface()
     with SessionLocal() as session:
         _seed_dev_user(session)
@@ -87,6 +88,10 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("transcript_results", "del_count", "INTEGER"),
     ("transcript_results", "ins_count", "INTEGER"),
     ("transcript_results", "alignment", "JSON"),
+    # tts_results shipped without these two; `create_all` builds the table on a
+    # host that has never seen it, but never ALTERs one that already exists.
+    ("tts_results", "channels", "INTEGER"),
+    ("tts_results", "bit_depth", "INTEGER"),
 )
 
 
@@ -121,6 +126,84 @@ def _backfill_recording_surface() -> None:
             logger.info(
                 "Labelled %d pre-existing recording(s) as transcript recordings", result.rowcount
             )
+
+
+#: The one-shot move from one clip per (recording, engine) to one clip per
+#: (recording, engine, VOICE).
+#:
+#: DESTRUCTIVE, and deliberately so. Rows written under the old constraint have
+#: an S3 key with no voice segment (`tts/{id}/{tts_id}.wav`), so two voices
+#: would collide on one object; rather than carry two key layouts forever, the
+#: old clips are deleted and re-synthesized. This was an explicit call, made
+#: when the affected set was two dev rows.
+#:
+#: Runs at most once: the whole step is gated on the OLD constraint still
+#: existing. Once it has been swapped there is nothing to match and this is a
+#: no-op forever after. Do NOT relax that guard -- it is the only thing between
+#: this function and a database with real clips in it.
+_OLD_TTS_CONSTRAINT = "uq_tts_results_audio_file_tts"
+_NEW_TTS_CONSTRAINT = "uq_tts_results_audio_file_tts_voice"
+
+
+def _migrate_tts_results_per_voice() -> None:
+    """Widen tts_results' unique key to include `voice`, dropping old clips.
+
+    Postgres only, like the other shims: SQLite built the table from the
+    current models a moment ago and already has the new constraint.
+
+    `create_all` never ALTERs an existing table, and `_ADDED_COLUMNS` only
+    knows ADD COLUMN, so a constraint change has nowhere else to live. See the
+    comment above for why this deletes rather than migrates.
+    """
+    if engine.dialect.name != "postgresql":
+        return
+
+    with engine.begin() as conn:
+        exists = conn.execute(
+            text(
+                "SELECT 1 FROM pg_constraint WHERE conrelid = 'tts_results'::regclass"
+                " AND conname = :name"
+            ),
+            {"name": _OLD_TTS_CONSTRAINT},
+        ).scalar()
+        if not exists:
+            return
+
+        # Collected before the DELETE so the objects can be cleaned up after.
+        stale_keys = [
+            key
+            for (key,) in conn.execute(
+                text("SELECT s3_key FROM tts_results WHERE s3_key IS NOT NULL")
+            ).all()
+        ]
+        deleted = conn.execute(text("DELETE FROM tts_results")).rowcount
+        conn.execute(text(f"ALTER TABLE tts_results DROP CONSTRAINT IF EXISTS {_OLD_TTS_CONSTRAINT}"))
+        # Safe only because the table was just emptied.
+        conn.execute(text("ALTER TABLE tts_results ALTER COLUMN voice SET NOT NULL"))
+        conn.execute(
+            text(
+                f"ALTER TABLE tts_results ADD CONSTRAINT {_NEW_TTS_CONSTRAINT}"
+                " UNIQUE (audio_file_id, tts_id, voice)"
+            )
+        )
+
+    logger.info(
+        "Migrated tts_results to one clip per voice; dropped %d clip(s) stored under the "
+        "old voice-less key layout",
+        deleted,
+    )
+
+    # Lazy import: packages.database has no business depending on object
+    # storage at module scope. Same trick `cohere_container_healthy` uses to
+    # keep a layering edge from becoming an import cycle.
+    if stale_keys:
+        from packages.storage import s3_client
+
+        for key in stale_keys:
+            try:
+                s3_client.delete_object(key)
+            except Exception:
+                logger.warning("Could not delete orphaned TTS object %s", key, exc_info=True)
 
 
 def _ensure_added_columns() -> None:

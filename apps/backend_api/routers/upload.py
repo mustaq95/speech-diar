@@ -129,6 +129,24 @@ def _content_hash_file(path: str) -> str:
     return h.hexdigest()[:32]
 
 
+def _canonicalize_to_file(content: bytes) -> str:
+    """Write `content` to disk as a 16 kHz mono 16-bit PCM WAV and return the path.
+
+    On disk rather than in memory so a multi-hour file never lands wholesale in
+    RAM, and one shape so every downstream consumer sees the same thing. Callers
+    own the returned path and must unlink it.
+    """
+    if _is_canonical_wav(content):
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(content)
+        return path
+    path = _transcode_to_wav_file(content)
+    if path is None:
+        raise HTTPException(status_code=415, detail="Unsupported or unreadable audio file")
+    return path
+
+
 def store_recording(
     content: bytes,
     filename: str,
@@ -155,17 +173,7 @@ def store_recording(
     Fully synchronous (blocking ffmpeg + storage IO), so callers run it via
     `run_in_threadpool` to keep it off the event loop.
     """
-    # Canonicalize to a 16 kHz mono 16-bit PCM WAV on disk so every downstream consumer
-    # sees one shape and a multi-hour file never lands wholesale in memory.
-    if _is_canonical_wav(content):
-        fd, canonical_path = tempfile.mkstemp(suffix=".wav")
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(content)
-    else:
-        canonical_path = _transcode_to_wav_file(content)
-        if canonical_path is None:
-            raise HTTPException(status_code=415, detail="Unsupported or unreadable audio file")
-
+    canonical_path = _canonicalize_to_file(content)
     try:
         duration_sec = _wav_duration_file(canonical_path)
         if duration_sec is None:
@@ -196,6 +204,44 @@ def store_recording(
                     azure_blob.put_stream(fh, blob_key)
             audio_file.blob_key = blob_key
             audio_file.blob_url = azure_blob.blob_url(blob_key)
+        db.commit()
+    finally:
+        if os.path.exists(canonical_path):
+            os.unlink(canonical_path)
+    return audio_file
+
+
+def attach_audio(content: bytes, audio_file: AudioFile, db: Session) -> AudioFile:
+    """Store audio against an `AudioFile` row that already exists.
+
+    The read-aloud flow creates its row when the script is generated, before any
+    audio exists, so the row is in Projects from the moment there is something to
+    record. This fills in the half that was missing: the canonical object, the real
+    duration read from its header, and a `recording_` display name.
+
+    Same canonicalization as `store_recording`, deliberately — a read-aloud
+    recording must be the same stored shape as an upload whichever order the row
+    and the audio arrived in. Local lane only: the transcript surface never uses
+    the azure lane.
+
+    Fully synchronous (blocking ffmpeg + storage IO), so callers run it via
+    `run_in_threadpool`.
+    """
+    canonical_path = _canonicalize_to_file(content)
+    try:
+        duration_sec = _wav_duration_file(canonical_path)
+        if duration_sec is None:
+            raise HTTPException(status_code=415, detail="Could not read audio duration")
+
+        key = f"audio/{audio_file.id}.wav"
+        with open(canonical_path, "rb") as fh:
+            s3_client.put_stream(fh, key)
+        audio_file.s3_key = key
+        audio_file.duration_sec = duration_sec
+        # No rename: rows are created as `recording_...` in the first place, so
+        # the name already matches its own created_at rather than the clock at
+        # Stop. Rows made before that was true keep whatever they were called --
+        # renaming them here would change a name someone may have referenced.
         db.commit()
     finally:
         if os.path.exists(canonical_path):
