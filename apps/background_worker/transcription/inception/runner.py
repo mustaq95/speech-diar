@@ -232,7 +232,16 @@ def text_of(part: dict[str, Any]) -> str:
 
 
 def run(audio_path: str) -> InceptionRawOutput:
-    """Transcribe `audio_path`, splitting it under the truncation ceiling.
+    """Transcribe `audio_path` over the stored-audio path.
+
+    One whole-file call when `INCEPTION_BATCH_WHOLE_FILE` is set (the default),
+    otherwise split under the truncation ceiling. The whole-file mode exists so
+    the comparison surface can give this engine and cohere-transcribe the SAME
+    input in batch mode, and it costs transcript -- 65 words where the split
+    returns 140 on the same 65 s recording. See that setting for the measurement.
+
+    Either way the return shape is a LIST of entries, so `adapter.adapt` and
+    `raw_output` are unchanged by the branch.
 
     Segments are transcribed concurrently (`BATCH_MAX_CONCURRENCY`) but the
     returned list stays in AUDIO order, not completion order: `adapter.py`
@@ -246,6 +255,21 @@ def run(audio_path: str) -> InceptionRawOutput:
 
     send_path, cleanup = ensure_canonical_wav(audio_path)
     try:
+        if settings.inception_batch_whole_file:
+            # No splitting and no offsets: there is one piece, and it spans the
+            # whole recording. Logged at WARNING because the gateway answers 200
+            # while discarding content, so this line is the only trace that the
+            # short transcript was asked for rather than a fault.
+            logger.warning(
+                "inception-stt: sending %s WHOLE (INCEPTION_BATCH_WHOLE_FILE); this "
+                "gateway truncates long audio silently and the transcript will be short",
+                os.path.basename(audio_path),
+            )
+            with open(send_path, "rb") as fh:
+                entry = _post(settings, fh.read(), os.path.basename(send_path))
+            entry["segment_index"] = 0
+            return [entry]
+
         pieces = split_wav_fixed(send_path, settings.batch_segment_seconds)
         logger.info(
             "inception-stt: %d segment(s) of <=%.0fs for %s",

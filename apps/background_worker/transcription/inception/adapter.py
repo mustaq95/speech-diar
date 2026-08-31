@@ -27,3 +27,16 @@ from .runner import InceptionRawOutput, text_of
 def adapt(raw: InceptionRawOutput) -> str:
     segments = sorted(raw, key=lambda part: part.get("segment_index", 0))
     return " ".join(text for part in segments if (text := text_of(part))).strip()
+
+
+def segment_count(raw: InceptionRawOutput) -> int:
+    """How many pieces this engine actually cut the recording into.
+
+    Here rather than in the pipeline because the pipeline is not allowed to know
+    what the native output looks like -- `len(raw)` is only meaningful to code
+    that knows this engine returns one entry per segment.
+
+    A batch run's chunk count used to be left NULL and rendered as 0, which reads
+    as "the engine produced nothing" for a run that in fact made N calls.
+    """
+    return len(raw)

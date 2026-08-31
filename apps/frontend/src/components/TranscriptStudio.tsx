@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Segmented, SliderControl } from "./controls";
-import type { GeneratedScript, TranscriptReference, TranscriptRun } from "../types/diarization";
+import type {
+  GeneratedScript,
+  TranscriptReference,
+  TranscriptRun,
+  TranscriptSource,
+  TranscriptTransport,
+} from "../types/diarization";
 import type { RuntimeConfig, TranscriptEngineInfo } from "../adapters";
 import {
   audioStreamUrl,
@@ -232,11 +238,54 @@ export function TranscriptStudio({
     script?.audioFileId ?? (resumingScript ? audioFileId ?? null : null);
   const referenceWords = referenceText ? referenceText.split(/\s+/).length : 0;
   const chunkInterval = config?.chunkIntervalSec ?? 3;
+  // The batch path's own cut size. Falls back to the live interval only when the
+  // server did not send one, which is the closest honest guess available.
+  const batchSegmentSec = config?.batchSegmentSec ?? chunkInterval;
   const socketTimeoutSec = config?.socketOpenTimeoutSec ?? 10;
 
   // Live results win while a capture is on screen; otherwise a reopened
   // recording's stored runs. Same shape either way, so the scorecard is unchanged.
   const shownRuns: TranscriptRun[] | null = results ?? (viewingSaved ? savedRuns : null);
+
+  // A batch engine comes back from finalize as `queued` and is transcribed by a
+  // worker afterwards, so the results handed back at Stop are not the final ones.
+  // Nothing refetched them before, which is why a batch transcript never appeared
+  // in the live view at all -- the operator had to reopen the recording from
+  // Projects to see it.
+  //
+  // Same shape as StoredRecordingScorer's poll: run only while something is
+  // actually in flight, on the host's own interval, and stop as soon as it settles.
+  const pendingRunIds = useMemo(
+    () => (results ?? [])
+      .filter((run) => run.status === "queued" || run.status === "running")
+      .map((run) => run.asrId),
+    [results],
+  );
+  const awaitingBatch = pendingRunIds.length > 0;
+  const pendingAudioId = results?.[0]?.audioFileId ?? null;
+
+  useEffect(() => {
+    if (!awaitingBatch || pendingAudioId == null) return;
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      void (async () => {
+        try {
+          const fresh = await fetchTranscripts(pendingAudioId);
+          // Replaces `results` wholesale: the rows the worker wrote are the
+          // authority once it has run, and the live ones are unchanged by it.
+          if (!cancelled && fresh.length) setResults(fresh);
+        } catch {
+          // A failed poll is not worth surfacing — the next one recovers, or the
+          // run's own error field explains what happened. Same call as the
+          // stored-recording scorer makes.
+        }
+      })();
+    }, runtimeConfig?.pollIntervalMs ?? 1500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [awaitingBatch, pendingAudioId, runtimeConfig?.pollIntervalMs]);
   const runByEngine = useMemo(
     () => new Map((shownRuns ?? []).map((run) => [run.asrId, run])),
     [shownRuns],
@@ -270,8 +319,33 @@ export function TranscriptStudio({
     return null;
   }, [script, savedRef, savedParams]);
 
-  const streamEngines = useMemo(() => engines.filter((e) => e.transport === "stream"), [engines]);
-  const chunkEngines = useMemo(() => engines.filter((e) => e.transport === "chunks"), [engines]);
+  // The operator's per-engine feed-mode pick, for engines offering more than one.
+  // Absent means "use that engine's default", so the map stays empty until
+  // someone actually chooses.
+  const [modePicks, setModePicks] = useState<Record<string, TranscriptSource>>({});
+  const modeOf = useCallback(
+    (engine: TranscriptEngineInfo): TranscriptSource => modePicks[engine.asrId] ?? engine.feedMode,
+    [modePicks],
+  );
+  // The transport a given engine's CURRENT pick produces. Not a constant per
+  // engine: cohere is chunks live and file in batch, while inception-stt is
+  // chunks either way (its batch path still cuts at BATCH_SEGMENT_SECONDS, just
+  // from storage). Mirrors `transport_for_mode` on the server.
+  const transportOf = useCallback(
+    (engine: TranscriptEngineInfo): TranscriptTransport =>
+      modeOf(engine) === "live" ? engine.liveTransport : engine.batchTransport,
+    [modeOf],
+  );
+
+  // Only engines running LIVE are fed while the operator reads. A batch pick has
+  // to actually stop the feeder, or the engine would be fed over a route its own
+  // session refuses.
+  const streamEngines = useMemo(
+    () => engines.filter((e) => modeOf(e) === "live" && transportOf(e) === "stream"),
+    [engines, modeOf, transportOf]);
+  const chunkEngines = useMemo(
+    () => engines.filter((e) => modeOf(e) === "live" && transportOf(e) === "chunks"),
+    [engines, modeOf, transportOf]);
 
   const cleanupRun = useCallback(() => {
     if (tickRef.current != null) window.clearInterval(tickRef.current);
@@ -340,6 +414,10 @@ export function TranscriptStudio({
         engines.map((engine) => engine.asrId),
         chunkInterval,
         referenceText,
+        // Fixed for the whole run from here: the server stores what it resolved
+        // and labels the results with that, so moving the control mid-recording
+        // cannot relabel what already ran.
+        Object.fromEntries(engines.map((engine) => [engine.asrId, modeOf(engine)])),
       );
       sessionRef.current = session.sessionId;
 
@@ -762,7 +840,12 @@ export function TranscriptStudio({
           // recomputing it from anything now would be a different number.
           const stored = runByEngine.get(engine.asrId);
           const live = panels[engine.asrId] ?? EMPTY_PANEL;
-          const panel: LivePanel = viewingSaved && stored
+          // A batch engine has no live panel state at all -- it was fed nothing
+          // while the operator read -- so its text can only come from the row.
+          // Without this it showed "No transcript yet." forever, even after the
+          // worker had finished and the poll above had the transcript in hand.
+          const fromRow = (viewingSaved || stored?.source === "batch") && stored;
+          const panel: LivePanel = fromRow
             ? {
                 text: stored.text ?? "",
                 latencies: [],
@@ -770,20 +853,48 @@ export function TranscriptStudio({
                 error: stored.error ?? null,
               }
             : live;
-          const avg = viewingSaved && stored
-            ? stored.avgLatencyMs ?? null
-            : mean(live.latencies);
+          const avg = fromRow ? stored.avgLatencyMs ?? null : mean(live.latencies);
+          // Still being transcribed by a worker: shown as its own state rather
+          // than as an empty transcript, which reads as an engine that failed.
+          const runPending = stored?.status === "queued" || stored?.status === "running";
+          // The transport this PANEL is describing. A saved run reports the one it
+          // actually ran on; a live one, the current pick. Never engine.transport,
+          // which is only the default and would mislabel a run that chose the other.
+          const shown: TranscriptTransport =
+            (viewingSaved && stored?.transport) || transportOf(engine);
           return (
             <div className="panel engine-panel" key={engine.asrId}>
               <div className="engine-head">
                 <span className="engine-name">
-                  <span className={`engine-dot ${engine.transport}`} aria-hidden="true" />
+                  <span className={`engine-dot ${shown}`} aria-hidden="true" />
                   {engine.name}
                 </span>
-                <span className="mono engine-stats">
-                  {avg != null && <>lag {fmtMs(avg)}</>}
-                  {" "}
-                  {panel.text.split(/\s+/).filter(Boolean).length} words
+                <span className="engine-head-right">
+                  <span className="mono engine-stats">
+                    {avg != null && <>lag {fmtMs(avg)}</>}
+                    {" "}
+                    {panel.text.split(/\s+/).filter(Boolean).length} words
+                  </span>
+                  {/* Only for an engine that offers a real choice, and only while
+                      a new run can still be configured. Locked during capture:
+                      the session fixed its transports at Start, so a control
+                      that moved mid-run would describe something the server is
+                      not doing. Hidden on a saved recording, where the run's own
+                      transport is already what the tiles below report. */}
+                  {!viewingSaved && (engine.feedModes?.length ?? 0) > 1 && (
+                    <Segmented
+                      label={`${engine.name} feed mode`}
+                      value={modeOf(engine)}
+                      disabled={recording}
+                      onChange={(value) =>
+                        setModePicks((previous) => ({ ...previous, [engine.asrId]: value }))
+                      }
+                      options={engine.feedModes.map((option) => ({
+                        value: option,
+                        label: option === "live" ? "stream" : "batch",
+                      }))}
+                    />
+                  )}
                 </span>
               </div>
               <div className="engine-body" dir="auto">
@@ -794,12 +905,19 @@ export function TranscriptStudio({
                 ) : (
                   <span className="muted">
                     {recording
-                      ? "Listening…"
+                      ? shown === "file"
+                        // Fed nothing while you read, deliberately: its native mode is
+                        // one call over the whole recording, and cutting it into live
+                        // chunks changes what it sees rather than how fast it answers.
+                        ? "Runs once on the finished recording."
+                        : "Listening…"
                       : loadingSaved
                         ? "Loading…"
-                        : viewingSaved
-                          ? "This engine returned nothing for this recording."
-                          : "No transcript yet."}
+                        : runPending
+                          ? "Transcribing the finished recording…"
+                          : viewingSaved || stored
+                            ? "This engine returned nothing for this recording."
+                            : "No transcript yet."}
                   </span>
                 )}
               </div>
@@ -810,21 +928,52 @@ export function TranscriptStudio({
                 <div>
                   <span className="eyebrow">Transport</span>
                   <b className="mono">
-                    {engine.transport === "stream"
+                    {shown === "stream"
                       ? "stream · VAD"
-                      : `chunks · ${(
-                          (viewingSaved && stored?.chunkIntervalSec) || chunkInterval
-                        ).toFixed(1)}s`}
+                      : shown === "file"
+                        ? "file · whole recording"
+                        // A saved run reports the interval it actually cut at.
+                        // Otherwise the interval depends on the MODE: the live
+                        // slider governs a live run, but a batch run is cut at
+                        // BATCH_SEGMENT_SECONDS, a different setting. Echoing the
+                        // slider in batch mode described a cut that never
+                        // happened -- invisible while both default to 3s.
+                        : `chunks · ${(
+                            (viewingSaved && stored?.chunkIntervalSec) ||
+                            (modeOf(engine) === "batch" ? batchSegmentSec : chunkInterval)
+                          ).toFixed(1)}s`}
                   </b>
                 </div>
-                <div>
-                  <span className="eyebrow">{engine.transport === "stream" ? "Segments" : "Chunks"}</span>
-                  <b className="mono">{panel.chunkCount}</b>
-                </div>
-                <div>
-                  <span className="eyebrow">{engine.transport === "stream" ? "Avg lag behind live" : "Avg chunk latency"}</span>
-                  <b className="mono">{avg == null ? "—" : fmtMs(avg)}</b>
-                </div>
+                {shown === "file" ? (
+                  <>
+                    {/* Not "Chunks: 0" and not "Avg latency: —". This engine was
+                        never chunked and never measured against live audio, so a
+                        zero here would read as an engine that produced nothing.
+                        Both tiles show what was actually measured for a batch
+                        run: what stage it is at, and how long the call took. */}
+                    <div>
+                      <span className="eyebrow">Stage</span>
+                      <b className="mono">{viewingSaved && stored ? stored.status : "after recording"}</b>
+                    </div>
+                    <div>
+                      <span className="eyebrow">Processing time</span>
+                      <b className="mono">
+                        {viewingSaved && stored?.asrMs != null ? fmtMs(stored.asrMs) : "—"}
+                      </b>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div>
+                      <span className="eyebrow">{shown === "stream" ? "Segments" : "Chunks"}</span>
+                      <b className="mono">{panel.chunkCount}</b>
+                    </div>
+                    <div>
+                      <span className="eyebrow">{shown === "stream" ? "Avg lag behind live" : "Avg chunk latency"}</span>
+                      <b className="mono">{avg == null ? "—" : fmtMs(avg)}</b>
+                    </div>
+                  </>
+                )}
               </div>
             </div>
           );

@@ -69,8 +69,11 @@ def test_runner_posts_the_expected_request(monkeypatch: pytest.MonkeyPatch, tmp_
     # Transcription, not generation: a re-run must reproduce the same text or
     # an online-vs-offline timing comparison means nothing.
     assert seen["data"]["temperature"] == "0"
-    # Default is auto-detect: no forced language is sent, so the Arabic-first
-    # model does not hallucinate Arabic on English audio.
+    # An EMPTY setting omits the field. That is the mechanism under test here,
+    # not a recommendation: this endpoint has no auto-detect, and an absent
+    # language makes it emit English (see cohere_transcribe_language in
+    # settings.py). The real default is "ar"; this fixture blanks it on purpose
+    # so the omit path stays covered.
     assert "language" not in seen["data"]
     # Native payload handed back untouched for the adapter to read.
     assert raw == {"text": "مرحبا"}
@@ -175,3 +178,26 @@ def test_run_transcodes_and_cleans_up_a_non_canonical_recording(
     with wave.open(str(wav), "rb") as original:
         assert original.getframerate() == 44100  # the source is left untouched
     assert not os.path.exists(created[0]), "the transcoded temp file leaked"
+
+
+def test_the_language_default_is_arabic_not_empty() -> None:
+    """The setting's DEFAULT, guarded offline because the bug it prevents is
+    silent and expensive.
+
+    This endpoint has no auto-detect (`language=auto` is a 400 listing 14 fixed
+    codes). Omitting the field makes the model pick one language from the audio,
+    and on code-switched speech -- this platform's Mixed 50/50 scripts -- it picks
+    English and TRANSLATES the Arabic away. One real read-aloud scored 97.2% WER
+    with zero Arabic characters that way, and 15.3% with "ar".
+
+    An empty default reproduces that on any fresh checkout, and the failure looks
+    like a bad model rather than a bad setting. `tests/test_live_cohere_transcribe.py`
+    pins the endpoint behaviour this rests on.
+    """
+    from packages.config.settings import Settings
+
+    default = Settings.model_fields["cohere_transcribe_language"].default
+    assert default == "ar", (
+        f"cohere_transcribe_language defaults to {default!r}; an empty default makes "
+        "this engine emit English for code-switched Arabic audio"
+    )

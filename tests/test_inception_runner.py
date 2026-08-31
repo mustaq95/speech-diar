@@ -45,6 +45,12 @@ def _fake_settings(**overrides):
         stt_keepalive_expiry_sec=30,
         stt_max_connections=16,
         live_chunk_default_sec=3,
+        # These tests cover the SPLIT regime, which is what most of them are
+        # about (ordering, per-segment latency, one-call-for-short-audio). Pinned
+        # explicitly rather than inherited: production defaults this to True, and
+        # a fixture that followed it would silently stop exercising the splitting
+        # the moment the default flipped. The whole-file branch has its own test.
+        inception_batch_whole_file=False,
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
@@ -350,3 +356,76 @@ def test_splitting_recovers_content_a_single_call_drops() -> None:
         f"splitting recovered {split_words} words, one call recovered {single_words} — "
         "segmenting is supposed to recover content the gateway drops"
     )
+
+
+# --- INCEPTION_BATCH_WHOLE_FILE ----------------------------------------------
+#
+# The comparison surface gives both engines the same input in batch mode, so this
+# engine sends the recording whole rather than split. It costs transcript: on one
+# 65s recording the split returns 140 words and the whole file returns 65, at
+# HTTP 200 with no error. That is an accepted trade, not a bug, and these tests
+# pin the mechanism so the trade stays deliberate.
+
+
+def test_whole_file_mode_makes_exactly_one_call_for_long_audio(monkeypatch, tmp_path) -> None:
+    """10s at a 3s segment length is 4 calls when splitting, and must be 1 here.
+
+    The count is the whole point: it is what makes the input identical to
+    cohere-transcribe's, and it is also what discards the content.
+    """
+    wav = tmp_path / "long.wav"
+    _write_wav(wav, duration_sec=10)
+    monkeypatch.setattr(
+        runner, "get_settings",
+        lambda: _fake_settings(inception_batch_whole_file=True, batch_segment_seconds=3),
+    )
+    calls: list = []
+    _stub_post(monkeypatch, payload={"text": "whole"}, calls=calls)
+
+    raw = runner.run(str(wav))
+
+    assert len(calls) == 1, "whole-file mode must not split, whatever the segment length says"
+    assert len(raw) == 1
+    # Still a LIST of entries, so the adapter and raw_output are unchanged by the
+    # branch -- an engine returning a bare dict here would break both.
+    assert isinstance(raw, list)
+    assert raw[0]["segment_index"] == 0
+
+
+def test_whole_file_mode_carries_no_segment_offsets(monkeypatch, tmp_path) -> None:
+    """There is one piece spanning the recording, so a start/end offset would be
+    describing a split that did not happen."""
+    wav = tmp_path / "long.wav"
+    _write_wav(wav, duration_sec=10)
+    monkeypatch.setattr(
+        runner, "get_settings", lambda: _fake_settings(inception_batch_whole_file=True)
+    )
+    _stub_post(monkeypatch, payload={"text": "whole"})
+
+    raw = runner.run(str(wav))
+
+    assert "segment_start" not in raw[0]
+    assert "segment_end" not in raw[0]
+
+
+def test_the_flag_is_what_decides_not_the_audio_length(monkeypatch, tmp_path) -> None:
+    """Same audio, same segment length, both regimes — so a future change cannot
+    make the branch depend on duration by accident."""
+    wav = tmp_path / "long.wav"
+    _write_wav(wav, duration_sec=10)
+
+    monkeypatch.setattr(
+        runner, "get_settings",
+        lambda: _fake_settings(inception_batch_whole_file=False, batch_segment_seconds=3),
+    )
+    split_calls: list = []
+    _stub_post(monkeypatch, payload={"text": "piece"}, calls=split_calls)
+    assert len(runner.run(str(wav))) == 4
+
+    monkeypatch.setattr(
+        runner, "get_settings",
+        lambda: _fake_settings(inception_batch_whole_file=True, batch_segment_seconds=3),
+    )
+    whole_calls: list = []
+    _stub_post(monkeypatch, payload={"text": "whole"}, calls=whole_calls)
+    assert len(runner.run(str(wav))) == 1

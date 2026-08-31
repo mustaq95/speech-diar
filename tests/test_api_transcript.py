@@ -658,7 +658,15 @@ def test_transport_is_labelled_per_engine(client: TestClient, db_session_factory
         session.commit()
     by_id = {run["asrId"]: run for run in client.get(f"/evaluations/{audio_file_id}/transcript").json()}
     assert by_id["hamsa"]["transport"] == "stream"
-    assert by_id["inception-stt"]["transport"] == "chunks"
+    # A STORED-AUDIO run, so inception-stt reports its batch transport, which is
+    # "file" while INCEPTION_BATCH_WHOLE_FILE is on (the default). Read through
+    # transport_for rather than hardcoded, so this test states the invariant --
+    # the route reports what the engine will actually do -- instead of pinning a
+    # string that the setting can legitimately change.
+    from apps.background_worker.transcription import transport_for
+
+    assert by_id["inception-stt"]["transport"] == transport_for("inception-stt")
+    assert by_id["inception-stt"]["transport"] == "file"
 
 
 def test_deleting_a_recording_removes_its_reference(client: TestClient, db_session_factory: sessionmaker[Session]) -> None:

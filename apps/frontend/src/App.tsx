@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ConfigBar } from "./components/ConfigBar";
 import { EmptyDashboard } from "./components/EmptyDashboard";
 import { Insights } from "./components/Insights";
@@ -56,6 +56,12 @@ const DEFAULT_POLL_INTERVAL_MS = 1500;
 const TARGET_PX_PER_BAR = 3;
 const MIN_WAVE_BARS = 210;
 const MAX_WAVE_BARS = 3000;
+
+const AgentationDev = import.meta.env.DEV
+  ? lazy(() =>
+      import("./AgentationDev").then((m) => ({ default: m.AgentationDev })),
+    )
+  : null;
 
 export default function App() {
   // All diarization data enters the UI through the adapter layer as the
@@ -1118,6 +1124,12 @@ export default function App() {
             />
           </section>
         </main>
+      )}
+
+      {AgentationDev && (
+        <Suspense fallback={null}>
+          <AgentationDev />
+        </Suspense>
       )}
     </div>
   );

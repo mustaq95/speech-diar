@@ -10,6 +10,8 @@ import type {
   TranscriptReference,
   TranscriptRun,
   TranscriptionMode,
+  TranscriptSource,
+  TranscriptTransport,
   TtsDelivery,
   TtsRun,
   UploadAck,
@@ -75,7 +77,25 @@ export interface TranscriptEngineInfo {
   asrId: string;
   name: string;
   mode: TranscriptionMode;
-  transport: "stream" | "chunks";
+  // The contract's type, not a copy of its members: this was an inline
+  // "stream" | "chunks" and adding "file" to the contract left it silently
+  // narrower, so the engine that needed the new label was the one the compiler
+  // said could not have it.
+  /** The transport this engine's DEFAULT mode produces. Not a constant per
+   * engine: cohere-transcribe is chunks live and file in batch. */
+  transport: TranscriptTransport;
+  /** Default feed mode. Deliberately TranscriptSource and not a parallel type:
+   * the mode a session runs an engine in IS the `source` its row ends up with. */
+  feedMode: TranscriptSource;
+  /** The transport each mode produces. Two fields, not one: the transport is a
+   * function of the mode, so the label has to change when the operator flips the
+   * control. cohere-transcribe is chunks live and file in batch; inception-stt is
+   * chunks either way. */
+  liveTransport: TranscriptTransport;
+  batchTransport: TranscriptTransport;
+  /** Feed modes this engine offers, in menu order; entry 0 is the default. One
+   * entry means there is no choice and the UI shows no control. */
+  feedModes: TranscriptSource[];
   configured: boolean;
 }
 
@@ -88,6 +108,9 @@ export interface TranscriptConfig {
    * engine sooner; the waveform's render rate is independent of it. */
   recordBlockSamples: number;
   chunkIntervalSec: number;
+  /** The BATCH path's cut size — a different setting from chunkIntervalSec, equal
+   * to it only by default. A panel in batch mode must label this one. */
+  batchSegmentSec: number;
   chunkIntervalMinSec: number;
   chunkIntervalMaxSec: number;
   /** Deadline for a streaming engine's socket to open. A dropped upgrade neither
@@ -321,7 +344,16 @@ export interface LiveSessionAck {
   asrIds: string[];
   chunkIntervalSec: number;
   sampleRate: number;
-  engines: Array<{ asrId: string; name: string; transport: "stream" | "chunks" }>;
+  /** `transport` is what THIS session will actually use, already resolved from the
+   * caller's pick — the browser keys its feeding on it, so it must be the server's
+   * answer rather than the browser's request. */
+  engines: Array<{
+    asrId: string;
+    name: string;
+    feedMode: TranscriptSource;
+    feedModes: TranscriptSource[];
+    transport: TranscriptTransport;
+  }>;
 }
 
 /** Open a live read-aloud session. The transcripts accumulate server-side, next
@@ -330,11 +362,16 @@ export async function openLiveSession(
   asrIds: string[],
   chunkIntervalSec: number,
   referenceText: string,
+  /** Per-engine feed mode, for engines that offer more than one. Omitted entries
+   * take that engine's default. Sent at open and fixed for the run: the operator
+   * can move the control mid-recording and what ran must stay what is
+   * labelled. */
+  modes?: Record<string, TranscriptSource>,
 ): Promise<LiveSessionAck> {
   const response = await fetch(`${API_BASE_URL}/transcript/session`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ asrIds, chunkIntervalSec, referenceText }),
+    body: JSON.stringify({ asrIds, chunkIntervalSec, referenceText, modes }),
   });
   if (!response.ok) throw new Error(await errorDetail(response));
   return (await response.json()) as LiveSessionAck;

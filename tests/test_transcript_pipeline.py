@@ -284,3 +284,90 @@ def test_recording_without_local_audio_fails_honestly(
     row = _row(wired.sessions, wired.audio_file_id)
     assert row.status == "failed"
     assert "MinIO" in row.error
+
+
+# --- What a BATCH run records about its own cut ------------------------------
+#
+# A chunked engine run over stored audio is cut at BATCH_SEGMENT_SECONDS, which
+# is a DIFFERENT setting from the live chunk slider and equal to it only by
+# default (both 3s). The row used to leave chunk_interval_sec null, so the panel
+# fell back to whatever the live slider was showing and labelled a stored batch
+# run with a cut that never happened. chunk_count was null too, and rendered 0 --
+# "this engine produced nothing" for a run that made N calls.
+
+
+def _patch_segment_seconds(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+    """Make the batch cut size differ from the live one (both default to 3s, so a
+    test on the defaults would pass against the very bug this pins)."""
+    from packages.config.settings import get_settings
+
+    real = get_settings()
+    monkeypatch.setattr(
+        pipeline, "get_settings",
+        lambda: SimpleNamespace(batch_segment_seconds=seconds,
+                                live_chunk_default_sec=real.live_chunk_default_sec),
+    )
+
+
+def _stub_chunked_engine(monkeypatch: pytest.MonkeyPatch, asr_id: str, segments: int):
+    """A chunked engine whose native output is a list, one entry per segment."""
+    monkeypatch.setattr(
+        pipeline,
+        "engine_for",
+        lambda requested: SimpleNamespace(
+            run=lambda _path: [{"seg": i} for i in range(segments)],
+            adapt=lambda raw: " ".join(f"piece{p['seg']}" for p in raw),
+            # The adapter's function, as the real engine wires it: the pipeline
+            # must never count the segments itself.
+            batch_segments=lambda raw: len(raw),
+        ) if requested == asr_id else None,
+    )
+
+
+def test_a_batch_run_records_the_interval_it_was_actually_cut_at(
+    wired: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Not the live slider's value, and not null.
+
+    Pinned with the two settings made DIFFERENT, because they are equal by
+    default and a test using the defaults would pass against the bug.
+
+    Exercises the SPLIT regime, which is not the default any more: batch mode
+    sends the whole file (transport "file") unless INCEPTION_BATCH_WHOLE_FILE is
+    off. The branch under test only runs for a chunked transport, so the transport
+    is forced here alongside the setting -- keeping this covered for whoever turns
+    the flag back off.
+    """
+    # Patched at the pipeline's import site: get_settings() is cached and hands
+    # back a built instance, so setting the class attribute never reaches it.
+    _patch_segment_seconds(monkeypatch, 7.0)
+    monkeypatch.setattr(pipeline, "transport_for", lambda _asr_id: "chunks")
+    wired.add_row("inception-stt")
+    _stub_chunked_engine(monkeypatch, "inception-stt", segments=5)
+
+    pipeline.run_asr(wired.audio_file_id, "inception-stt")
+
+    row = _row(wired.sessions, wired.audio_file_id, "inception-stt")
+    assert row.transport == "chunks"
+    assert row.chunk_interval_sec == 7.0, (
+        "a batch run must record BATCH_SEGMENT_SECONDS, not the live chunk interval"
+    )
+    assert row.chunk_count == 5, "the segment count came from the adapter, not from null"
+
+
+def test_a_whole_file_batch_run_records_no_interval_at_all(
+    wired: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cohere-transcribe's batch run is ONE call, so there is no interval and no
+    chunk count. Null here is correct and is what makes the UI print the reason
+    instead of a fabricated 1."""
+    _patch_segment_seconds(monkeypatch, 7.0)
+    wired.add_row("cohere-transcribe")
+    _stub_engine(monkeypatch, "cohere-transcribe", "نص كامل")
+
+    pipeline.run_asr(wired.audio_file_id, "cohere-transcribe")
+
+    row = _row(wired.sessions, wired.audio_file_id, "cohere-transcribe")
+    assert row.transport == "file"
+    assert row.chunk_interval_sec is None
+    assert row.chunk_count is None

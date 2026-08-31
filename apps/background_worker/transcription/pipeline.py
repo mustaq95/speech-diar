@@ -41,6 +41,7 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
+from packages.config.settings import get_settings
 from packages.database.models import TranscriptResult
 from packages.database.session import SessionLocal
 from packages.storage.s3_client import download_to
@@ -164,6 +165,19 @@ def run_asr(audio_file_id: int, asr_id: str) -> None:
         # Stamped here rather than at enqueue so a row written by an older build
         # still gets labelled; the scorecard needs it to say what each figure means.
         row.transport = transport_for(asr_id)
+        # What this BATCH run actually cut the recording at, recorded rather than
+        # left null. A null here made the panel fall back to the LIVE chunk
+        # slider's value, so a stored batch run displayed whatever interval the
+        # operator's live control happened to be showing -- correct only while the
+        # two settings coincide, which by default they do (both 3s). Move the
+        # slider and the label started describing a cut that never happened.
+        #
+        # Only for a chunked transport: a "file" run made one whole-file call and
+        # has no interval, so its columns stay null and the UI prints the reason.
+        if row.transport == "chunks":
+            row.chunk_interval_sec = get_settings().batch_segment_seconds
+            if engine.batch_segments is not None:
+                row.chunk_count = engine.batch_segments(raw)
         # Scored at the end of ASR, not after alignment: WER is a comparison of
         # TEXT, so it needs nothing the aligner produces, and computing it here
         # means a recording with a reference shows its error rates as soon as the

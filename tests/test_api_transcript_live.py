@@ -60,12 +60,13 @@ def live_session(monkeypatch):
     """
     store: dict = {}
 
-    def create(asr_ids, chunk_interval_sec, reference_text=""):
+    def create(asr_ids, chunk_interval_sec, reference_text="", modes=None):
         store["meta"] = {
             "asr_ids": list(asr_ids),
             "chunk_interval_sec": chunk_interval_sec,
             "reference_text": reference_text,
             "started_at": 0.0,
+            "modes": dict(modes or {}),
         }
         store["parts"] = {asr_id: [] for asr_id in asr_ids}
         return "test-session"
@@ -517,3 +518,336 @@ def test_finalize_leaves_a_legacy_script_named_row_alone(
         row = session.get(AudioFile, audio_file_id)
         assert row.filename == "script_20260820_120000"
         assert row.s3_key, "the recording still attached, only the name was left alone"
+
+
+# --- The chunk route dispatches on asr_id, and file-transport engines ---------
+#
+# Two failures that a green suite would not have shown.
+#
+# `POST /transcript/chunk` validated `asr_id` and then called the inception
+# runner unconditionally, while filing the result under `asr_id`. With only one
+# chunked engine registered, label and runner happened to agree and nothing was
+# visibly wrong. A second chunked engine would have had Inception's text and
+# measured latency stored under its own name at 200 OK.
+#
+# And cohere-transcribe is `transport="file"`: it is fed nothing live (3s chunks
+# take the same Arabic clip from 391 Arabic characters to zero), so finalize has
+# to queue it over the stored audio instead of writing it an empty live row.
+
+
+@pytest.fixture()
+def stub_queue(monkeypatch: pytest.MonkeyPatch):
+    """Capture what finalize enqueues, without a worker or a Redis."""
+    jobs: list[tuple] = []
+    monkeypatch.setattr(
+        "apps.backend_api.routers.transcript.queue",
+        SimpleNamespace(enqueue=lambda fn, *args: jobs.append((fn.__name__, *args))),
+    )
+    return jobs
+
+
+def test_chunk_route_runs_the_engine_it_was_asked_for(
+    client: TestClient, live_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fails against the hardcoded version, which ran Inception for every asr_id.
+
+    Registers a second chunked engine with its own runner and asserts the text
+    that comes back is THAT engine's. With dispatch hardcoded, this returns
+    Inception's text under the other engine's name and still answers 200.
+    """
+    from apps.background_worker.transcription import (
+        ASR_ENGINES,
+        ASR_TRANSPORTS,
+        AsrEngine,
+    )
+
+    other = AsrEngine(
+        asr_id="other-chunked", mode="online", name="Other",
+        run=lambda path: {}, adapt=lambda raw: "",
+        configured=lambda s: True,
+        run_chunk=lambda payload, filename: {"text": "from the OTHER engine", "latency_ms": 42},
+        chunk_text=lambda entry: entry["text"],
+    )
+    monkeypatch.setitem(ASR_ENGINES, "other-chunked", other)
+    monkeypatch.setitem(ASR_TRANSPORTS, "other-chunked", "chunks")
+    # Inception's own chunk call must never be reached for this request.
+    monkeypatch.setattr(
+        "apps.background_worker.transcription.inception.runner.transcribe_bytes",
+        lambda *a, **k: pytest.fail("the chunk route called Inception for another engine"),
+    )
+    live_session.create(["other-chunked"], 3.0)
+
+    response = client.post(
+        "/transcript/chunk",
+        data={"sessionId": "test-session", "asrId": "other-chunked", "chunkIndex": "0"},
+        files={"file": ("chunk.wav", make_wav_bytes(duration_sec=1.0), "audio/wav")},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["text"] == "from the OTHER engine"
+    assert response.json()["latencyMs"] == 42
+    # And it was stored under the engine that actually produced it.
+    assert live_session.store["parts"]["other-chunked"][0]["text"] == "from the OTHER engine"
+
+
+def test_chunk_route_refuses_an_engine_running_in_batch_mode(
+    client: TestClient, live_session
+) -> None:
+    """Cohere CAN be chunked, so capability alone no longer decides. The session's
+    pick does: a run opened in batch mode must not accept live chunks, or the row
+    would carry live timings while `run_asr` also writes it from storage."""
+    live_session.create(["cohere-transcribe"], 3.0, modes={"cohere-transcribe": "batch"})
+
+    response = client.post(
+        "/transcript/chunk",
+        data={"sessionId": "test-session", "asrId": "cohere-transcribe", "chunkIndex": "0"},
+        files={"file": ("chunk.wav", make_wav_bytes(duration_sec=1.0), "audio/wav")},
+    )
+
+    assert response.status_code == 422
+    assert "batch" in response.json()["detail"]
+    assert live_session.store["parts"]["cohere-transcribe"] == []
+
+
+def test_chunk_route_accepts_cohere_when_the_session_chose_live(
+    client: TestClient, live_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half: the same engine, the other pick, is fed here and its own
+    runner is what runs.
+
+    The stub replaces the REGISTRY ENTRY, not the runner module attribute.
+    `AsrEngine.run_chunk` binds the function object at import time, so patching
+    `cohere.runner.transcribe_bytes` leaves the frozen dataclass still holding the
+    original -- and this test then quietly transcribed a silent WAV against the
+    real container on :9025 and asserted on its answer. Nothing in the harness is
+    allowed to reach real infrastructure; that it passed a 200 back made it look
+    like it was working.
+    """
+    import dataclasses
+
+    from apps.background_worker.transcription import ASR_ENGINES
+
+    monkeypatch.setitem(
+        ASR_ENGINES,
+        "cohere-transcribe",
+        dataclasses.replace(
+            ASR_ENGINES["cohere-transcribe"],
+            run_chunk=lambda payload, filename="chunk.wav": {
+                "response": {"text": "from cohere", "usage": {"type": "duration", "seconds": 3}},
+                "latency_ms": 130,
+            },
+        ),
+    )
+    live_session.create(["cohere-transcribe"], 3.0, modes={"cohere-transcribe": "live"})
+
+    response = client.post(
+        "/transcript/chunk",
+        data={"sessionId": "test-session", "asrId": "cohere-transcribe", "chunkIndex": "0"},
+        files={"file": ("chunk.wav", make_wav_bytes(duration_sec=1.0), "audio/wav")},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["text"] == "from cohere"
+    assert response.json()["latencyMs"] == 130
+    assert live_session.store["parts"]["cohere-transcribe"][0]["text"] == "from cohere"
+
+
+def test_finalize_queues_a_batch_mode_engine_over_the_stored_audio(
+    client: TestClient, db_session_factory: sessionmaker[Session],
+    live_session, stub_s3, stub_queue,
+) -> None:
+    """Cohere is fed nothing live, so finalize must QUEUE it, not write it an
+    empty transcript. An empty 'done' row would score as total error and read as
+    the engine having failed at a job it was never given."""
+    live_session.create(["hamsa", "cohere-transcribe"], 3.0,
+                        modes={"hamsa": "live", "cohere-transcribe": "batch"})
+    live_session.store["parts"]["hamsa"] = [{"i": 0, "text": "one two three", "ms": 120}]
+
+    runs = _finalize(client).json()
+
+    by_id = {run["asrId"]: run for run in runs}
+    assert set(by_id) == {"hamsa", "cohere-transcribe"}
+
+    # The live engine is unchanged by cohere's presence.
+    assert by_id["hamsa"]["status"] == "done"
+    assert by_id["hamsa"]["source"] == "live"
+    assert by_id["hamsa"]["transport"] == "stream"
+
+    # The file engine is queued, labelled batch/file, and carries no fabricated
+    # live measurements.
+    cohere = by_id["cohere-transcribe"]
+    assert cohere["status"] == "queued"
+    assert cohere["source"] == "batch"
+    assert cohere["transport"] == "file"
+    assert not cohere.get("text")
+    assert cohere.get("chunkCount") is None
+    assert cohere.get("firstLatencyMs") is None
+
+    # Exactly one job, for the file engine only, enqueued after the commit.
+    assert stub_queue == [("run_asr", by_id["hamsa"]["audioFileId"], "cohere-transcribe")]
+
+
+def test_finalize_keeps_the_live_transcripts_when_the_batch_engine_is_gone(
+    client: TestClient, db_session_factory: sessionmaker[Session],
+    live_session, stub_s3, stub_queue, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The container can stop between opening the session and finalizing. The
+    live transcripts were measured while someone was speaking and cannot be
+    reproduced; the batch one can be re-run from the recording. So the batch
+    engine fails alone and takes nothing with it."""
+    monkeypatch.setattr(
+        "apps.background_worker.transcription.cohere_container_healthy", lambda s: False
+    )
+    live_session.create(["hamsa", "cohere-transcribe"], 3.0,
+                        modes={"hamsa": "live", "cohere-transcribe": "batch"})
+    live_session.store["parts"]["hamsa"] = [{"i": 0, "text": "one two three", "ms": 120}]
+
+    response = _finalize(client)
+
+    assert response.status_code == 200, response.text
+    by_id = {run["asrId"]: run for run in response.json()}
+    assert by_id["hamsa"]["status"] == "done"
+    assert by_id["hamsa"]["text"] == "one two three"
+    assert by_id["cohere-transcribe"]["status"] == "failed"
+    assert stub_queue == []
+
+    # And the live transcript really is on disk, not just in the response.
+    with db_session_factory() as session:
+        stored = session.query(TranscriptResult).filter_by(
+            audio_file_id=by_id["hamsa"]["audioFileId"], asr_id="hamsa"
+        ).one()
+        assert stored.text == "one two three"
+
+
+def test_finalize_keeps_cohere_live_when_the_session_chose_live(
+    client: TestClient, db_session_factory: sessionmaker[Session],
+    live_session, stub_s3, stub_queue,
+) -> None:
+    """The toggle's other half at finalize.
+
+    Chosen as chunks, cohere is a LIVE row like Inception: done, source=live,
+    transport=chunks, carrying the interval and the latencies measured while
+    someone was speaking — and NOT queued, because there is nothing to run.
+    Reading the transport from the static registry instead of the session would
+    queue it here and label it "file", losing the live measurement entirely.
+    """
+    live_session.create(["cohere-transcribe"], 3.0,
+                        modes={"cohere-transcribe": "live"})
+    live_session.store["parts"]["cohere-transcribe"] = [
+        {"i": 0, "text": "one two", "ms": 130},
+        {"i": 1, "text": "three", "ms": 150},
+    ]
+
+    run = _finalize(client).json()[0]
+
+    assert run["asrId"] == "cohere-transcribe"
+    assert run["status"] == "done"
+    assert run["source"] == "live"
+    assert run["transport"] == "chunks"
+    assert run["chunkIntervalSec"] == 3.0
+    assert run["chunkCount"] == 2
+    assert run["avgLatencyMs"] == 140
+    assert run["text"] == "one two three"
+    assert stub_queue == [], "a live cohere run has nothing to queue"
+
+
+def test_the_same_engine_takes_either_mode_across_two_sessions(
+    client: TestClient, db_session_factory: sessionmaker[Session],
+    live_session, stub_s3, stub_queue,
+) -> None:
+    """One engine, two runs, two honest labels — which is the point of the toggle.
+
+    Guards the thing that would quietly break it: a transport resolved from the
+    registry at finalize rather than from the session would give both runs the
+    same label no matter what was picked.
+    """
+    live_session.create(["cohere-transcribe"], 3.0,
+                        modes={"cohere-transcribe": "live"})
+    live_session.store["parts"]["cohere-transcribe"] = [{"i": 0, "text": "live text", "ms": 130}]
+    chunked = _finalize(client).json()[0]
+
+    live_session.create(["cohere-transcribe"], 3.0,
+                        modes={"cohere-transcribe": "batch"})
+    filed = _finalize(client).json()[0]
+
+    assert (chunked["transport"], chunked["source"], chunked["status"]) == ("chunks", "live", "done")
+    assert (filed["transport"], filed["source"], filed["status"]) == ("file", "batch", "queued")
+    assert stub_queue == [("run_asr", filed["audioFileId"], "cohere-transcribe")]
+
+
+def test_both_engines_get_the_whole_file_in_batch_mode(
+    client: TestClient, db_session_factory: sessionmaker[Session],
+    live_session, stub_s3, stub_queue,
+) -> None:
+    """The symmetry batch mode exists for.
+
+    Both engines are fed the SAME input in batch -- one whole-file call each --
+    so their error rates are comparable on identical audio. Inception used to
+    stay chunked here, which made its batch panel indistinguishable from its
+    stream panel and meant the two engines were never compared on the same thing.
+
+    The cost is real and accepted: this gateway silently truncates long audio
+    (140 words split vs 65 whole, on one 65s recording), so inception's batch WER
+    carries that. INCEPTION_BATCH_WHOLE_FILE is what trades it, and
+    `transport_for` follows the same setting so the label cannot drift from it.
+    """
+    live_session.create(
+        ["inception-stt", "cohere-transcribe"], 3.0,
+        modes={"inception-stt": "batch", "cohere-transcribe": "batch"},
+    )
+
+    by_id = {run["asrId"]: run for run in _finalize(client).json()}
+
+    assert by_id["inception-stt"]["transport"] == "file"
+    assert by_id["cohere-transcribe"]["transport"] == "file", "both, or it is not a comparison"
+    assert all(run["source"] == "batch" for run in by_id.values())
+    assert all(run["status"] == "queued" for run in by_id.values())
+    # No chunk figures on either: one call has no interval and no chunk count, and
+    # a fabricated 1 would read as a measurement.
+    for run in by_id.values():
+        assert run.get("chunkIntervalSec") is None
+        assert run.get("chunkCount") is None
+    assert sorted(job[2] for job in stub_queue) == ["cohere-transcribe", "inception-stt"]
+
+
+def test_live_mode_chunks_both_engines_identically(
+    client: TestClient, db_session_factory: sessionmaker[Session],
+    live_session, stub_s3, stub_queue,
+) -> None:
+    """The other half of the symmetry: in LIVE mode both take 3s chunks.
+
+    Guards the pair. Making batch symmetric by moving inception to whole-file
+    must not have moved its live transport too -- live is where the two engines
+    are compared on identical short chunks.
+    """
+    live_session.create(
+        ["inception-stt", "cohere-transcribe"], 3.0,
+        modes={"inception-stt": "live", "cohere-transcribe": "live"},
+    )
+    for asr_id in ("inception-stt", "cohere-transcribe"):
+        live_session.store["parts"][asr_id] = [{"i": 0, "text": "one two", "ms": 100}]
+
+    by_id = {run["asrId"]: run for run in _finalize(client).json()}
+
+    for asr_id in ("inception-stt", "cohere-transcribe"):
+        assert by_id[asr_id]["transport"] == "chunks"
+        assert by_id[asr_id]["source"] == "live"
+        assert by_id[asr_id]["chunkIntervalSec"] == 3.0
+    assert stub_queue == [], "a live run has nothing to queue"
+
+
+def test_chunk_route_refuses_inception_in_batch_mode(client: TestClient, live_session) -> None:
+    """The engine that has always owned this route is not exempt: in batch mode it
+    must be refused too, or the row would carry live chunk timings while `run_asr`
+    independently overwrote it from storage."""
+    live_session.create(["inception-stt"], 3.0, modes={"inception-stt": "batch"})
+
+    response = client.post(
+        "/transcript/chunk",
+        data={"sessionId": "test-session", "asrId": "inception-stt", "chunkIndex": "0"},
+        files={"file": ("chunk.wav", make_wav_bytes(duration_sec=1.0), "audio/wav")},
+    )
+
+    assert response.status_code == 422
+    assert "batch" in response.json()["detail"]
+    assert live_session.store["parts"]["inception-stt"] == []

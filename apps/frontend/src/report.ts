@@ -325,6 +325,10 @@ export function buildTranscriptReportHtml(
   const transportLabel = (run: (typeof runs)[number]) => {
     const transport = run.transport ?? engines.find((e) => e.asrId === run.asrId)?.transport ?? "";
     if (transport === "stream") return "stream · engine VAD";
+    // "file" must never fall through to "chunks": that engine was handed the whole
+    // recording in one call after the fact, and labelling it chunked would credit
+    // it with a boundary cost it never paid.
+    if (transport === "file") return "file · whole recording";
     return run.chunkIntervalSec ? `chunks · ${run.chunkIntervalSec.toFixed(1)}s` : "chunks";
   };
   const referenceWords = runs.find((run) => run.metrics)?.metrics?.refWordCount ?? 0;
@@ -628,9 +632,15 @@ export function buildTranscriptAggregateReportHtml(report: TranscriptReportData)
       const latency = engine.latencyCount ? engine.latencySum / engine.latencyCount : null;
       const rtf = engine.rtfCount ? engine.rtfSum / engine.rtfCount : null;
       const isStream = engine.transport === "stream";
+      const transportLabel =
+        engine.transport === "stream"
+          ? "stream · engine VAD"
+          : engine.transport === "file"
+            ? "file · whole recording"
+            : "chunks";
       return `<tr>
         <td><strong>${escapeHtml(engine.name)}</strong><br>
-            <span class="sub">${escapeHtml(isStream ? "stream · engine VAD" : "chunks")}</span></td>
+            <span class="sub">${escapeHtml(transportLabel)}</span></td>
         <td class="num">${engine.recordings}</td>
         <td class="num">${ratePctOrDash(wer)}</td>
         <td class="num">${ratePctOrDash(werRaw)}</td>

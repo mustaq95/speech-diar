@@ -9,6 +9,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from apps.background_worker.transcription import (
     ASR_ENGINES,
     COMPARISON_ASR_IDS,
+    default_feed_mode,
+    feed_modes,
+    transport_for_mode,
     DEFAULT_TRANSCRIPTION_MODE,
     MODE_TO_ASR_ID,
     transport_for,
@@ -102,7 +105,25 @@ def frontend_config() -> dict[str, object]:
                     "asrId": asr_id,
                     "name": ASR_ENGINES[asr_id].name,
                     "mode": ASR_ENGINES[asr_id].mode,
-                    "transport": transport_for(asr_id),
+                    # The DEFAULT feed mode and the transport it produces, which
+                    # is what a session gets when the operator does not pick.
+                    # `feedModes` is what they may pick from -- one entry means
+                    # there is no choice to offer and the UI shows no control.
+                    "feedMode": default_feed_mode(asr_id),
+                    "feedModes": list(feed_modes(asr_id)),
+                    # BOTH transports, because the transport is a function of the
+                    # mode and the UI has to relabel the moment the operator flips
+                    # the control. Sent rather than derived in the browser so the
+                    # mapping lives in exactly one place (`transport_for_mode`).
+                    "liveTransport": transport_for_mode(asr_id, "live"),
+                    "batchTransport": transport_for_mode(asr_id, "batch"),
+                    # The default mode's transport. Kept for callers that read one
+                    # transport per engine (the scorecard and report fall back to
+                    # it when a run predates its own transport column).
+                    "transport": (
+                        transport_for_mode(asr_id, default_feed_mode(asr_id) or "live")
+                        or transport_for(asr_id)
+                    ),
                     "configured": ASR_ENGINES[asr_id].configured(settings),
                 }
                 for asr_id in COMPARISON_ASR_IDS
@@ -111,6 +132,11 @@ def frontend_config() -> dict[str, object]:
             "recordSampleRate": settings.live_record_sample_rate,
             "recordBlockSamples": settings.live_record_block_samples,
             "chunkIntervalSec": settings.live_chunk_default_sec,
+            # The BATCH path's cut size, which is a different setting from the
+            # live one above and only coincidentally equal to it. Sent so a panel
+            # showing an engine in batch mode can label the interval it will
+            # actually use instead of echoing the live slider.
+            "batchSegmentSec": settings.batch_segment_seconds,
             "chunkIntervalMinSec": settings.live_chunk_min_sec,
             "chunkIntervalMaxSec": settings.live_chunk_max_sec,
             "socketOpenTimeoutSec": settings.live_socket_open_timeout_sec,

@@ -182,3 +182,49 @@ def test_cer_is_finer_grained_than_wer() -> None:
     result = score("transcription", "transcriptoin")
     assert result.wer == pytest.approx(1.0)
     assert result.cer < 0.3
+
+
+# --- Real-time factor per transport ------------------------------------------
+#
+# The gate here tested `transport != "chunks"` while "chunks" and "stream" were
+# the only two transports, which reads identically to "not a stream" and is not.
+# Adding "file" dropped its RTF to NULL, and the scorecard printed "—" for a
+# figure that had in fact been measured (883 ms of inference over 54.8 s of
+# audio). Verified live before it was fixed.
+
+
+def _row(transport: str, *, asr_ms=None, chunk_latencies=None):
+    from packages.database.models import TranscriptResult
+
+    return TranscriptResult(
+        audio_file_id=1, asr_id="x", status="done", transport=transport,
+        text="one two three", asr_ms=asr_ms, chunk_latencies_ms=chunk_latencies,
+    )
+
+
+def test_a_file_transport_reports_a_real_time_factor() -> None:
+    """One call over the whole recording is exactly where RTF means something:
+    there is no waiting-for-a-speaker time folded into the wall clock."""
+    from apps.background_worker.transcription.scoring import _real_time_factor
+
+    rtf = _real_time_factor(_row("file", asr_ms=883), 54.8)
+
+    assert rtf is not None, "a file transport measured its own time; RTF is not unmeasurable"
+    assert rtf == pytest.approx(0.883 / 54.8)
+
+
+def test_a_stream_transport_reports_no_real_time_factor() -> None:
+    """Unchanged, and the reason it is None is different in kind: a real-time
+    protocol consumes audio at 1x, so the quotient measures the protocol."""
+    from apps.background_worker.transcription.scoring import _real_time_factor
+
+    assert _real_time_factor(_row("stream", asr_ms=5000), 54.8) is None
+
+
+def test_a_chunked_transport_prefers_summed_chunk_latencies() -> None:
+    """Still the inference time, not the capture wall clock."""
+    from apps.background_worker.transcription.scoring import _real_time_factor
+
+    rtf = _real_time_factor(_row("chunks", asr_ms=99999, chunk_latencies=[400, 600]), 50.0)
+
+    assert rtf == pytest.approx(1.0 / 50.0)

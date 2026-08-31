@@ -119,13 +119,34 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .record-clock { font-size: 20px; font-variant-numeric: tabular-nums; }
 .record-wave { flex: 1; min-width: 0; height: 44px; display: flex; align-items: center; gap: 2px; overflow: hidden; border-radius: 8px; background: var(--panel-2); padding: 0 8px; }
 .record-wave i { flex: 0 0 2px; background: var(--accent); border-radius: 2px; min-height: 3px; }
-.engine-panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; margin-bottom: 0; flex: 1; min-height: 0; }
+/* `flex: 1` so the panels fill the page while a recording is running and there is
+   room to spare. NOT `min-height: 0`, which is what it used to say: that let this
+   grid shrink to 121px while its own content was 548px, and since overflow is
+   visible the panels kept PAINTING over the scorecard laid out beneath them. The
+   transcripts looked lost after Stop; they were on screen, underneath the Eval
+   result card. It also defeated the page's own scrollbar, because nothing
+   overflowed the flex container for `.page { overflow: auto }` to act on.
+   `min-height: auto` (the flex default) floors this at its content, so the page
+   scrolls instead of stacking two things in one place. */
+.engine-panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; margin-bottom: 0; flex: 1; }
 .engine-panel { display: flex; flex-direction: column; gap: 12px; }
 .engine-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
 .engine-name { display: inline-flex; align-items: center; gap: 8px; font-weight: 650; font-size: 14px; }
 .engine-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); display: inline-block; }
 .engine-dot.stream { background: var(--good); }
 .engine-dot.chunks { background: var(--accent); }
+.engine-dot.file { background: var(--warn); }
+/* Right side of an engine head: the measured stats, plus a mode toggle for the
+   one engine that has a choice. Sized down from .segmented so it sits on the
+   head's line instead of growing it. */
+.engine-head-right { display: flex; align-items: center; gap: 10px; }
+.engine-head-right .segmented { padding: 2px; gap: 2px; }
+.engine-head-right .segmented button { padding: 3px 8px; font-size: 10.5px; }
+/* A scorecard row whose engine the worker has not finished. Dimmed rather than
+   hidden: the engine is part of this comparison and its absence is temporary, so
+   the row holds its place instead of the table reflowing when it lands. */
+.score-row.is-pending { opacity: .45; }
+.score-row.is-pending .score-bar i { background: var(--dim); }
 .engine-dot.single { background: var(--accent); }
 /* Every coloured element in a TTS card reads --engine, set once per panel in
    TtsStudio from the engine's delivery (stream=green, single=blue). */

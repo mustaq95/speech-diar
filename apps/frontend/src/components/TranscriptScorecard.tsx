@@ -121,7 +121,14 @@ export function TranscriptScorecard({ runs, engines, referenceWords }: Transcrip
               <span className="eyebrow">Bar length = better score</span>
               {runs.map((run) => {
                 const value = tile.valueOf(run);
-                const reason = tile.unavailable?.(run) ?? null;
+                // A run the worker has not finished yet reports THAT, ahead of
+                // any per-tile reason: "—" beside a finished engine's number
+                // reads as "this engine scored nothing", which is a different
+                // claim from "this engine has not answered yet".
+                const pending = run.status === "queued" || run.status === "running";
+                const reason = pending
+                  ? (run.status === "running" ? "transcribing…" : "queued…")
+                  : tile.unavailable?.(run) ?? null;
                 // Bar length is share-of-best, so the better engine is always the
                 // fuller bar regardless of which direction is good.
                 let fill = 0;
@@ -132,7 +139,7 @@ export function TranscriptScorecard({ runs, engines, referenceWords }: Transcrip
                 }
                 const transport = transportOf(run);
                 return (
-                  <div className="score-row" key={run.asrId}>
+                  <div className={`score-row${pending ? " is-pending" : ""}`} key={run.asrId}>
                     <div className="score-row-head">
                       <span>
                         <span className={`engine-dot ${transport ?? ""}`} aria-hidden="true" />
@@ -150,9 +157,15 @@ export function TranscriptScorecard({ runs, engines, referenceWords }: Transcrip
                     <small className="score-transport mono">
                       {transport === "stream"
                         ? "stream · VAD"
-                        : run.chunkIntervalSec
-                          ? `chunks · ${run.chunkIntervalSec.toFixed(1)}s`
-                          : "chunks"}
+                        : transport === "file"
+                          // Never falls through to "chunks": this engine was fed the
+                          // whole recording in one call, after the fact, and reading
+                          // it as a chunked live run would credit it with a boundary
+                          // cost it never paid.
+                          ? "file · whole recording"
+                          : run.chunkIntervalSec
+                            ? `chunks · ${run.chunkIntervalSec.toFixed(1)}s`
+                            : "chunks"}
                       {run.source ? ` · ${run.source}` : ""}
                     </small>
                   </div>

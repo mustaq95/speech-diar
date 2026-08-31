@@ -251,11 +251,37 @@ class Settings(BaseSettings):
     # instead of by the cap.
     cohere_transcribe_url: str = "http://localhost:9025"
     cohere_transcribe_timeout_sec: int = 1800
-    # Empty = auto-detect (correct for both English and Arabic). A non-empty
-    # value FORCES that language as a decoder prompt the model obeys over the
-    # audio, so "ar" makes English recordings hallucinate Arabic and "en" would
-    # break Arabic ones. Only set it to force a known single-language batch.
-    cohere_transcribe_language: str = ""
+    # "ar", and EMPTY IS NOT A NEUTRAL VALUE HERE. Do not "clean this up" back to
+    # "" -- that is the bug this default exists to prevent.
+    #
+    # THIS MODEL HAS NO AUTO-DETECT. Probed 2026-08-31 against the container:
+    #
+    #     language=auto -> 400 "Unsupported language: 'auto'. Must be one of
+    #     ['en','fr','de','es','pt','it','nl','pl','el','ar','ko','ja','vi','zh']"
+    #
+    # Omitting the field does not mean "detect it". It makes the model settle on
+    # ONE language from the content, and which one depends on the audio:
+    #
+    #   mostly-Arabic conversation   -> Arabic (391 chars on the committed sample)
+    #   code-switched within sentences -> ENGLISH, TRANSLATING the Arabic away
+    #                                   (0 chars on a real Mixed-50/50 read-aloud,
+    #                                    at 3 s, 10 s, 20 s, 30 s AND 45 s)
+    #
+    # The second case is what this surface normally produces, and it is not a
+    # short-audio effect -- no chunk size avoids it. That is the whole reason this
+    # default is not "".
+    #
+    # "ar" is what turns the Arabic path on, and it does NOT force everything to
+    # Arabic: it code-switches, leaving English as English ("...coordination in
+    # مصدر city hit 94%..."). On one real read-aloud recording it moved that
+    # engine from 97.2% WER (0 Arabic characters) to 15.3% (372 Arabic + 307
+    # Latin), i.e. from worst of three engines to best.
+    #
+    # The one measured cost: on PURE-ENGLISH audio "ar" is clean whole-file (0
+    # Arabic characters over 54 s) but leaks Arabic into 6 of 18 3 s chunks. That
+    # is a live-chunked English-only run only, and it is the reason this is called
+    # out rather than silently set.
+    cohere_transcribe_language: str = "ar"
 
     # --- Inception-STT (via the LiteLLM gateway) ---
     # A request/response transcription gateway, OpenAI-compatible
@@ -271,9 +297,12 @@ class Settings(BaseSettings):
     stt_model: str = "inception-stt"
     # "" or "auto" BOTH mean auto-detect, and both omit the field from the
     # request entirely (see STT_AUTO_LANGUAGES in the runner). A real language
-    # code is a decoder prompt the model obeys over the audio, which is how
-    # cohere_transcribe_language above hallucinates Arabic across English
-    # recordings. Mixed ar/en audio must never force one.
+    # code is a decoder prompt the model obeys over the audio; on the cohere
+    # engine, forcing "ar" leaks Arabic into 6 of 18 short ENGLISH chunks (it is
+    # clean on whole files). Mixed ar/en audio must never force one here.
+    #
+    # Unlike cohere-transcribe, this gateway's omit-the-field really is
+    # auto-detect rather than "emit English" -- do not carry that finding across.
     stt_default_language: str = "auto"
     stt_timeout_seconds: float = 120
     # How long a piece of audio may be in ONE call to this gateway.
@@ -305,6 +334,28 @@ class Settings(BaseSettings):
     # transcript away for fewer requests.
     batch_segment_seconds: float = 3
     batch_max_concurrency: int = 4
+    # Send the WHOLE recording in one call on the stored-audio (batch) path,
+    # instead of splitting it at batch_segment_seconds above.
+    #
+    # This deliberately overrides the table above, and it costs transcript. The
+    # comparison surface wants both engines given the same input in batch mode --
+    # cohere-transcribe's native mode is a single whole-file POST, so Inception
+    # matching it is what makes that an apples-to-apples measurement. Measured
+    # 2026-08-31 on one 65 s bilingual recording:
+    #
+    #     3 s segments -> 140 words (reference 144), WER 0.368
+    #     whole file   ->  65 words, HTTP 200, no error
+    #
+    # ~54% of the transcript is discarded silently, which matches the 100 s row of
+    # the table above (51 words vs 219). So an Inception batch WER is substantially
+    # a measurement of this gateway's truncation, and the UI says so next to it.
+    #
+    # A flag, not a deletion: the split path is a hard-won safeguard and this is
+    # the only way back to the 140-word result. It also drives the reported
+    # transport (see `transport_for`), so the label can never disagree with what
+    # actually ran. LIVE chunking is unaffected -- both engines still take 3 s
+    # chunks there, which is the symmetric comparison on the live side.
+    inception_batch_whole_file: bool = True
     # How long an idle connection to the gateway is kept alive for reuse.
     #
     # This is a latency setting, not a resource one. httpx's module-level

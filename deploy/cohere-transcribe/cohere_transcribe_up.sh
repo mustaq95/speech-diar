@@ -16,7 +16,13 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="$ROOT/cohere-transcribe.env"
-COMPOSE="docker compose -f $ROOT/docker-compose.cohere-transcribe.yml"
+# The REPO-ROOT compose file, which `include`s this folder's, so this script and
+# `docker compose up -d` produce the same container in the same project. Pointing
+# it at the local file instead creates a second project that owns a container of
+# the same name, and whichever runs second dies on a name conflict.
+REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
+COMPOSE="docker compose -f $REPO_ROOT/docker-compose.yml"
+SERVICE="cohere-transcribe"
 
 wait_for_ready() {
   local url="$1"
@@ -50,10 +56,10 @@ if [[ -z "${HF_TOKEN:-}" || "${HF_TOKEN}" == "hf_..." ]]; then
 fi
 
 echo "==> Building cohere-transcribe image..."
-$COMPOSE build
+$COMPOSE build "$SERVICE"
 
 echo "==> Starting cohere-transcribe..."
-$COMPOSE up -d
+$COMPOSE up -d "$SERVICE"
 
 PORT="${COHERE_TRANSCRIBE_PORT:-9025}"
 if wait_for_ready "http://localhost:${PORT}/health" 80; then
@@ -64,6 +70,6 @@ if wait_for_ready "http://localhost:${PORT}/health" 80; then
   echo "        -F response_format=json -F temperature=0"
 else
   echo "Timed out waiting for readiness. Check logs:"
-  echo "  $COMPOSE logs -f cohere-transcribe"
+  echo "  $COMPOSE logs -f $SERVICE"
   exit 1
 fi

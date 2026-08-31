@@ -1,5 +1,25 @@
-# Local development environment: database, queue broker, and object storage.
+# Local development environment: database, queue broker, object storage, and the
+# on-host ASR container.
 # Usage (from repo root): docker compose up -d
+#
+# `include` rather than a copy of the service: the cohere-transcribe definition
+# stays the single source of truth in its own deploy/ folder (its build context,
+# vLLM flags and volumes are all relative to that directory, and `include`
+# resolves them there). Editing it in one place still changes both entry points.
+#
+# It is here because "not configured" on the Transcript surface is almost always
+# just this container being down, and it was the one piece of infrastructure the
+# repo expected you to start by hand. It already declares `restart:
+# unless-stopped`, so once up it stays up across reboots and crashes exactly like
+# postgres and redis. An explicit `docker stop` still wins, by design.
+#
+# GPU HOSTS ONLY. The service declares `gpus: all`, so on a machine without one
+# `docker compose up -d` will fail on this service. Bring up just the plain infra
+# there with:
+#     docker compose up -d postgres redis minio
+include:
+  - deploy/cohere-transcribe/docker-compose.cohere-transcribe.yml
+
 services:
   postgres:
     image: postgres:16-alpine

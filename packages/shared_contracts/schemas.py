@@ -35,10 +35,18 @@ TranscriptionMode = Literal["online", "offline"]
 TranscriptSource = Literal["live", "batch"]
 
 #: What the audio travelled over for a given engine. `stream` is continuous with
-#: engine-side VAD; `chunks` is fixed-interval cuts. A chunked engine carries its
-#: boundary cost inside its own error rate, so every figure is labelled with this
-#: and the two transports' chunk statistics are NOT comparable to each other.
-TranscriptTransport = Literal["stream", "chunks"]
+#: engine-side VAD; `chunks` is fixed-interval cuts; `file` is the whole recording
+#: in one call, after the fact. A chunked engine carries its boundary cost inside
+#: its own error rate, so every figure is labelled with this and the transports'
+#: chunk statistics are NOT comparable to each other.
+#:
+#: `file` is not a live transport and its engine is fed nothing while the operator
+#: reads: it runs once over the stored audio at finalize. It exists because an
+#: engine whose native mode is a whole-file POST should be measured in that mode
+#: -- cohere-transcribe's `run()` posts the recording in one call and does no
+#: splitting, so "chunks" would misdescribe it. It is a second honest pipeline,
+#: not a workaround: that engine's live chunked path works too.
+TranscriptTransport = Literal["stream", "chunks", "file"]
 
 #: Where a reference transcript came from. `script` was generated and read aloud,
 #: so the words were known before the audio existed; `pasted` was supplied by

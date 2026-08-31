@@ -46,14 +46,21 @@ from sqlalchemy.orm import Session
 from apps.background_worker.transcription import (
     ASR_ENGINES,
     COMPARISON_ASR_IDS,
+    feed_modes,
     live_session,
     resolve_asr_ids,
+    resolve_feed_mode,
     transport_for,
+    transport_for_mode,
 )
 from apps.background_worker.transcription import scoring
-from apps.background_worker.transcription.inception import runner as inception_runner
 from apps.backend_api.dependencies import get_current_user, get_db
-from apps.backend_api.routers.evaluations import _transcript_run as transcript_run_contract
+from apps.backend_api.routers.evaluations import (
+    _queue_transcript,
+    _transcript_run as transcript_run_contract,
+)
+from apps.background_worker.queue_app import queue
+from apps.background_worker.transcription.pipeline import run_asr
 from packages import script_gen
 from packages.config.settings import get_settings
 from apps.backend_api.routers.upload import attach_audio, store_recording
@@ -210,6 +217,7 @@ def open_session(
     asr_ids: list[str] | None = Body(None, embed=True, alias="asrIds"),
     chunk_interval_sec: float | None = Body(None, embed=True, alias="chunkIntervalSec"),
     reference_text: str = Body("", embed=True, alias="referenceText"),
+    modes: dict[str, str] | None = Body(None, embed=True, alias="modes"),
     current_user: User = Depends(get_current_user),
 ) -> dict[str, object]:
     """Open a live read-aloud session and return its id.
@@ -231,6 +239,17 @@ def open_session(
             status_code=422, detail=f"Not configured on this host: {unconfigured}"
         )
 
+    # Resolved once, here, and stored on the session: an engine that offers more
+    # than one feed mode must run the whole recording in the one picked at Start,
+    # not in whatever the control says by the time finalize arrives.
+    try:
+        chosen = {
+            asr_id: resolve_feed_mode(asr_id, (modes or {}).get(asr_id))
+            for asr_id in resolved
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     interval = chunk_interval_sec or settings.live_chunk_default_sec
     if not settings.live_chunk_min_sec <= interval <= settings.live_chunk_max_sec:
         raise HTTPException(
@@ -239,7 +258,7 @@ def open_session(
                    f"and {settings.live_chunk_max_sec}",
         )
 
-    session_id = live_session.create(resolved, interval, reference_text)
+    session_id = live_session.create(resolved, interval, reference_text, modes=chosen)
     return {
         "sessionId": session_id,
         "asrIds": resolved,
@@ -249,7 +268,13 @@ def open_session(
             {
                 "asrId": asr_id,
                 "name": ASR_ENGINES[asr_id].name,
-                "transport": transport_for(asr_id),
+                # The mode this SESSION runs in, and the transport that mode
+                # actually produces -- the browser keys its feeding on the pair,
+                # so a mismatch here would feed an engine over a route its own
+                # session refuses.
+                "feedMode": chosen[asr_id],
+                "feedModes": list(feed_modes(asr_id)),
+                "transport": transport_for_mode(asr_id, chosen[asr_id]),
             }
             for asr_id in resolved
         ],
@@ -276,12 +301,34 @@ async def transcribe_chunk(
     """
     if not live_session.exists(session_id):
         raise HTTPException(status_code=404, detail="Unknown or expired session")
-    if asr_id not in ASR_ENGINES:
+    engine = ASR_ENGINES.get(asr_id)
+    if engine is None:
         raise HTTPException(status_code=422, detail=f"Unknown ASR engine {asr_id!r}")
+    # Dispatch on asr_id, never on a hardcoded runner. The result is filed under
+    # asr_id a few lines below, so an engine mismatch here would store one
+    # engine's text and latency under another's name at 200 OK -- invisible
+    # except as two identical columns on the scorecard.
+    if engine.run_chunk is None or engine.chunk_text is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{engine.name} has no chunk transport; it is not fed by this route",
+        )
+    # An engine that CAN be chunked but whose session runs it in batch must not be
+    # fed here either: the chunk would be transcribed and stored, and the row would
+    # carry live chunk timings while `run_asr` also wrote it from storage. The
+    # session's pick is the authority, not the engine's capability.
+    session_meta = live_session.meta(session_id) or {}
+    mode = (session_meta.get("modes") or {}).get(asr_id)
+    if mode and mode != "live":
+        raise HTTPException(
+            status_code=422,
+            detail=f"{engine.name} is running in {mode!r} mode for this session; "
+                   "it is not fed by this route",
+        )
 
     payload = await file.read()
     try:
-        # run_in_threadpool, NOT a bare call: `transcribe_bytes` blocks on
+        # run_in_threadpool, NOT a bare call: the engine's chunk call blocks on
         # httpx.post for as long as the gateway takes, and this handler is
         # `async def`, so calling it directly blocks the whole event loop.
         #
@@ -291,19 +338,23 @@ async def transcribe_chunk(
         # starved (3 words captured over two minutes of speech) and finalize sat
         # behind every queued chunk, which is what made Stop look like it hung.
         entry = await run_in_threadpool(
-            inception_runner.transcribe_bytes, payload, file.filename or "chunk.wav"
+            engine.run_chunk, payload, file.filename or "chunk.wav"
         )
-    except inception_runner.InceptionError as exc:
+    except Exception as exc:
         # Recorded as an empty chunk rather than swallowed: the call was made and
         # took time, so the chunk count stays truthful, and the error reaches the
         # panel instead of looking like silence.
+        #
+        # Broad, because each engine raises its own error type and this route no
+        # longer knows which engine it just called. Re-raised as a 502 either
+        # way, so nothing is being swallowed by the width.
         await run_in_threadpool(
             partial(live_session.append_part, session_id, asr_id,
                     index=chunk_index, text="", latency_ms=0, raw=None)
         )
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    text = inception_runner.text_of(entry)
+    text = engine.chunk_text(entry)
     latency_ms = int(entry.get("latency_ms") or 0)
     await run_in_threadpool(
         partial(live_session.append_part, session_id, asr_id,
@@ -633,7 +684,47 @@ def _persist_session(
                 existing.params = params
 
     rows: list[TranscriptResult] = []
+    # How this session actually ran each engine, resolved at open time. Falls back
+    # to "live" only for a session opened before the field existed, which is what
+    # every such session was.
+    session_modes: dict[str, str] = session.get("modes") or {}
     for asr_id in session["asr_ids"]:
+        mode = session_modes.get(asr_id) or "live"
+        if mode == "batch":
+            # Fed NOTHING while the operator read: this engine runs once over the
+            # stored recording instead, and reaches done|failed on its own like any
+            # stored-audio run.
+            #
+            # `_queue_transcript` stamps it source="batch", which is the honest
+            # label and, with `transport`, says everything the mode did: the
+            # reference and therefore the error rates are the same as the live
+            # engines', the timings are not. For cohere the transport also changes
+            # (file, one whole-file call); for inception-stt it does not (still
+            # chunks, cut at BATCH_SEGMENT_SECONDS, just from storage).
+            try:
+                rows.append(_queue_transcript(db, audio_file, asr_id, get_settings()))
+            except HTTPException as exc:
+                # The engine was checked at open_session; if it has gone away since
+                # (its container stopped mid-reading), that must not cost the live
+                # engines their transcripts. Those were measured while someone was
+                # speaking and cannot be reproduced -- this one runs over stored
+                # audio and can be re-run from the recording at any time.
+                logger.warning(
+                    "Could not queue %s at finalize for audio_file_id=%s: %s",
+                    asr_id, audio_file.id, exc.detail,
+                )
+                rows.append(TranscriptResult(
+                    audio_file_id=audio_file.id, asr_id=asr_id, status="failed",
+                    source="batch", transport="file", error=str(exc.detail),
+                ))
+                db.add(rows[-1])
+            continue
+        # Live from here down. The transport is derived from the mode rather than
+        # read from ASR_TRANSPORTS, which is the BATCH half: cohere is chunks live
+        # and file in batch, so the static map would mislabel a live cohere run.
+        # (The batch branch above does not need this -- `_queue_transcript` stamps
+        # the transport `run_asr` genuinely uses.)
+        live_transport = transport_for_mode(asr_id, mode) or transport_for(asr_id)
         captured = live_session.transcript(session_id, asr_id)
         row = TranscriptResult(
             audio_file_id=audio_file.id,
@@ -642,7 +733,7 @@ def _persist_session(
             # wait for, and showing "queued" would imply one was coming.
             status="done",
             source="live",
-            transport=transport_for(asr_id),
+            transport=live_transport,
             text=captured["text"],
             chunk_count=captured["chunk_count"],
             chunk_latencies_ms=captured["chunk_latencies_ms"],
@@ -650,7 +741,7 @@ def _persist_session(
             avg_latency_ms=captured["avg_latency_ms"],
             # Only meaningful for a chunked transport; a stream has no interval.
             chunk_interval_sec=(
-                session["chunk_interval_sec"] if transport_for(asr_id) == "chunks" else None
+                session["chunk_interval_sec"] if live_transport == "chunks" else None
             ),
             asr_ms=captured["total_latency_ms"],
             # Native output, verbatim, exactly as the stored-audio pipeline keeps
@@ -663,4 +754,9 @@ def _persist_session(
         rows.append(row)
 
     db.commit()
+    # After the commit, so a job can never start against a row that is not yet
+    # visible to the worker's own session. Same ordering as `start_transcripts`.
+    for row in rows:
+        if row.status == "queued":
+            queue.enqueue(run_asr, audio_file.id, row.asr_id)
     return rows

@@ -72,12 +72,22 @@ def _real_time_factor(row: TranscriptResult, audio_duration_sec: float | None) -
     1x by definition, so the quotient would be ~1.0 no matter how fast the model
     is and would say nothing about it. NULL is what makes the UI print
     "real-time bound" instead of a number that looks like a measurement.
+
+    Every OTHER transport gets one. This tested `transport != "chunks"` while
+    "chunks" and "stream" were the only two, which reads the same as excluding
+    the stream and is not: adding "file" silently dropped an RTF that is not only
+    measurable but is the single most meaningful speed figure that engine has
+    (one call, whole recording, no waiting on a speaker). It rendered as "—",
+    which is the blank this codebase is not allowed to print for something it
+    did measure.
     """
-    if row.transport != "chunks" or not audio_duration_sec:
+    if row.transport == "stream" or not audio_duration_sec:
         return None
     # Prefer the summed per-chunk latencies (what was actually spent on inference)
     # over the run's wall clock, which on a live capture includes the time spent
-    # waiting for someone to finish speaking.
+    # waiting for someone to finish speaking. A file transport has no per-chunk
+    # latencies, so it falls through to asr_ms -- which for it is the whole
+    # measurement, not a fallback: one call, timed end to end.
     total_ms = sum(row.chunk_latencies_ms or []) or row.asr_ms
     if not total_ms:
         return None

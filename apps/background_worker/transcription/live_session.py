@@ -55,11 +55,21 @@ def _parts_key(session_id: str, asr_id: str) -> str:
     return f"{_PREFIX}:{session_id}:{asr_id}:parts"
 
 
-def create(asr_ids: list[str], chunk_interval_sec: float, reference_text: str = "") -> str:
+def create(
+    asr_ids: list[str],
+    chunk_interval_sec: float,
+    reference_text: str = "",
+    modes: dict[str, str] | None = None,
+) -> str:
     """Open a session and return its id.
 
     `started_at` is stamped here so the session's own elapsed time is measured
     from the server, not reconstructed from client clocks.
+
+    `modes` is the per-engine feed mode (live|batch) RESOLVED at open time and
+    kept here for the whole run. It is stored rather than re-derived at finalize
+    for the same reason `asr_id` travels as a job argument: the operator can flip
+    the control after starting, and what gets labelled must be what actually ran.
     """
     session_id = uuid.uuid4().hex
     ttl = _settings.live_session_ttl_sec
@@ -68,6 +78,7 @@ def create(asr_ids: list[str], chunk_interval_sec: float, reference_text: str = 
         "chunk_interval_sec": str(chunk_interval_sec),
         "reference_text": reference_text,
         "started_at": str(time.time()),
+        "modes": json.dumps(modes or {}),
     }
     pipe = _redis.pipeline()
     pipe.hset(_meta_key(session_id), mapping=mapping)
@@ -92,6 +103,9 @@ def meta(session_id: str) -> dict[str, Any] | None:
         "chunk_interval_sec": float(decoded.get("chunk_interval_sec", 0) or 0),
         "reference_text": decoded.get("reference_text", ""),
         "started_at": float(decoded.get("started_at", 0) or 0),
+        # Sessions opened before this field existed have none; callers fall back
+        # to the engine's default rather than crashing on a mid-flight upgrade.
+        "modes": json.loads(decoded.get("modes", "{}")),
     }
 
 

@@ -6,6 +6,8 @@ fails silently at runtime (dropped at upload, or run in-process without a
 container); these tests turn every mismatch into a loud pytest failure.
 """
 
+from types import SimpleNamespace
+
 from apps.background_worker.lanes import LANE_MAP
 from apps.background_worker.models import REGISTRY
 from apps.background_worker.supervisor.registry import _registry
@@ -56,7 +58,110 @@ def test_every_asr_engine_declares_a_transport() -> None:
 
     for asr_id in ASR_ENGINES:
         assert asr_id in ASR_TRANSPORTS, f"{asr_id!r} is registered but declares no transport"
-        assert ASR_TRANSPORTS[asr_id] in ("stream", "chunks")
+        assert ASR_TRANSPORTS[asr_id] in ("stream", "chunks", "file")
+
+
+def test_an_engine_can_be_chunked_exactly_when_its_live_transport_says_so() -> None:
+    """The chunk route dispatches on `run_chunk`, and the transport label is what
+    every surface prints beside the figure. If the two disagree, one of them is
+    lying about how the audio reached the engine.
+
+    Fails against the version of `POST /transcript/chunk` that called the
+    inception runner unconditionally: there, an engine could be labelled "chunks"
+    with no chunk entry point of its own and still return 200 OK, storing
+    Inception's text and latency under its own name."""
+    from apps.background_worker.transcription import ASR_ENGINES, LIVE_TRANSPORTS
+
+    for asr_id, engine in ASR_ENGINES.items():
+        chunkable = engine.run_chunk is not None and engine.chunk_text is not None
+        assert chunkable == (LIVE_TRANSPORTS[asr_id] == "chunks"), (
+            f"{asr_id!r} has a chunk entry point={chunkable} but its live transport is "
+            f"{LIVE_TRANSPORTS[asr_id]!r}; the live chunk route dispatches on the entry "
+            "point and every surface prints the transport, so the two must agree"
+        )
+
+
+def test_every_engine_declares_a_feed_mode_and_a_transport_for_each() -> None:
+    """An engine with no modes cannot be put in a session at all, and one whose
+    mode maps to no transport would render a run with a blank transport label."""
+    from apps.background_worker.transcription import (
+        ASR_ENGINES,
+        ASR_FEED_MODES,
+        ASR_TRANSPORTS,
+        LIVE_TRANSPORTS,
+        transport_for,
+        transport_for_mode,
+    )
+
+    for asr_id in ASR_ENGINES:
+        modes = ASR_FEED_MODES.get(asr_id)
+        assert modes, f"{asr_id!r} declares no feed mode"
+        assert modes[0] == "live", f"{asr_id!r} must default to live, not {modes[0]!r}"
+        for mode in modes:
+            assert mode in ("live", "batch")
+            assert transport_for_mode(asr_id, mode) in ("stream", "chunks", "file"), (
+                f"{asr_id!r} in {mode!r} maps to no known transport"
+            )
+        # The batch half must agree with what `run_asr` genuinely does, which is
+        # what `transport_for` resolves -- NOT the raw ASR_TRANSPORTS entry.
+        # inception-stt's batch transport comes from INCEPTION_BATCH_WHOLE_FILE,
+        # so the dict holds only one of its two values and reading it directly is
+        # how a label starts describing a run that did not happen.
+        assert transport_for_mode(asr_id, "batch") == transport_for(asr_id)
+        assert transport_for_mode(asr_id, "live") == LIVE_TRANSPORTS[asr_id]
+        assert ASR_TRANSPORTS[asr_id] in ("stream", "chunks", "file")
+
+
+def test_inception_batch_transport_follows_its_setting() -> None:
+    """The label and the behaviour are driven by one switch, in both positions.
+
+    `run()` sends the whole file when INCEPTION_BATCH_WHOLE_FILE is on and splits
+    when it is off; `transport_for` must say "file" and "chunks" to match. A
+    static entry beside the flag is the bug this asserts against -- the row would
+    be stamped "chunks" while the engine swallowed the recording whole.
+    """
+    import apps.background_worker.transcription as transcription
+    from packages.config.settings import get_settings
+
+    real = get_settings()
+    for whole_file, expected in ((True, "file"), (False, "chunks")):
+        fake = SimpleNamespace(inception_batch_whole_file=whole_file)
+        original = transcription.get_settings
+        transcription.get_settings = lambda: fake
+        try:
+            assert transcription.transport_for("inception-stt") == expected
+            assert transcription.transport_for_mode("inception-stt", "batch") == expected
+            # Live is unaffected either way: both engines chunk at 3s there.
+            assert transcription.transport_for_mode("inception-stt", "live") == "chunks"
+        finally:
+            transcription.get_settings = original
+    assert transcription.transport_for("inception-stt") == (
+        "file" if real.inception_batch_whole_file else "chunks"
+    )
+
+
+def test_a_batch_mode_engine_can_actually_run_over_stored_audio() -> None:
+    """Offering batch means `run_asr` will call `engine.run(path)` on the whole
+    recording. An engine listed for batch with no working `run` would queue a job
+    that dies in a worker instead of failing at the request."""
+    from apps.background_worker.transcription import ASR_ENGINES, ASR_FEED_MODES
+
+    for asr_id, engine in ASR_ENGINES.items():
+        if "batch" in ASR_FEED_MODES[asr_id]:
+            assert callable(engine.run), f"{asr_id!r} offers batch but has no run()"
+
+
+def test_no_feed_mode_is_declared_for_an_unregistered_engine() -> None:
+    from apps.background_worker.transcription import (
+        ASR_ENGINES,
+        ASR_FEED_MODES,
+        LIVE_TRANSPORTS,
+    )
+
+    for asr_id in ASR_FEED_MODES:
+        assert asr_id in ASR_ENGINES, f"feed modes declared for unregistered {asr_id!r}"
+    for asr_id in LIVE_TRANSPORTS:
+        assert asr_id in ASR_ENGINES, f"live transport declared for unregistered {asr_id!r}"
 
 
 def test_no_transport_is_declared_for_an_unregistered_engine() -> None:

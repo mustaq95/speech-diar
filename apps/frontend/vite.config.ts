@@ -1,8 +1,11 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   plugins: [react()],
+  // Dev-only: pre-bundle agentation at server start so the first page load does
+  // not trigger a mid-session re-optimize (stale dep chunk errors).
+  optimizeDeps: mode === "development" ? { include: ["agentation"] } : undefined,
   server: {
     proxy: {
       "/api": {
@@ -18,4 +21,4 @@ export default defineConfig({
       },
     },
   },
-});
+}));
