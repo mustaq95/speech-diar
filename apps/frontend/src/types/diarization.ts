@@ -303,6 +303,10 @@ export interface TranscriptRun {
   // --- transcript evaluation: how this run was produced, and how it scored ---
   /** live (read-aloud capture) or batch (stored audio). */
   source: TranscriptSource;
+  /** A live row obtained by replaying stored audio through the chunk route rather than
+   *  by someone reading aloud. Its text is comparable; its latencies are the gateway's
+   *  round trip, not lag behind a speaker. Always false for batch. */
+  replayed: boolean;
   /** stream or chunks — label every figure with it; the two are not comparable. */
   transport?: TranscriptTransport;
   /** Cut interval for a chunked transport; undefined for a stream. */

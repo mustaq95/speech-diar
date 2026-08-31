@@ -330,7 +330,9 @@ def _enqueue_transcript(db: Session, audio_file: AudioFile) -> None:
     try:
         db.add(TranscriptResult(audio_file_id=audio_file.id, asr_id=asr_id, status="queued"))
         db.commit()
-        queue.enqueue(run_asr, audio_file.id, asr_id)
+        # Explicitly batch: an auto transcript runs over the stored upload, and
+        # the row `_queue_transcript` just wrote is keyed on that.
+        queue.enqueue(run_asr, audio_file.id, asr_id, "batch")
     except Exception:
         logger.exception("Could not queue transcript for audio_file_id=%s", audio_file.id)
         db.rollback()

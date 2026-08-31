@@ -17,11 +17,21 @@ import {
   liveStreamUrl,
   openLiveSession,
   sendLiveChunk,
+  startTranscripts,
 } from "../adapters";
 import { startRecording, type Recorder } from "../recording";
 import { StoredRecordingScorer } from "./StoredRecordingScorer";
 import { TranscriptScorecard } from "./TranscriptScorecard";
 import { TtsStudio } from "./TtsStudio";
+
+/** A transcript row's identity: the engine AND the feed mode it ran in.
+ *
+ * One recording can hold both an engine's live measurement and its batch one
+ * (they are different measurements of the same engine, which is what this
+ * surface compares), so `asrId` alone does not identify a row. */
+function runKey(asrId: string, source: TranscriptSource): string {
+  return `${asrId}::${source}`;
+}
 
 /** Human labels for the .env-supplied option ids. An id with no label here still
  * renders (as itself), so adding one to .env never blanks a control. */
@@ -247,33 +257,33 @@ export function TranscriptStudio({
   // recording's stored runs. Same shape either way, so the scorecard is unchanged.
   const shownRuns: TranscriptRun[] | null = results ?? (viewingSaved ? savedRuns : null);
 
-  // A batch engine comes back from finalize as `queued` and is transcribed by a
-  // worker afterwards, so the results handed back at Stop are not the final ones.
-  // Nothing refetched them before, which is why a batch transcript never appeared
-  // in the live view at all -- the operator had to reopen the recording from
-  // Projects to see it.
+  // A batch engine is transcribed by a worker AFTER the call that created its row
+  // returns, so neither the finalize response nor the initial load of a saved
+  // recording holds its final state. Nothing refetched them before, which is why
+  // a batch transcript never appeared without reopening the recording.
   //
-  // Same shape as StoredRecordingScorer's poll: run only while something is
-  // actually in flight, on the host's own interval, and stop as soon as it settles.
-  const pendingRunIds = useMemo(
-    () => (results ?? [])
-      .filter((run) => run.status === "queued" || run.status === "running")
-      .map((run) => run.asrId),
-    [results],
+  // One poll for both sources, because "a row is still running" means the same
+  // thing whether it came from Stop or from a re-run on a stored recording.
+  // Same shape as StoredRecordingScorer's: only while something is actually in
+  // flight, on the host's own interval, stopped as soon as it settles.
+  const awaitingRuns = (shownRuns ?? []).some(
+    (run) => run.status === "queued" || run.status === "running",
   );
-  const awaitingBatch = pendingRunIds.length > 0;
-  const pendingAudioId = results?.[0]?.audioFileId ?? null;
+  const pollAudioId = results?.[0]?.audioFileId ?? audioFileId ?? null;
 
   useEffect(() => {
-    if (!awaitingBatch || pendingAudioId == null) return;
+    if (!awaitingRuns || pollAudioId == null) return;
     let cancelled = false;
     const timer = window.setInterval(() => {
       void (async () => {
         try {
-          const fresh = await fetchTranscripts(pendingAudioId);
-          // Replaces `results` wholesale: the rows the worker wrote are the
-          // authority once it has run, and the live ones are unchanged by it.
-          if (!cancelled && fresh.length) setResults(fresh);
+          const fresh = await fetchTranscripts(pollAudioId);
+          if (cancelled || !fresh.length) return;
+          // Into whichever source is on screen. `results` wins when a capture
+          // just finished, so it is refreshed there; otherwise this is a saved
+          // recording and its rows are the ones being watched.
+          if (results) setResults(fresh);
+          else setSavedRuns(fresh);
         } catch {
           // A failed poll is not worth surfacing — the next one recovers, or the
           // run's own error field explains what happened. Same call as the
@@ -285,9 +295,51 @@ export function TranscriptStudio({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [awaitingBatch, pendingAudioId, runtimeConfig?.pollIntervalMs]);
+    // `results` is read inside but must not restart the timer on every refresh:
+    // it changes identity each poll, which would clear and recreate the interval
+    // in a loop and never let a tick land.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [awaitingRuns, pollAudioId, runtimeConfig?.pollIntervalMs]);
+
+  // Run one engine over the STORED audio, for a recording where it never ran (or
+  // to re-run it). The row comes back queued and the poll above takes it from
+  // there, so the scorecard fills in on its own.
+  const [rerunning, setRerunning] = useState<string | null>(null);
+  const rerunEngine = useCallback(async (asrId: string, feedMode: TranscriptSource) => {
+    if (audioFileId == null || rerunning) return;
+    setRerunning(asrId);
+    setRunError(null);
+    try {
+      const started = await startTranscripts(
+        audioFileId,
+        [asrId],
+        { [asrId]: feedMode },
+        // The interval a live REPLAY cuts at. Sent so the run is cut at what the
+        // panel labels it with; a server default here is the same class of bug
+        // as echoing the live slider over a batch run.
+        feedMode === "live" ? chunkInterval : undefined,
+      );
+      const replaced = new Set(started.map((run) => runKey(run.asrId, run.source)));
+      const merge = (previous: TranscriptRun[]) => [
+        ...previous.filter((run) => !replaced.has(runKey(run.asrId, run.source))),
+        ...started,
+      ];
+      // Only the (engine, mode) that was re-run is replaced. The same engine's
+      // result in the OTHER mode is a separate measurement and stays put — that
+      // side-by-side is the point of keying rows on the mode.
+      if (results) setResults(merge(results));
+      else setSavedRuns(merge);
+    } catch (error) {
+      setRunError((error as Error).message);
+    } finally {
+      setRerunning(null);
+    }
+  }, [audioFileId, rerunning, results, chunkInterval]);
+  // Keyed on (engine, feed mode), matching the row's own key. Keyed on asrId
+  // alone, an engine with both a live and a batch result would collapse to
+  // whichever came last in the list and the toggle could never show the other.
   const runByEngine = useMemo(
-    () => new Map((shownRuns ?? []).map((run) => [run.asrId, run])),
+    () => new Map((shownRuns ?? []).map((run) => [runKey(run.asrId, run.source), run])),
     [shownRuns],
   );
 
@@ -838,7 +890,11 @@ export function TranscriptStudio({
           // Live panel while capturing; the stored run when a saved recording is
           // open. Its avgLatencyMs is the value that was MEASURED at the time —
           // recomputing it from anything now would be a different number.
-          const stored = runByEngine.get(engine.asrId);
+          // The row for the mode the toggle is ON, not "this engine's row":
+          // an engine can hold both, and showing the other one under this
+          // label is the mismatch the TTS card already paid for with voices.
+          const picked = modeOf(engine);
+          const stored = runByEngine.get(runKey(engine.asrId, picked));
           const live = panels[engine.asrId] ?? EMPTY_PANEL;
           // A batch engine has no live panel state at all -- it was fed nothing
           // while the operator read -- so its text can only come from the row.
@@ -862,6 +918,10 @@ export function TranscriptStudio({
           // which is only the default and would mislabel a run that chose the other.
           const shown: TranscriptTransport =
             (viewingSaved && stored?.transport) || transportOf(engine);
+          // A live row obtained by replaying stored audio, not by someone
+          // reading. Its transcript is comparable; its latencies are the
+          // gateway's round trip, so every timing tile below says so.
+          const replayed = Boolean(stored?.replayed);
           return (
             <div className="panel engine-panel" key={engine.asrId}>
               <div className="engine-head">
@@ -871,7 +931,12 @@ export function TranscriptStudio({
                 </span>
                 <span className="engine-head-right">
                   <span className="mono engine-stats">
-                    {avg != null && <>lag {fmtMs(avg)}</>}
+                    {/* "replay" rather than a bare lag figure: a replayed run's
+                        latency is the gateway's round trip, not how far behind
+                        a speaker the engine ran, and the two must not read as
+                        the same measurement. */}
+                    {replayed && <span className="engine-replayed">replay</span>}
+                    {avg != null && <> lag {fmtMs(avg)}</>}
                     {" "}
                     {panel.text.split(/\s+/).filter(Boolean).length} words
                   </span>
@@ -881,7 +946,47 @@ export function TranscriptStudio({
                       that moved mid-run would describe something the server is
                       not doing. Hidden on a saved recording, where the run's own
                       transport is already what the tiles below report. */}
-                  {!viewingSaved && (engine.feedModes?.length ?? 0) > 1 && (
+                  {/* Run this one engine over the stored audio. Only on a saved
+                      recording: there is no stored audio to run against before
+                      that, and during a capture the live feed is the measurement.
+                      Always offered, not just when the engine has no row -- a
+                      re-run is the natural second action after a failure, and the
+                      route resets the row rather than adding a second one. */}
+                  {viewingSaved && !recording && (
+                    <button
+                      type="button"
+                      className="engine-rerun"
+                      onClick={() => void rerunEngine(engine.asrId, picked)}
+                      disabled={rerunning != null || runPending}
+                      aria-label={`Run ${engine.name} over this recording`}
+                      title={
+                        runPending
+                          ? `${engine.name} is already running`
+                          : picked === "live"
+                            // Said plainly on the control that starts it: this
+                            // replays stored audio through the chunk route, and
+                            // it replaces whatever live row is there — which may
+                            // be a read-aloud measurement that cannot be redone.
+                            ? `Replay this recording through ${engine.name}'s live chunk route`
+                              + `${stored ? " (replaces the stored live run)" : ""}`
+                            : stored
+                              ? `Re-run ${engine.name} over this recording (batch)`
+                              : `Run ${engine.name} over this recording (batch)`
+                      }
+                    >
+                      {rerunning === engine.asrId || runPending ? "…" : "\u21bb"}
+                    </button>
+                  )}
+                  {/* Shown on a saved recording too, not just before a capture.
+                      It has two jobs there: it picks WHICH of this engine's
+                      stored results the panel is showing (a recording can hold
+                      both), and it picks the mode the re-run beside it will use.
+                      Hiding it left no way to do either — the only re-run
+                      available was batch, and it overwrote the live row.
+                      Still locked during capture: the session fixed its
+                      transports at Start, so a control that moved mid-run would
+                      describe something the server is not doing. */}
+                  {(engine.feedModes?.length ?? 0) > 1 && (
                     <Segmented
                       label={`${engine.name} feed mode`}
                       value={modeOf(engine)}
@@ -915,9 +1020,16 @@ export function TranscriptStudio({
                         ? "Loading…"
                         : runPending
                           ? "Transcribing the finished recording…"
-                          : viewingSaved || stored
+                          : stored
                             ? "This engine returned nothing for this recording."
-                            : "No transcript yet."}
+                            // Never run in THIS mode. Distinct from "returned
+                            // nothing", which is a result: this engine has no
+                            // row here at all, and the re-run beside the toggle
+                            // is what fills it. Saying "returned nothing" would
+                            // report a failure that never happened.
+                            : viewingSaved
+                              ? `Not run in ${picked === "live" ? "stream" : "batch"} mode yet.`
+                              : "No transcript yet."}
                   </span>
                 )}
               </div>

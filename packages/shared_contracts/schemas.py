@@ -344,6 +344,14 @@ class TranscriptRun(ContractModel):
     source: TranscriptSource = Field(
         default="batch", description="live (read-aloud capture) or batch (stored audio)"
     )
+    replayed: bool = Field(
+        default=False,
+        description=(
+            "A live row obtained by replaying stored audio through the chunk route rather "
+            "than by someone reading aloud. Its text is comparable; its latencies are the "
+            "gateway's round trip, not lag behind a speaker. Always false for batch."
+        ),
+    )
     transport: TranscriptTransport | None = Field(
         default=None, description="stream or chunks — label every figure with it; the two are not comparable"
     )

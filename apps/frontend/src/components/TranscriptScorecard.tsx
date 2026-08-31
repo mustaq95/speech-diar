@@ -75,6 +75,13 @@ const TILES: Tile[] = [
  *    engine's does not. That is a real difference between the two PIPELINES, and
  *    it only misleads if a reader takes either number as the model's own.
  */
+/** A row's identity here is (engine, feed mode): a recording can hold an
+ *  engine's live result AND its batch one, so keying on asrId alone gives React
+ *  duplicate keys and the reader two identical labels over different numbers. */
+function keyOf(run: TranscriptRun): string {
+  return `${run.asrId}::${run.source}`;
+}
+
 export function TranscriptScorecard({ runs, engines, referenceWords }: TranscriptScorecardProps) {
   const transportOf = (run: TranscriptRun) =>
     run.transport ?? engines.find((engine) => engine.asrId === run.asrId)?.transport ?? null;
@@ -139,7 +146,7 @@ export function TranscriptScorecard({ runs, engines, referenceWords }: Transcrip
                 }
                 const transport = transportOf(run);
                 return (
-                  <div className={`score-row${pending ? " is-pending" : ""}`} key={run.asrId}>
+                  <div className={`score-row${pending ? " is-pending" : ""}`} key={keyOf(run)}>
                     <div className="score-row-head">
                       <span>
                         <span className={`engine-dot ${transport ?? ""}`} aria-hidden="true" />
@@ -166,7 +173,7 @@ export function TranscriptScorecard({ runs, engines, referenceWords }: Transcrip
                           : run.chunkIntervalSec
                             ? `chunks · ${run.chunkIntervalSec.toFixed(1)}s`
                             : "chunks"}
-                      {run.source ? ` · ${run.source}` : ""}
+                      {run.source ? ` · ${run.replayed ? "replay" : run.source}` : ""}
                     </small>
                   </div>
                 );
@@ -179,8 +186,16 @@ export function TranscriptScorecard({ runs, engines, referenceWords }: Transcrip
       {scored && (
         <div className="scorecard-ops">
           {runs.map((run) => (
-            <div key={run.asrId} className="ops-row">
-              <span>{nameOf(run)}</span>
+            <div key={keyOf(run)} className="ops-row">
+              {/* The mode is part of the label, not a footnote: two rows for one
+                  engine differ only by it, and an unlabelled pair reads as the
+                  same run measured twice. */}
+              <span>
+                {nameOf(run)}
+                <span className="muted">
+                  {" · "}{run.source === "live" ? (run.replayed ? "replay" : "stream") : "batch"}
+                </span>
+              </span>
               {run.metrics ? (
                 <span className="mono">
                   {run.metrics.subCount} sub · {run.metrics.delCount} del · {run.metrics.insCount} ins

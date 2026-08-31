@@ -9,7 +9,7 @@ TranscriptResult carries the same pair for the live-speech ASR engines.
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, JSON, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, JSON, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -116,7 +116,19 @@ class TranscriptResult(Base):
 
     __tablename__ = "transcript_results"
     __table_args__ = (
-        UniqueConstraint("audio_file_id", "asr_id", name="uq_transcript_results_audio_file_asr"),
+        # Keyed on the FEED MODE as well as the engine, so one recording can hold
+        # both an engine's live measurement and its batch one. It could not
+        # before: a batch re-run reset the single row and the read-aloud numbers
+        # were gone, which made "compare this engine's two modes" impossible on
+        # the surface built to compare things.
+        #
+        # `source` is NOT NULL (it has a default), and that is load-bearing the
+        # same way `tts_results.voice` is: Postgres treats NULLs as distinct
+        # inside a UNIQUE, so a nullable column here would let duplicates through.
+        UniqueConstraint(
+            "audio_file_id", "asr_id", "source",
+            name="uq_transcript_results_audio_file_asr_source",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -157,6 +169,14 @@ class TranscriptResult(Base):
     # of the same engine, and a scorecard that mixed them silently would be
     # comparing two things while claiming to compare one.
     source: Mapped[str] = mapped_column(String(8), default="batch")  # live|batch
+    # A "live" row can be produced two ways, and they are not the same
+    # measurement: someone actually read a script aloud (False), or stored audio
+    # was cut and replayed through the live chunk route (True). The transcript is
+    # comparable either way; the LATENCIES are not, because a replay is paced by
+    # the loop rather than by speech. Stored rather than derived, and labelled
+    # everywhere the timing figures appear, so the two never merge silently.
+    # Always False for a batch row, which is not replayed of anything.
+    replayed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     # What the audio actually travelled over, for the engine that produced this
     # row: "stream" (continuous, engine-side VAD) or "chunks" (fixed cuts).
     # The two are NOT interchangeable and the UI labels each figure with it —

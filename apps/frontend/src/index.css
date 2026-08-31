@@ -142,6 +142,10 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .engine-head-right { display: flex; align-items: center; gap: 10px; }
 .engine-head-right .segmented { padding: 2px; gap: 2px; }
 .engine-head-right .segmented button { padding: 3px 8px; font-size: 10.5px; }
+/* Icon-only re-run, sized to sit on the engine head's line beside the word count. */
+.engine-rerun { border: 1px solid var(--line-2); background: var(--panel-2); color: var(--muted); border-radius: 6px; width: 22px; height: 22px; line-height: 1; padding: 0; cursor: pointer; font-size: 13px; }
+.engine-rerun:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.engine-rerun:disabled { opacity: .45; cursor: default; }
 /* A scorecard row whose engine the worker has not finished. Dimmed rather than
    hidden: the engine is part of this comparison and its absence is temporary, so
    the row holds its place instead of the table reflowing when it lands. */
@@ -339,6 +343,12 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .ghost-btn { border: 1px solid var(--line-2); border-radius: 9px; padding: 10px 16px; font-size: 13px; font-weight: 600; color: var(--text); background: transparent; cursor: pointer; }
 .ghost-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 .ghost-btn:disabled { opacity: .45; cursor: not-allowed; }
+/* A live row obtained by replaying stored audio, not by someone reading aloud.
+   Marked because its latencies are the gateway's round trip and must not read
+   as lag behind a speaker. */
+.engine-replayed { color: var(--warn); border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
+  border-radius: 4px; padding: 1px 5px; font-size: 9.5px; letter-spacing: .3px; }
+
 .project-list { display: flex; flex-direction: column; gap: 10px; }
 .project-row { display: flex; align-items: center; gap: 16px; padding: 15px 18px; border-radius: 12px; background: var(--panel); border: 1px solid var(--line); cursor: pointer; text-align: left; min-width: 0; }
 .project-row.is-fresh { border-color: rgba(52,211,153,.3); }
@@ -348,6 +358,31 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .project-colors { display: flex; gap: 6px; }
 .project-colors i, .speaker-dots i, .palette-row i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
 .empty-list { text-align: center; color: var(--faint); padding: 60px 0; }
+
+/* Report recording picker. The app's only modal — a multi-row selection has
+   nowhere to live inline, unlike the delete confirm. Above .voice-menu and
+   .playhead, both z-index 20. */
+.picker-backdrop { position: fixed; inset: 0; z-index: 50; background: rgba(6,9,14,.66);
+  display: flex; align-items: center; justify-content: center; padding: 24px; }
+.picker-panel { width: min(560px, 92vw); max-height: 80vh; display: flex; flex-direction: column;
+  background: var(--panel); border: 1px solid var(--line-2); border-radius: 14px;
+  box-shadow: 0 20px 50px rgba(0,0,0,.55); }
+.picker-panel:focus { outline: none; }
+.picker-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px;
+  padding: 18px 20px 14px; border-bottom: 1px solid var(--line); }
+.picker-head h2 { margin: 0; font-size: 17px; font-weight: 650; }
+.picker-head p { margin: 5px 0 0; color: var(--muted); font-size: 12px; }
+.picker-bulk { display: flex; gap: 8px; flex: 0 0 auto; }
+.picker-list { flex: 1; min-height: 0; overflow: auto; padding: 8px; }
+.picker-row { display: flex; align-items: center; gap: 12px; padding: 9px 10px; border-radius: 8px; cursor: pointer; }
+.picker-row:hover { background: var(--panel-2); }
+.picker-row input { flex: 0 0 auto; width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; }
+.picker-lines { min-width: 0; }
+.picker-lines strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 12.5px; font-family: "IBM Plex Mono", ui-monospace, monospace; }
+.picker-lines small { display: block; color: var(--faint); margin-top: 3px; font-size: 11px; }
+.picker-foot { display: flex; justify-content: flex-end; gap: 10px; padding: 14px 20px;
+  border-top: 1px solid var(--line); }
 .settings-page { padding-bottom: 50px; }
 .settings-section { border-radius: 12px; padding: 4px 20px; margin-bottom: 14px; }
 .settings-section-head { padding: 16px 0 4px; }

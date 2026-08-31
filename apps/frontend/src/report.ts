@@ -440,6 +440,11 @@ const LANGUAGE_LABELS: Record<string, string> = {
 
 interface EngineTotals {
   asrId: string;
+  /** (engine, feed mode) — what the per-recording `wer` record is keyed on. */
+  key: string;
+  /** Display name WITH its feed mode, because an engine contributes up to two
+   *  columns (its live measurement and its batch one) and they are different
+   *  pipelines. An unlabelled pair reads as one engine measured twice. */
   name: string;
   transport: string;
   recordings: number;
@@ -460,9 +465,9 @@ interface EngineTotals {
   rtfCount: number;
 }
 
-function emptyTotals(asrId: string, name: string, transport: string): EngineTotals {
+function emptyTotals(key: string, asrId: string, name: string, transport: string): EngineTotals {
   return {
-    asrId, name, transport, recordings: 0,
+    key, asrId, name, transport, recordings: 0,
     sub: 0, del: 0, ins: 0, refWords: 0, hypWords: 0,
     cerWeighted: 0, werRawWeighted: 0,
     latencySum: 0, latencyCount: 0, rtfSum: 0, rtfCount: 0,
@@ -480,6 +485,20 @@ function emptyTotals(asrId: string, name: string, transport: string): EngineTota
 function weightedWer(totals: EngineTotals): number | null {
   if (!totals.refWords) return null;
   return (totals.sub + totals.del + totals.ins) / totals.refWords;
+}
+
+/** A report column's identity: the engine and the mode it ran in. */
+function runColumnKey(run: TranscriptRun): string {
+  return `${run.asrId}::${run.source}`;
+}
+
+/** What produced this run, in the words the UI uses. "replay" is its own label
+ *  and not folded into "stream": a replayed row's latency is the gateway's round
+ *  trip, not how far behind a speaker the engine ran, so its speed columns are
+ *  not comparable with a read-aloud's. */
+function feedModeLabel(run: TranscriptRun): string {
+  if (run.source !== "live") return "batch";
+  return run.replayed ? "replay" : "stream";
 }
 
 function accumulate(totals: EngineTotals, run: TranscriptRun): void {
@@ -568,14 +587,19 @@ export function computeTranscriptReport(entries: TranscriptReportEntry[]): Trans
     const wer: Record<string, number | null> = {};
     for (const run of entry.runs) {
       const transport = run.transport ?? "";
-      const name = run.asrName || run.asrId;
-      if (!overall.has(run.asrId)) overall.set(run.asrId, emptyTotals(run.asrId, name, transport));
-      if (!languageBucket.has(run.asrId)) {
-        languageBucket.set(run.asrId, emptyTotals(run.asrId, name, transport));
+      // Keyed on (engine, feed mode), never the engine alone. One recording can
+      // hold an engine's live result AND its batch one; summing them into a
+      // single bucket would report the mean of two different pipelines under one
+      // name, and the per-recording row would silently keep whichever came last.
+      const key = runColumnKey(run);
+      const name = `${run.asrName || run.asrId} (${feedModeLabel(run)})`;
+      if (!overall.has(key)) overall.set(key, emptyTotals(key, run.asrId, name, transport));
+      if (!languageBucket.has(key)) {
+        languageBucket.set(key, emptyTotals(key, run.asrId, name, transport));
       }
-      accumulate(overall.get(run.asrId)!, run);
-      accumulate(languageBucket.get(run.asrId)!, run);
-      wer[run.asrId] = run.metrics?.wer ?? null;
+      accumulate(overall.get(key)!, run);
+      accumulate(languageBucket.get(key)!, run);
+      wer[key] = run.metrics?.wer ?? null;
     }
 
     perRecording.push({
@@ -660,11 +684,14 @@ export function buildTranscriptAggregateReportHtml(report: TranscriptReportData)
   const languageRows = report.byLanguage
     .map((group) => {
       const cells = engines.map((engine) => {
-        const totals = group.engines.find((item) => item.asrId === engine.asrId);
+        // Matched on `key`, not asrId: an engine contributes one column per feed
+        // mode, and asrId would find whichever of its two came first and print
+        // the batch figure under the stream column.
+        const totals = group.engines.find((item) => item.key === engine.key);
         const wer = totals ? weightedWer(totals) : null;
         const best = bestOf(
           engines.map((other) => {
-            const t = group.engines.find((item) => item.asrId === other.asrId);
+            const t = group.engines.find((item) => item.key === other.key);
             return t ? weightedWer(t) : null;
           }),
         );
@@ -684,7 +711,7 @@ export function buildTranscriptAggregateReportHtml(report: TranscriptReportData)
   const recordingRows = report.perRecording
     .map((row) => {
       const cells = engines
-        .map((engine) => `<td class="num">${ratePctOrDash(row.wer[engine.asrId] ?? null)}</td>`)
+        .map((engine) => `<td class="num">${ratePctOrDash(row.wer[engine.key] ?? null)}</td>`)
         .join("");
       return `<tr>
         <td>${escapeHtml(row.name)}<br><span class="sub">${escapeHtml(row.date)}</span></td>

@@ -102,7 +102,7 @@ def test_asr_persists_text_and_its_own_timing_then_queues_alignment(
     # args[1] carries the stage's own id because supervisor/state.py reads
     # job.args[1] as the model id when deriving which models a worker is busy
     # on; args[2] is the engine whose row this alignment belongs to.
-    assert jobs[0].args == (wired.audio_file_id, pipeline.ALIGNER_ID, "hamsa")
+    assert jobs[0].args == (wired.audio_file_id, pipeline.ALIGNER_ID, "hamsa", "batch")
 
 
 def test_the_job_argument_decides_the_engine(
@@ -341,7 +341,7 @@ def test_a_batch_run_records_the_interval_it_was_actually_cut_at(
     # Patched at the pipeline's import site: get_settings() is cached and hands
     # back a built instance, so setting the class attribute never reaches it.
     _patch_segment_seconds(monkeypatch, 7.0)
-    monkeypatch.setattr(pipeline, "transport_for", lambda _asr_id: "chunks")
+    monkeypatch.setattr(pipeline, "transport_for_mode", lambda _asr_id, _mode: "chunks")
     wired.add_row("inception-stt")
     _stub_chunked_engine(monkeypatch, "inception-stt", segments=5)
 
@@ -371,3 +371,131 @@ def test_a_whole_file_batch_run_records_no_interval_at_all(
     assert row.transport == "file"
     assert row.chunk_interval_sec is None
     assert row.chunk_count is None
+
+
+# --- source="live": replaying stored audio through the chunk route ------------
+
+
+def test_a_live_replay_chunks_the_audio_and_measures_every_call(
+    wired: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`source="live"` feeds the engine's CHUNK call once per cut and records
+    what each one cost, exactly as the live route does — and stamps `replayed`,
+    because those latencies are the gateway's round trip and not how far behind
+    a speaker the engine ran.
+    """
+    wired.add_row("cohere-transcribe", source="live")
+    calls: list[str] = []
+
+    def run_chunk(payload: bytes, filename: str) -> dict[str, str]:
+        calls.append(filename)
+        return {"text": f"piece{len(calls)}"}
+
+    monkeypatch.setattr(pipeline, "ensure_canonical_wav", lambda path: (path, None))
+    monkeypatch.setattr(
+        pipeline, "split_wav_fixed", lambda path, seconds: [(b"wav", 0.0, 3.0), (b"wav", 3.0, 6.0)]
+    )
+    monkeypatch.setattr(
+        pipeline, "engine_for",
+        lambda asr_id: SimpleNamespace(
+            name="Cohere", run_chunk=run_chunk, chunk_text=lambda entry: entry["text"],
+            run=None, adapt=None, batch_segments=None,
+        ),
+    )
+    monkeypatch.setattr(pipeline, "transport_for_mode", lambda _asr_id, _mode: "chunks")
+    monkeypatch.setattr(pipeline, "_score_and_log", lambda *args, **kwargs: None)
+
+    pipeline.run_asr(wired.audio_file_id, "cohere-transcribe", "live", 3.0)
+
+    assert calls == ["chunk0.wav", "chunk1.wav"]
+    row = _row(wired.sessions, wired.audio_file_id, "cohere-transcribe")
+    # ASR is stage one: the text is committed and alignment is queued behind it,
+    # which is the staging the rest of this file pins.
+    assert (row.status, row.stage) == ("running", "asr")
+    # Joined with a single space in audio order, nothing else done to it — the
+    # same rule `live_session.transcript` follows, so a replayed row and a
+    # captured one are assembled identically.
+    assert row.text == "piece1 piece2"
+    assert row.source == "live"
+    assert row.replayed is True
+    assert row.transport == "chunks"
+    # The interval that actually ran, not a server default.
+    assert row.chunk_interval_sec == 3.0
+    assert row.chunk_count == 2
+    assert row.first_latency_ms is not None and row.avg_latency_ms is not None
+
+
+def test_a_replay_records_a_failed_chunk_as_empty_rather_than_dropping_it(
+    wired: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors POST /transcript/chunk: the call was made and it cost time, so the
+    chunk count stays truthful. Dropping it would understate the count while
+    flattering the engine's apparent output rate."""
+    wired.add_row("cohere-transcribe", source="live")
+
+    def run_chunk(payload: bytes, filename: str) -> dict[str, str]:
+        if filename == "chunk0.wav":
+            raise RuntimeError("gateway said no")
+        return {"text": "second"}
+
+    monkeypatch.setattr(pipeline, "ensure_canonical_wav", lambda path: (path, None))
+    monkeypatch.setattr(
+        pipeline, "split_wav_fixed", lambda path, seconds: [(b"wav", 0.0, 3.0), (b"wav", 3.0, 6.0)]
+    )
+    monkeypatch.setattr(
+        pipeline, "engine_for",
+        lambda asr_id: SimpleNamespace(
+            name="Cohere", run_chunk=run_chunk, chunk_text=lambda entry: entry["text"],
+            run=None, adapt=None, batch_segments=None,
+        ),
+    )
+    monkeypatch.setattr(pipeline, "transport_for_mode", lambda _asr_id, _mode: "chunks")
+    monkeypatch.setattr(pipeline, "_score_and_log", lambda *args, **kwargs: None)
+
+    pipeline.run_asr(wired.audio_file_id, "cohere-transcribe", "live", 3.0)
+
+    row = _row(wired.sessions, wired.audio_file_id, "cohere-transcribe")
+    assert row.status != "failed"
+    assert row.text == "second"
+    assert row.chunk_count == 2
+
+
+def test_a_batch_run_does_not_touch_the_live_row_of_the_same_engine(
+    wired: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pipeline half of the constraint change: two rows, two jobs, and the
+    batch job must find its OWN row. Keyed on asr_id alone it would load the live
+    row and overwrite a read-aloud measurement."""
+    wired.add_row("cohere-transcribe", source="live", text="read aloud", avg_latency_ms=210)
+    wired.add_row("cohere-transcribe", source="batch")
+    with wired.sessions() as session:
+        live = (
+            session.query(TranscriptResult)
+            .filter_by(audio_file_id=wired.audio_file_id, asr_id="cohere-transcribe", source="live")
+            .one()
+        )
+        live.status = "done"
+        session.commit()
+
+    monkeypatch.setattr(
+        pipeline, "engine_for",
+        lambda asr_id: SimpleNamespace(
+            name="Cohere", run=lambda path: {"native": "from storage"},
+            adapt=lambda raw: raw["native"], run_chunk=None, chunk_text=None, batch_segments=None,
+        ),
+    )
+    monkeypatch.setattr(pipeline, "transport_for_mode", lambda _asr_id, _mode: "file")
+    monkeypatch.setattr(pipeline, "_score_and_log", lambda *args, **kwargs: None)
+
+    pipeline.run_asr(wired.audio_file_id, "cohere-transcribe", "batch")
+
+    with wired.sessions() as session:
+        rows = {
+            row.source: row
+            for row in session.query(TranscriptResult)
+            .filter_by(audio_file_id=wired.audio_file_id, asr_id="cohere-transcribe")
+            .all()
+        }
+    assert rows["live"].text == "read aloud"
+    assert rows["live"].avg_latency_ms == 210
+    assert rows["batch"].text == "from storage"

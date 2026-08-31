@@ -474,11 +474,17 @@ export async function putReference(
 export async function startTranscripts(
   audioFileId: number,
   asrIds: string[],
+  /** Per engine, because the mode toggle is per engine. Anything unlisted runs
+   *  batch, which is what a stored-audio run has always meant. */
+  feedModes?: Record<string, TranscriptSource>,
+  /** The interval a "live" replay cuts at — the operator's slider, so the run is
+   *  cut at what the panel labels it with. */
+  chunkIntervalSec?: number,
 ): Promise<TranscriptRun[]> {
   const response = await fetch(`${API_BASE_URL}/evaluations/${audioFileId}/transcripts`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ asrIds }),
+    body: JSON.stringify({ asrIds, feedModes, chunkIntervalSec }),
   });
   if (!response.ok) throw new Error(await errorDetail(response));
   return (await response.json()) as TranscriptRun[];

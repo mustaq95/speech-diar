@@ -204,7 +204,7 @@ def test_post_transcript_enqueues_the_selected_online_engine(
     assert response.status_code == 200
     assert response.json()["status"] == "queued"
     # args[1] is the engine id, matching the job shape supervisor/state.py reads.
-    assert _asr_jobs(fake_queue) == [(audio_file_id, "hamsa")]
+    assert _asr_jobs(fake_queue) == [(audio_file_id, "hamsa", "batch")]
 
 
 def test_post_transcript_enqueues_the_selected_offline_engine(
@@ -217,7 +217,7 @@ def test_post_transcript_enqueues_the_selected_offline_engine(
 
     assert body["asrId"] == "cohere-transcribe"
     assert body["mode"] == "offline"
-    assert _asr_jobs(fake_queue) == [(audio_file_id, "cohere-transcribe")]
+    assert _asr_jobs(fake_queue) == [(audio_file_id, "cohere-transcribe", "batch")]
 
 
 def test_post_transcript_422s_when_the_selected_mode_is_unconfigured(
@@ -320,7 +320,7 @@ def test_the_other_mode_may_start_while_one_is_running(
 
     assert response.status_code == 200
     assert response.json()["asrId"] == "cohere-transcribe"
-    assert _asr_jobs(fake_queue) == [(audio_file_id, "cohere-transcribe")]
+    assert _asr_jobs(fake_queue) == [(audio_file_id, "cohere-transcribe", "batch")]
 
 
 def test_post_transcript_rejects_a_recording_with_no_local_audio(
@@ -342,7 +342,7 @@ def test_upload_enqueues_a_transcript_alongside_the_model_jobs(
     )
     audio_file_id = response.json()["audioFileId"]
 
-    assert _asr_jobs(fake_queue) == [(audio_file_id, "cohere-transcribe")]
+    assert _asr_jobs(fake_queue) == [(audio_file_id, "cohere-transcribe", "batch")]
     with db_session_factory() as session:
         row = session.query(TranscriptResult).filter_by(audio_file_id=audio_file_id).one()
         assert row.status == "queued"
@@ -714,3 +714,147 @@ def test_plural_route_collapses_a_duplicated_engine(client: TestClient, db_sessi
     assert response.status_code == 200
     assert len(response.json()) == 1
     assert len(fake_queue.jobs) - before == 1
+
+
+# --- one row per (recording, engine, FEED MODE) -----------------------------
+#
+# Before this, `transcript_results` was unique on (audio_file_id, asr_id) and
+# `_queue_transcript` reset that single row. So a batch re-run of an engine that
+# had been captured live NULLED the read-aloud transcript, its chunk latencies
+# and its scores — silently, at 200 OK, on the surface whose whole job is to
+# compare. Every test below fails against that shape.
+
+
+def _live_row(factory: sessionmaker[Session], audio_file_id: int, asr_id: str) -> int:
+    """A finished LIVE capture for one engine, with numbers worth losing."""
+    with factory() as session:
+        row = TranscriptResult(
+            audio_file_id=audio_file_id,
+            asr_id=asr_id,
+            status="done",
+            source="live",
+            transport="chunks",
+            text="مرحبا بكم",
+            chunk_count=7,
+            chunk_interval_sec=3.0,
+            first_latency_ms=180,
+            avg_latency_ms=210,
+            wer=0.12,
+        )
+        session.add(row)
+        session.commit()
+        return row.id
+
+
+def test_a_batch_rerun_leaves_the_live_measurement_intact(
+    client: TestClient, db_session_factory: sessionmaker[Session], fake_queue: Queue
+) -> None:
+    """The bug this constraint change exists for.
+
+    Re-running an engine in batch must ADD a row beside the live one, never
+    overwrite it. The live numbers were measured while someone read a script
+    aloud and cannot be reproduced from storage.
+    """
+    audio_file_id = _recording(db_session_factory)
+    live_id = _live_row(db_session_factory, audio_file_id, "cohere-transcribe")
+
+    response = client.post(
+        f"/evaluations/{audio_file_id}/transcripts",
+        json={"asrIds": ["cohere-transcribe"], "feedModes": {"cohere-transcribe": "batch"}},
+    )
+
+    assert response.status_code == 200
+    assert [run["source"] for run in response.json()] == ["batch"]
+    with db_session_factory() as session:
+        live = session.get(TranscriptResult, live_id)
+        assert (live.status, live.source, live.text) == ("done", "live", "مرحبا بكم")
+        assert (live.chunk_count, live.avg_latency_ms, live.wer) == (7, 210, 0.12)
+        rows = session.query(TranscriptResult).filter_by(audio_file_id=audio_file_id).all()
+        assert sorted(row.source for row in rows) == ["batch", "live"]
+    assert _asr_jobs(fake_queue) == [(audio_file_id, "cohere-transcribe", "batch", None)]
+
+
+def test_rerunning_the_same_feed_mode_resets_that_row_in_place(
+    client: TestClient, db_session_factory: sessionmaker[Session]
+) -> None:
+    """Widening the key must not turn a re-run into an accumulating pile of rows:
+    the same mode still replaces its own result, which is what `uq_..._source`
+    enforces and what a blind `db.add` would violate (the finalize incident)."""
+    audio_file_id = _recording(db_session_factory)
+    live_id = _live_row(db_session_factory, audio_file_id, "cohere-transcribe")
+
+    response = client.post(
+        f"/evaluations/{audio_file_id}/transcripts",
+        json={"asrIds": ["cohere-transcribe"], "feedModes": {"cohere-transcribe": "live"}},
+    )
+
+    assert response.status_code == 200
+    with db_session_factory() as session:
+        rows = session.query(TranscriptResult).filter_by(audio_file_id=audio_file_id).all()
+        assert len(rows) == 1
+        assert rows[0].id == live_id
+        # Reset, not appended to: the previous run's measurements are gone
+        # because they describe a transcript that no longer exists.
+        assert (rows[0].status, rows[0].source, rows[0].text) == ("queued", "live", None)
+        assert (rows[0].chunk_count, rows[0].avg_latency_ms, rows[0].wer) == (None, None, None)
+
+
+def test_a_live_replay_passes_the_operators_interval_to_the_job(
+    client: TestClient, db_session_factory: sessionmaker[Session], fake_queue: Queue
+) -> None:
+    """The interval the panel LABELS the run with has to be the one that ran.
+    Falling back to a server default here is the bug the batch-interval comment
+    in `run_asr` already documents, one layer up."""
+    audio_file_id = _recording(db_session_factory)
+
+    response = client.post(
+        f"/evaluations/{audio_file_id}/transcripts",
+        json={
+            "asrIds": ["cohere-transcribe"],
+            "feedModes": {"cohere-transcribe": "live"},
+            "chunkIntervalSec": 8.0,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()[0]
+    # cohere is `chunks` live and `file` in batch; the row must carry the mode's
+    # transport, not the engine's batch default.
+    assert (body["source"], body["transport"]) == ("live", "chunks")
+    assert _asr_jobs(fake_queue) == [(audio_file_id, "cohere-transcribe", "live", 8.0)]
+
+
+def test_an_engine_with_no_chunk_transport_cannot_be_replayed_live(
+    client: TestClient, db_session_factory: sessionmaker[Session], fake_queue: Queue
+) -> None:
+    """hamsa is a socket protocol with no chunk call. Replaying it as chunks
+    would be a different measurement wearing the same label, so it is refused at
+    the request rather than producing a row nobody can interpret."""
+    audio_file_id = _recording(db_session_factory)
+
+    response = client.post(
+        f"/evaluations/{audio_file_id}/transcripts",
+        json={"asrIds": ["hamsa"], "feedModes": {"hamsa": "live"}},
+    )
+
+    assert response.status_code == 422
+    assert "chunk transport" in response.json()["detail"]
+    with db_session_factory() as session:
+        assert session.query(TranscriptResult).filter_by(audio_file_id=audio_file_id).count() == 0
+    assert _asr_jobs(fake_queue) == []
+
+
+def test_an_unlisted_engine_defaults_to_batch(
+    client: TestClient, db_session_factory: sessionmaker[Session], fake_queue: Queue
+) -> None:
+    """No `feedModes` at all is what every caller written before this sent, and
+    it must still mean what it always meant: run the stored audio."""
+    audio_file_id = _recording(db_session_factory)
+
+    response = client.post(
+        f"/evaluations/{audio_file_id}/transcripts", json={"asrIds": ["cohere-transcribe"]}
+    )
+
+    assert response.status_code == 200
+    assert response.json()[0]["source"] == "batch"
+    assert _asr_jobs(fake_queue) == [(audio_file_id, "cohere-transcribe", "batch", None)]

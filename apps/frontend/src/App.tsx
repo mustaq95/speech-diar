@@ -5,6 +5,7 @@ import { Insights } from "./components/Insights";
 import { ModelStatusStrip } from "./components/ModelStatusStrip";
 import { ProcessingScreen } from "./components/ProcessingScreen";
 import { ProjectsView } from "./components/ProjectsView";
+import { ReportPicker } from "./components/ReportPicker";
 import { SettingsView } from "./components/SettingsView";
 import { MIN_PX_PER_SEC, Studio } from "./components/Studio";
 import { TopBar } from "./components/TopBar";
@@ -489,16 +490,19 @@ export default function App() {
   }, [time, syncDom, speakerTick]);
 
   const [reportBusy, setReportBusy] = useState(false);
+  // Which recordings a report covers is a choice, not all of them. The picker
+  // holds the ticks; App only ever sees the rows that came back from it.
+  const [pickerOpen, setPickerOpen] = useState(false);
 
   // Two fetches per recording (its reference and its per-engine runs) rather than
   // one aggregate route. A report is a rare, deliberate action over a handful of
   // recordings, so the round trips are not worth a bespoke endpoint — unlike the
   // Projects list, which paid this cost on every visit and now does not.
-  const generateTranscriptReport = async () => {
+  const generateTranscriptReport = async (selection: Project[]) => {
     setReportBusy(true);
     try {
       const settled = await Promise.all(
-        projects.map(async (project): Promise<TranscriptReportEntry | null> => {
+        selection.map(async (project): Promise<TranscriptReportEntry | null> => {
           try {
             const [reference, runs] = await Promise.all([
               fetchReference(project.audioFileId),
@@ -556,16 +560,16 @@ export default function App() {
   // the script was in.
   //
   // Recordings that fail to load are skipped rather than aborting the whole report.
-  const handleGenerateReport = async () => {
-    if (reportBusy || projects.length === 0) return;
+  const handleGenerateReport = async (selection: Project[]) => {
+    if (reportBusy || selection.length === 0) return;
     if (listSurface === "transcript") {
-      await generateTranscriptReport();
+      await generateTranscriptReport(selection);
       return;
     }
     setReportBusy(true);
     try {
       const settled = await Promise.all(
-        projects.map(async (project): Promise<ReportEntry | null> => {
+        selection.map(async (project): Promise<ReportEntry | null> => {
           try {
             return { project, evaluation: await fetchEvaluation(project.audioFileId) };
           } catch (error) {
@@ -976,9 +980,23 @@ export default function App() {
           onOpenProject={openProject}
           onNew={startNewUpload}
           onDelete={handleDeleteProject}
-          onGenerateReport={handleGenerateReport}
+          onGenerateReport={() => setPickerOpen(true)}
           reportBusy={reportBusy}
           surface={listSurface}
+        />
+      )}
+      {nav === "projects" && pickerOpen && (
+        <ReportPicker
+          projects={projects}
+          surface={listSurface}
+          busy={reportBusy}
+          onCancel={() => setPickerOpen(false)}
+          onGenerate={(selected) => {
+            // Stays open while the fetches run so its own button carries the busy
+            // state, then closes. The two "nothing to report" alerts resolve the
+            // same way, so they close it too.
+            void handleGenerateReport(selected).finally(() => setPickerOpen(false));
+          }}
         />
       )}
       {nav === "settings" && (

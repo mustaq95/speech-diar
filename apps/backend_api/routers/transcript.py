@@ -758,5 +758,8 @@ def _persist_session(
     # visible to the worker's own session. Same ordering as `start_transcripts`.
     for row in rows:
         if row.status == "queued":
-            queue.enqueue(run_asr, audio_file.id, row.asr_id)
+            # The row's own feed mode, so the job finds the row it was written
+            # for: rows are keyed on (recording, engine, source) now, and a job
+            # that assumed batch would look past a live row and drop itself.
+            queue.enqueue(run_asr, audio_file.id, row.asr_id, row.source)
     return rows

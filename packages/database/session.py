@@ -45,6 +45,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _ensure_added_columns()
     _migrate_tts_results_per_voice()
+    _migrate_transcript_results_per_mode()
     _backfill_recording_surface()
     with SessionLocal() as session:
         _seed_dev_user(session)
@@ -88,6 +89,10 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("transcript_results", "del_count", "INTEGER"),
     ("transcript_results", "ins_count", "INTEGER"),
     ("transcript_results", "alignment", "JSON"),
+    # How a "live" row was obtained: a real read-aloud, or stored audio replayed
+    # through the live chunk route. False is right for every row that existed
+    # before replay did -- all of them came from someone reading.
+    ("transcript_results", "replayed", "BOOLEAN DEFAULT FALSE"),
     # tts_results shipped without these two; `create_all` builds the table on a
     # host that has never seen it, but never ALTERs one that already exists.
     ("tts_results", "channels", "INTEGER"),
@@ -141,6 +146,8 @@ def _backfill_recording_surface() -> None:
 #: existing. Once it has been swapped there is nothing to match and this is a
 #: no-op forever after. Do NOT relax that guard -- it is the only thing between
 #: this function and a database with real clips in it.
+_OLD_TRANSCRIPT_CONSTRAINT = "uq_transcript_results_audio_file_asr"
+_NEW_TRANSCRIPT_CONSTRAINT = "uq_transcript_results_audio_file_asr_source"
 _OLD_TTS_CONSTRAINT = "uq_tts_results_audio_file_tts"
 _NEW_TTS_CONSTRAINT = "uq_tts_results_audio_file_tts_voice"
 
@@ -204,6 +211,56 @@ def _migrate_tts_results_per_voice() -> None:
                 s3_client.delete_object(key)
             except Exception:
                 logger.warning("Could not delete orphaned TTS object %s", key, exc_info=True)
+
+
+def _migrate_transcript_results_per_mode() -> None:
+    """Widen transcript_results' unique key to include `source` (live|batch).
+
+    Postgres only, like the other shims: SQLite built the table from the current
+    models a moment ago and already has the new constraint.
+
+    Unlike `_migrate_tts_results_per_voice`, this one deletes nothing and can't.
+    Every existing row already carries a valid `source`, and uniqueness on
+    (audio_file_id, asr_id) implies uniqueness on (audio_file_id, asr_id,
+    source), so widening the key can never collide. The rows are the measurements
+    this tool exists to keep.
+
+    Gated on the OLD constraint still existing, so it can never fire twice. Do
+    not relax that guard.
+    """
+    if engine.dialect.name != "postgresql":
+        return
+
+    with engine.begin() as conn:
+        exists = conn.execute(
+            text(
+                "SELECT 1 FROM pg_constraint WHERE conrelid = 'transcript_results'::regclass"
+                " AND conname = :name"
+            ),
+            {"name": _OLD_TRANSCRIPT_CONSTRAINT},
+        ).scalar()
+        if not exists:
+            return
+
+        # A row written before `source` existed defaulted to 'batch'; a NULL here
+        # would defeat the whole constraint, since Postgres treats NULLs as
+        # distinct inside a UNIQUE.
+        conn.execute(text("UPDATE transcript_results SET source = 'batch' WHERE source IS NULL"))
+        conn.execute(text("ALTER TABLE transcript_results ALTER COLUMN source SET NOT NULL"))
+        conn.execute(
+            text(f"ALTER TABLE transcript_results DROP CONSTRAINT IF EXISTS {_OLD_TRANSCRIPT_CONSTRAINT}")
+        )
+        conn.execute(
+            text(
+                f"ALTER TABLE transcript_results ADD CONSTRAINT {_NEW_TRANSCRIPT_CONSTRAINT}"
+                " UNIQUE (audio_file_id, asr_id, source)"
+            )
+        )
+
+    logger.info(
+        "Migrated transcript_results to one row per (recording, engine, feed mode); "
+        "no rows were dropped"
+    )
 
 
 def _ensure_added_columns() -> None:

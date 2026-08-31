@@ -18,8 +18,10 @@ from apps.background_worker.models import REGISTRY
 from apps.background_worker.pipelines.azure_pipeline import _fixed_key
 from apps.background_worker.queue_app import queue
 from apps.background_worker.transcription import (
+    feed_modes,
     resolve_asr_ids,
     transport_for,
+    transport_for_mode,
     ALIGNER_NAME,
     DEFAULT_TRANSCRIPTION_MODE,
     asr_id_for_mode,
@@ -238,10 +240,14 @@ def _transcript_run(row: TranscriptResult) -> TranscriptRun:
         align_ms=row.align_ms,
         error=row.error,
         source=row.source or "batch",
+        # Only a live row can be a replay, and the UI has to say so: a replayed
+        # run's latencies are the gateway's round trip, not how far behind a
+        # speaker the engine ran.
+        replayed=bool(row.replayed),
         # From the engine's registry entry, not the row: the transport is a fact
         # about the engine, and a row written before this column existed should
         # still be labelled correctly rather than showing blank.
-        transport=row.transport or transport_for(row.asr_id),
+        transport=row.transport or transport_for_mode(row.asr_id, row.source or "batch"),
         chunk_interval_sec=row.chunk_interval_sec,
         chunk_count=row.chunk_count,
         first_latency_ms=row.first_latency_ms,
@@ -317,23 +323,53 @@ def get_transcripts(
 
 
 def _queue_transcript(
-    db: Session, audio_file: AudioFile, asr_id: str, settings
+    db: Session, audio_file: AudioFile, asr_id: str, settings, feed_mode: str = "batch"
 ) -> TranscriptResult:
-    """Reset (or create) one engine's row for this recording and enqueue its job.
+    """Reset (or create) one engine's row for this recording IN ONE FEED MODE and
+    enqueue its job.
 
-    Keyed on (recording, engine) throughout, so queueing one engine never
-    touches another's text, timings or scores — that side-by-side is the whole
-    comparison. Raises the same 409/422 the single-engine route always did.
+    Keyed on (recording, engine, feed mode) throughout, so queueing one engine
+    never touches another's text, timings or scores — nor its own result in the
+    other mode, which is the comparison this surface exists for. A re-run of the
+    SAME mode still resets in place; running the other mode adds a row beside it.
+    Raises the same 409/422 the single-engine route always did.
+
+    "batch" is always allowed: it is what a stored-audio run has always done.
+    "live" means replaying the recording through the engine's live chunk route,
+    so it additionally requires an engine that HAS that route — hamsa is a
+    socket protocol with no chunk call, and replaying it as chunks would be a
+    different measurement wearing the same label.
     """
     engine = engine_for(asr_id)
     if engine is None or not engine.configured(settings):
         raise HTTPException(
             status_code=422, detail=f"{asr_id!r} is not configured on this host"
         )
+    if feed_mode not in ("live", "batch"):
+        raise HTTPException(
+            status_code=422, detail=f"Unknown feed mode {feed_mode!r}; expected 'live' or 'batch'"
+        )
+    if feed_mode == "live":
+        if "live" not in feed_modes(asr_id):
+            raise HTTPException(
+                status_code=422,
+                detail=f"{engine.name} does not offer a live feed mode",
+            )
+        if engine.run_chunk is None or engine.chunk_text is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{engine.name} has no chunk transport, so it cannot be replayed live",
+            )
 
-    row = db.query(TranscriptResult).filter_by(audio_file_id=audio_file.id, asr_id=asr_id).one_or_none()
+    row = (
+        db.query(TranscriptResult)
+        .filter_by(audio_file_id=audio_file.id, asr_id=asr_id, source=feed_mode)
+        .one_or_none()
+    )
     if row is None:
-        row = TranscriptResult(audio_file_id=audio_file.id, asr_id=asr_id, status="queued")
+        row = TranscriptResult(
+            audio_file_id=audio_file.id, asr_id=asr_id, source=feed_mode, status="queued"
+        )
         db.add(row)
     else:
         if row.status in ("queued", "running"):
@@ -369,15 +405,21 @@ def _queue_transcript(
         row.del_count = None
         row.ins_count = None
         row.alignment = None
-    row.source = "batch"
-    row.transport = transport_for(asr_id)
+    row.source = feed_mode
+    # Cleared, not left: re-running the SAME mode replaces the run, and a stale
+    # True would keep labelling a fresh read-aloud row as a replay. `run_asr`
+    # sets it back when it actually replays.
+    row.replayed = False
+    row.transport = transport_for_mode(asr_id, feed_mode)
     return row
 
 
 @router.post("/{audio_file_id}/transcripts", response_model=list[TranscriptRun], response_model_by_alias=True)
 def start_transcripts(
     audio_file_id: int,
-    asr_ids: list[str] = Body(..., embed=True, alias="asrIds"),
+    asr_ids: list[str] = Body(..., alias="asrIds"),
+    feed_modes_by_engine: dict[str, str] | None = Body(None, alias="feedModes"),
+    chunk_interval_sec: float | None = Body(None, alias="chunkIntervalSec"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[TranscriptRun]:
@@ -395,6 +437,12 @@ def start_transcripts(
     All-or-nothing on validation: an unknown or unconfigured engine is rejected
     before ANY job is queued, so a typo cannot leave half the comparison running
     against a scorecard that will never fill.
+
+    `feedModes` maps engine id -> "live" | "batch", per engine because the toggle
+    is per engine; anything unlisted runs batch, which is what a stored-audio run
+    has always meant. `chunkIntervalSec` is the interval a "live" replay cuts at,
+    and it is the operator's live slider rather than a server default so the
+    interval the panel LABELS the run with is the one that actually ran.
     """
     audio_file = _get_audio_file(db, audio_file_id, current_user)
     if not audio_file.s3_key:
@@ -407,11 +455,15 @@ def start_transcripts(
         raise HTTPException(status_code=422, detail=f"Unknown ASR engine {exc.args[0]!r}") from exc
 
     settings = get_settings()
-    rows = [_queue_transcript(db, audio_file, asr_id, settings) for asr_id in resolved]
+    picked = {asr_id: (feed_modes_by_engine or {}).get(asr_id, "batch") for asr_id in resolved}
+    rows = [_queue_transcript(db, audio_file, asr_id, settings, picked[asr_id]) for asr_id in resolved]
     db.commit()
     for asr_id in resolved:
-        queue.enqueue(run_asr, audio_file.id, asr_id)
-    logger.info("Queued transcripts (%s) for audio_file_id=%s", ",".join(resolved), audio_file.id)
+        queue.enqueue(run_asr, audio_file.id, asr_id, picked[asr_id], chunk_interval_sec)
+    logger.info(
+        "Queued transcripts (%s) for audio_file_id=%s",
+        ",".join(f"{asr_id}:{picked[asr_id]}" for asr_id in resolved), audio_file.id,
+    )
     return [_transcript_run(row) for row in rows]
 
 
@@ -453,10 +505,13 @@ def start_transcript(
             detail=f"{mode} mode selects {asr_id!r}, which is not configured on this host",
         )
 
-    row = _queue_transcript(db, audio_file, asr_id, settings)
+    # "batch": this route runs stored audio, which is what it has always meant.
+    # Its `mode` argument selects the ENGINE (online/offline), a different axis
+    # from the live/batch feed mode the row is now keyed on.
+    row = _queue_transcript(db, audio_file, asr_id, settings, "batch")
     db.commit()
 
-    queue.enqueue(run_asr, audio_file.id, asr_id)
+    queue.enqueue(run_asr, audio_file.id, asr_id, "batch")
     logger.info("Queued transcript (%s) for audio_file_id=%s", asr_id, audio_file.id)
     return _transcript_run(row)
 

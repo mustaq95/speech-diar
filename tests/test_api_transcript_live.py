@@ -684,7 +684,7 @@ def test_finalize_queues_a_batch_mode_engine_over_the_stored_audio(
     assert cohere.get("firstLatencyMs") is None
 
     # Exactly one job, for the file engine only, enqueued after the commit.
-    assert stub_queue == [("run_asr", by_id["hamsa"]["audioFileId"], "cohere-transcribe")]
+    assert stub_queue == [("run_asr", by_id["hamsa"]["audioFileId"], "cohere-transcribe", "batch")]
 
 
 def test_finalize_keeps_the_live_transcripts_when_the_batch_engine_is_gone(
@@ -772,7 +772,7 @@ def test_the_same_engine_takes_either_mode_across_two_sessions(
 
     assert (chunked["transport"], chunked["source"], chunked["status"]) == ("chunks", "live", "done")
     assert (filed["transport"], filed["source"], filed["status"]) == ("file", "batch", "queued")
-    assert stub_queue == [("run_asr", filed["audioFileId"], "cohere-transcribe")]
+    assert stub_queue == [("run_asr", filed["audioFileId"], "cohere-transcribe", "batch")]
 
 
 def test_both_engines_get_the_whole_file_in_batch_mode(

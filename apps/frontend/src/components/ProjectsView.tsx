@@ -14,6 +14,36 @@ interface ProjectsViewProps {
   surface: StudioMode;
 }
 
+/** The line under a recording's name: when it was made, how long it is, and the
+ * one figure that describes it on this surface.
+ *
+ * A transcript recording has no speakers to detect and no models to count; what
+ * it has is engines compared and, once a reference exists, an error rate.
+ * Showing "0 speakers detected" would read as a failure rather than as a
+ * category that does not apply.
+ *
+ * A saved script has no audio at all, so its duration is not 0:00 — it is
+ * nothing that was ever measured, and printing a clock there would be inventing
+ * a figure.
+ *
+ * Exported because ReportPicker labels the same recordings and must say the same
+ * thing about them; two copies of this would drift.
+ */
+export function projectSubtitle(project: Project, isTranscript: boolean): string {
+  const head = project.date + (project.hasAudio ? ` · ${project.duration}` : "");
+  if (!project.hasAudio) {
+    return `${head} · ${project.ttsCount > 0
+      ? `TTS · ${project.ttsCount} clip${project.ttsCount === 1 ? "" : "s"}`
+      : "script saved, not recorded yet"}`;
+  }
+  if (isTranscript) {
+    return `${head} · ${project.scored && project.bestWer != null
+      ? `best WER ${(project.bestWer * 100).toFixed(1)}%`
+      : "not scored"}`;
+  }
+  return `${head} · ${project.speakers} speakers detected`;
+}
+
 export function ProjectsView({
   projects,
   onOpenProject,
@@ -37,10 +67,13 @@ export function ProjectsView({
           </p>
         </div>
         <div className="view-head-actions">
-          {/* Both surfaces have a report now, but they are different documents: the
-              diarization one is descriptive (no ground truth to score against), the
-              transcript one scores accuracy and breaks it down by language. App
-              picks by surface. */}
+          {/* Opens the recording picker rather than reporting on everything: an
+              aggregate is total errors over total reference words, so one junk
+              take moves the headline number and there has to be a way to leave it
+              out. Both surfaces have a report, but they are different documents:
+              the diarization one is descriptive (no ground truth to score
+              against), the transcript one scores accuracy and breaks it down by
+              language. App picks by surface. */}
           <button className="ghost-btn" type="button" onClick={onGenerateReport} disabled={reportBusy || projects.length === 0}>
             {reportBusy ? "Generating…" : "Generate report"}
           </button>
@@ -69,27 +102,7 @@ export function ProjectsView({
                 <strong>{project.name}</strong>
                 {project.fresh && <b>NEW</b>}
               </span>
-              {/* A transcript recording has no speakers to detect and no models to
-                  count; what it has is engines compared and, once a reference exists,
-                  an error rate. Showing "0 speakers detected" would read as a failure
-                  rather than as a category that does not apply.
-
-                  A saved script has no audio at all, so its duration is not 0:00 — it
-                  is nothing that was ever measured, and printing a clock there would
-                  be inventing a figure. */}
-              <small>
-                {project.date}
-                {project.hasAudio ? ` · ${project.duration}` : ""} ·{" "}
-                {!project.hasAudio
-                  ? project.ttsCount > 0
-                    ? `TTS · ${project.ttsCount} clip${project.ttsCount === 1 ? "" : "s"}`
-                    : "script saved, not recorded yet"
-                  : isTranscript
-                    ? project.scored && project.bestWer != null
-                      ? `best WER ${(project.bestWer * 100).toFixed(1)}%`
-                      : "not scored"
-                    : `${project.speakers} speakers detected`}
-              </small>
+              <small>{projectSubtitle(project, isTranscript)}</small>
             </span>
             <span className="project-colors">
               {SPEAKER_COLORS.slice(0, isTranscript ? project.engines : project.models).map((color) => (
