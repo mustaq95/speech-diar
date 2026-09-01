@@ -373,6 +373,102 @@ class Settings(BaseSettings):
     verify_ssl: bool = True
     litellm_ca_bundle: str = ""
 
+    # --- Pre-start the transcript surface's GPU containers ---
+    # When true, the supervisor daemon starts every container-backed ASR engine
+    # at boot, waits for each to report healthy, and then PINS them: they are
+    # exempt from idle-unload for as long as the daemon runs.
+    #
+    # This exists because the transcript path cannot start a container itself.
+    # Unlike the diarization path it never calls admission/ensure_ready, so a
+    # local engine whose container is down reports "not configured" and can
+    # never be enqueued -- and raising IDLE_UNLOAD_TIMEOUT_SEC does not help,
+    # because idle is measured from `last_job_finished_at`, which for these
+    # models is weeks old (moss 795h, vibevoice 697h as measured on 2026-09-01).
+    #
+    # It is a DELIBERATE OVERRIDE of GPU residency policy, and that is the whole
+    # point of the flag, so be clear about what it costs:
+    #   * pinned containers ignore MAX_RESIDENT_MODELS, so they can hold more
+    #     slots than the cap allows;
+    #   * they ignore `requires_exclusive_gpu`, which vibevoice sets. Both
+    #     vibevoice and moss-transcribe were observed up, healthy and
+    #     transcribing correctly at the same time on this GB10 host, so the flag
+    #     is conservative here rather than wrong -- but on a smaller GPU
+    #     co-residency is exactly what that flag exists to prevent, and vibevoice
+    #     will fail to become healthy instead of failing loudly.
+    #   * a diarization job for some OTHER model may then find no GPU room.
+    #
+    # Leave it false on a shared host. Turn it on when the box is dedicated to an
+    # STT comparison run and you want every engine available at once.
+    stt_prestart_containers: bool = False
+
+    # --- Speechmatics (hosted batch ASR: submit a job, poll, fetch) ---
+    speechmatics_api_key: str | None = None
+    # The US endpoint. This key 401s against eu2.asr.api.speechmatics.com --
+    # Speechmatics keys are region-scoped, so a "just point it at EU" change is a
+    # silent auth failure, not a latency tweak.
+    speechmatics_url: str = "https://asr.api.speechmatics.com/v2"
+    # "ar_en" is Speechmatics' BILINGUAL Arabic+English pack ("Arabic and
+    # English" per its own language_pack_info), not a fallback list, and it is
+    # the only setting here that actually transcribes code-switched audio.
+    #
+    # Measured on a 61 s code-switched recording (2026-09-01):
+    #   ar_en                -> WER 0.589, 119 deletions, English kept in Latin
+    #   auto + expected      -> WER 0.729, 154 deletions, English GONE
+    # Language identification ("auto") resolves ONE pack for the whole file
+    # (predicted_language "ar", all 90 words tagged ar) and then transliterates
+    # or drops every English passage. So "auto" is strictly worse here and is
+    # deliberately not the default. Set this to a single code (e.g. "ar") only
+    # to measure that regression on purpose.
+    speechmatics_language: str = "ar_en"
+    speechmatics_operating_point: str = "enhanced"
+    speechmatics_poll_interval_sec: float = 3
+    speechmatics_timeout_sec: float = 1800
+
+    # --- ElevenLabs Scribe (hosted, one whole-file POST) ---
+    elevenlabs_api_key: str | None = None
+    elevenlabs_stt_url: str = "https://api.elevenlabs.io/v1/speech-to-text"
+    # Validated server-side: a bad id 400s listing what is valid, so a typo fails
+    # loudly instead of silently falling back to an older model.
+    elevenlabs_stt_model: str = "scribe_v2"
+    # "auto" / "" omit `language_code`, which is what makes this engine
+    # auto-detect. Measured: omitted on code-switched audio returned
+    # language_code "ara" at 0.968 confidence AND kept the English in Latin
+    # script (WER 0.564, the best of every engine probed). Forcing a single code
+    # can only take that away, so auto is the default.
+    elevenlabs_stt_language: str = "auto"
+    elevenlabs_stt_timeout_sec: float = 600
+
+    # --- ADEO Qwen3-ASR (hosted, per-model proxy on the ADEO inference host) ---
+    # A per-model proxy URL, not a gateway with a model list: each model has its
+    # own path and its own bearer token, so URL and key travel together.
+    adeo_qwen3_asr_url: str | None = None
+    adeo_qwen3_asr_api_key: str | None = None
+    adeo_qwen3_asr_model: str = "Qwen/Qwen3-ASR-1.7B"
+    adeo_qwen3_asr_timeout_sec: float = 600
+    # No language setting on purpose, and this is measured, not assumed. vLLM
+    # VALIDATES `language` for this model and then the model IGNORES it: omitted,
+    # "ar" and "en" returned byte-identical text (same sha256, 821 chars) on the
+    # same code-switched clip, while "auto" and "ar,en" are rejected 400 against
+    # a 57-code list. The field can therefore only ever break a request, never
+    # change one, so it is never sent. The model code-switches natively.
+
+    # --- ADEO Whisper (hosted, per-model proxy on the same ADEO host) ---
+    adeo_whisper_url: str | None = None
+    adeo_whisper_api_key: str | None = None
+    # Empty omits `model`, which is what the working curl for this pod does. Its
+    # /v1/models could not be read to confirm a served id (see below).
+    adeo_whisper_model: str = ""
+    # "auto" / "" omit `language`, which is how Whisper auto-detects.
+    #
+    # UNVERIFIED, unlike every other engine here: this pod answered 504
+    # "Upstream service is unavailable" on every attempt over ~2 minutes on
+    # 2026-09-01, including its own /v1/models, so its response shape was never
+    # observed. It is implemented against the OpenAI transcription contract the
+    # sibling Qwen3 pod on this same host is PROVEN to speak. Probe it once it is
+    # up before trusting any figure it produces.
+    adeo_whisper_language: str = "auto"
+    adeo_whisper_timeout_sec: float = 600
+
     # --- TTS synthesis engines (script -> read-aloud audio) ---
     # Two synthesis engines, mirroring the two STT engines above: TryHamsa TTS
     # (streaming) and Inception-TTS (single-shot, via the same LiteLLM gateway

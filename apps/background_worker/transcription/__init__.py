@@ -33,12 +33,24 @@ from typing import Any, Callable
 from packages.config.settings import Settings, get_settings
 from packages.shared_contracts.schemas import TranscriptionMode
 
+from .adeo_qwen3 import adapter as adeo_qwen3_adapter
+from .adeo_qwen3 import runner as adeo_qwen3_runner
+from .adeo_whisper import adapter as adeo_whisper_adapter
+from .adeo_whisper import runner as adeo_whisper_runner
 from .cohere import adapter as cohere_adapter
 from .cohere import runner as cohere_runner
+from .elevenlabs import adapter as elevenlabs_adapter
+from .elevenlabs import runner as elevenlabs_runner
 from .hamsa import adapter as hamsa_adapter
 from .hamsa import runner as hamsa_runner
 from .inception import adapter as inception_adapter
 from .inception import runner as inception_runner
+from .moss import adapter as moss_adapter
+from .moss import runner as moss_runner
+from .speechmatics import adapter as speechmatics_adapter
+from .speechmatics import runner as speechmatics_runner
+from .vibevoice import adapter as vibevoice_adapter
+from .vibevoice import runner as vibevoice_runner
 
 #: Display name for the alignment stage, shown on the panel next to align_ms.
 ALIGNER_NAME = "CTC Forced Aligner · MMS-300m"
@@ -79,16 +91,19 @@ class AsrEngine:
     batch_segments: Callable[[Any], int | None] | None = None
 
 
-def cohere_container_healthy(settings: Settings) -> bool:
-    """Whether the offline engine's container is actually up.
+def _container_healthy(url: str | None) -> bool:
+    """Whether a LOCAL model container is actually up.
 
-    Offline is "configured" only when its container answers, not merely when a
-    URL is set (the URL has a default). This is what disables the panel's
-    offline toggle on a host where the container is down, instead of offering a
-    run that would fail at connect. A short timeout keeps the boot-time
-    `GET /config` probe from stalling when the container is absent.
+    A local engine is "configured" only when its container answers, not merely
+    when a URL is set (every one of these URLs has a default). This is what
+    disables an engine on a host where its container is down, instead of
+    offering a run that would fail at connect.
+
+    Cheap even when everything is down: a closed port on localhost refuses the
+    connection immediately rather than hanging, so `GET /config` does not pay the
+    timeout once per stopped container. The timeout only bounds the case where
+    something IS listening but not answering.
     """
-    url = settings.cohere_transcribe_url
     if not url:
         return False
     # Lazy import: the supervisor package pulls in heavier deps, and this module
@@ -96,7 +111,13 @@ def cohere_container_healthy(settings: Settings) -> bool:
     # supervisor uses for its own containers.
     from apps.background_worker.supervisor.containers import is_healthy
 
-    return is_healthy(f"{url}/health", timeout=2.0)
+    return is_healthy(f"{url.rstrip('/')}/health", timeout=2.0)
+
+
+def cohere_container_healthy(settings: Settings) -> bool:
+    """Whether the offline cohere container is up. Kept as a named function so
+    a test can monkeypatch this one engine."""
+    return _container_healthy(settings.cohere_transcribe_url)
 
 
 ASR_ENGINES: dict[str, AsrEngine] = {
@@ -135,6 +156,82 @@ ASR_ENGINES: dict[str, AsrEngine] = {
             # Indirect through the module function so a test can monkeypatch it;
             # the lambda looks the name up at call time.
             configured=lambda s: cohere_container_healthy(s),
+        ),
+        AsrEngine(
+            asr_id="speechmatics",
+            # Hosted job API: the audio is uploaded off this host.
+            mode="online",
+            name="Speechmatics",
+            run=speechmatics_runner.run,
+            adapt=speechmatics_adapter.adapt,
+            run_chunk=speechmatics_runner.transcribe_bytes,
+            # `adapt` IS the chunk reader: a chunk job returns the same json-v2
+            # body as a whole-file job, so reusing it keeps the punctuation
+            # attachment rule in one place instead of forking a second joiner
+            # that would drift.
+            chunk_text=speechmatics_adapter.adapt,
+            configured=lambda s: bool(s.speechmatics_api_key),
+        ),
+        AsrEngine(
+            asr_id="elevenlabs-scribe-v2",
+            mode="online",
+            name="ElevenLabs Scribe v2",
+            run=elevenlabs_runner.run,
+            adapt=elevenlabs_adapter.adapt,
+            run_chunk=elevenlabs_runner.transcribe_bytes,
+            chunk_text=elevenlabs_runner.text_of,
+            batch_segments=elevenlabs_adapter.segment_count,
+            configured=lambda s: bool(s.elevenlabs_api_key),
+        ),
+        AsrEngine(
+            asr_id="adeo-qwen3-asr",
+            mode="online",
+            name="ADEO Qwen3-ASR",
+            run=adeo_qwen3_runner.run,
+            adapt=adeo_qwen3_adapter.adapt,
+            run_chunk=adeo_qwen3_runner.transcribe_bytes,
+            chunk_text=adeo_qwen3_runner.text_of,
+            batch_segments=adeo_qwen3_adapter.segment_count,
+            configured=lambda s: bool(s.adeo_qwen3_asr_url and s.adeo_qwen3_asr_api_key),
+        ),
+        AsrEngine(
+            asr_id="adeo-whisper",
+            mode="online",
+            name="ADEO Whisper",
+            run=adeo_whisper_runner.run,
+            adapt=adeo_whisper_adapter.adapt,
+            run_chunk=adeo_whisper_runner.transcribe_bytes,
+            chunk_text=adeo_whisper_runner.text_of,
+            batch_segments=adeo_whisper_adapter.segment_count,
+            # Credentials only, NOT a reachability probe -- deliberately. This pod
+            # was 504 throughout probing, and a down remote engine must read as a
+            # failed run with its status visible, not as "not configured", which
+            # would quietly drop it from the comparison.
+            configured=lambda s: bool(s.adeo_whisper_url and s.adeo_whisper_api_key),
+        ),
+        AsrEngine(
+            asr_id="moss-transcribe",
+            # Local container: the audio never leaves this host.
+            mode="offline",
+            name="MOSS-Transcribe-Diarize",
+            run=moss_runner.run,
+            adapt=moss_adapter.adapt,
+            run_chunk=moss_runner.transcribe_bytes,
+            # Same shape from a chunk as from a whole file, so `adapt` reads both
+            # and the marker-stripping rule stays in one place.
+            chunk_text=moss_adapter.adapt,
+            configured=lambda s: _container_healthy(s.moss_transcribe_url),
+        ),
+        AsrEngine(
+            asr_id="vibevoice",
+            mode="offline",
+            name="VibeVoice-ASR",
+            run=vibevoice_runner.run,
+            adapt=vibevoice_adapter.adapt,
+            run_chunk=vibevoice_runner.transcribe_bytes,
+            chunk_text=vibevoice_adapter.adapt,
+            batch_segments=vibevoice_adapter.segment_count,
+            configured=lambda s: _container_healthy(s.vibevoice_url),
         ),
     )
 }
@@ -204,7 +301,17 @@ def engine_for(asr_id: str) -> AsrEngine | None:
 #: while the others were fed live. Its error rates are measured against the same
 #: reference and ARE comparable; its timing is a batch figure and every surface
 #: labels it with the transport that produced it.
-COMPARISON_ASR_IDS: tuple[str, ...] = ("hamsa", "inception-stt", "cohere-transcribe")
+COMPARISON_ASR_IDS: tuple[str, ...] = (
+    "hamsa",
+    "inception-stt",
+    "cohere-transcribe",
+    "elevenlabs-scribe-v2",
+    "speechmatics",
+    "adeo-qwen3-asr",
+    "adeo-whisper",
+    "moss-transcribe",
+    "vibevoice",
+)
 
 #: Which transport each engine's audio actually travels over. Not derivable from
 #: `mode` -- hamsa and inception-stt are BOTH online, yet one streams
@@ -231,6 +338,20 @@ ASR_TRANSPORTS: dict[str, str] = {
     # 45s. The language field is what decides, not the chunk size. See
     # `cohere_transcribe_language` in packages/config/settings.py.
     "cohere-transcribe": "file",
+    # Every engine below makes ONE whole-file call over stored audio. "file" is
+    # what `run()` genuinely does in each case, not a default: none of them
+    # splits, and none is fed a stream.
+    #
+    # speechmatics is "file" in the same sense even though its transport is a
+    # JOB QUEUE -- one whole file goes up, one transcript comes back. Its
+    # turnaround is not comparable to a single-shot engine's latency and the
+    # runner says so where the figure is produced.
+    "speechmatics": "file",
+    "elevenlabs-scribe-v2": "file",
+    "adeo-qwen3-asr": "file",
+    "adeo-whisper": "file",
+    "moss-transcribe": "file",
+    "vibevoice": "file",
 }
 
 
@@ -255,6 +376,23 @@ ASR_FEED_MODES: dict[str, tuple[str, ...]] = {
     "hamsa": ("live",),
     "inception-stt": ("live", "batch"),
     "cohere-transcribe": ("live", "batch"),
+    # The three fast hosted engines take a live chunk fine: each is a single
+    # short request/response, the same shape the live chunk route already posts.
+    "elevenlabs-scribe-v2": ("live", "batch"),
+    "adeo-qwen3-asr": ("live", "batch"),
+    "adeo-whisper": ("live", "batch"),
+    # These three also run live. Their INPUT is identical to every other chunked
+    # engine's (one recorder, one interval, the same bytes fanned out), so their
+    # error rates are comparable. Their live LATENCY is not, and each carries the
+    # reason in its own runner docstring:
+    #   speechmatics -- one submit/poll/fetch JOB per chunk, so the figure is
+    #                   queue turnaround rather than inference.
+    #   vibevoice    -- ~0.9x realtime, so it falls further behind as it goes.
+    #   moss         -- fast (4.1 s for 61 s), but a 3 s window gives a joint
+    #                   diarization model no context to diarize with.
+    "speechmatics": ("live", "batch"),
+    "moss-transcribe": ("live", "batch"),
+    "vibevoice": ("live", "batch"),
 }
 
 #: The transport each engine uses when fed LIVE. Its batch counterpart is
@@ -264,6 +402,12 @@ LIVE_TRANSPORTS: dict[str, str] = {
     "hamsa": "stream",
     "inception-stt": "chunks",
     "cohere-transcribe": "chunks",
+    "elevenlabs-scribe-v2": "chunks",
+    "adeo-qwen3-asr": "chunks",
+    "adeo-whisper": "chunks",
+    "speechmatics": "chunks",
+    "moss-transcribe": "chunks",
+    "vibevoice": "chunks",
 }
 
 

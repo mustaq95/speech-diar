@@ -122,6 +122,17 @@ export function TranscriptStudio({
   onScriptSaved,
 }: TranscriptStudioProps) {
   const config = runtimeConfig?.transcript ?? null;
+  // Every engine the host knows about, configured or not. Used for LAYOUT only:
+  // an engine whose container is down still gets a card, marked not ready, so the
+  // comparison grid keeps a stable shape and a missing engine is visible in place
+  // rather than named in a banner far from where its result would have been.
+  const allEngines = useMemo<TranscriptEngineInfo[]>(
+    () => config?.engines ?? [],
+    [config],
+  );
+  // Configured only. Everything that RUNS keys on this: `start_transcripts` is
+  // all-or-nothing and rejects an unconfigured engine before queueing anything,
+  // so an unready engine must never reach a run request.
   const engines = useMemo<TranscriptEngineInfo[]>(
     () => (config?.engines ?? []).filter((engine) => engine.configured),
     [config],
@@ -630,7 +641,6 @@ export function TranscriptStudio({
     }
   };
 
-  const unconfigured = (config?.engines ?? []).filter((engine) => !engine.configured);
 
   // Switching sub-mode while a live capture is running must tear it down the
   // same way unmounting does — the microphone and sockets are real resources
@@ -674,7 +684,7 @@ export function TranscriptStudio({
           <small className="mono muted transcript-mode-caption">
             {transcriptSubMode === "tts"
               ? `speech synthesis · ${ttsEngineCount} ${ttsEngineCount === 1 ? "engine" : "engines"}`
-              : `speech recognition · ${engines.length} ${engines.length === 1 ? "engine" : "engines"}`}
+              : `speech recognition · ${engines.length} of ${allEngines.length} ready`}
           </small>
         </div>
       </div>
@@ -687,12 +697,6 @@ export function TranscriptStudio({
         />
       ) : (
       <>
-      {unconfigured.length > 0 && (
-        <p className="transcript-notice">
-          Not configured: {unconfigured.map((engine) => engine.name).join(", ")} (check .env)
-        </p>
-      )}
-
       <section className="transcript-grid">
         <div className="panel script-controls">
           <h2>Read it out</h2>
@@ -886,7 +890,30 @@ export function TranscriptStudio({
       {runError && <p className="transcript-error">{runError}</p>}
 
       <section className="engine-panels">
-        {engines.map((engine) => {
+        {allEngines.map((engine) => {
+          // Not ready: its credentials are missing or its container is down. It
+          // keeps its place in the grid with the reason on the card, instead of
+          // vanishing and leaving the reader to notice an absence. Everything
+          // below this point assumes a runnable engine, so it returns here.
+          if (!engine.configured) {
+            return (
+              <div className="panel engine-panel is-not-ready" key={engine.asrId}>
+                <div className="engine-head">
+                  <span className="engine-name">
+                    <span className="engine-dot not-ready" aria-hidden="true" />
+                    {engine.name}
+                  </span>
+                  <span className="engine-head-right">
+                    <span className="engine-not-ready">Not ready</span>
+                  </span>
+                </div>
+                <div className="engine-body engine-body-empty">
+                  Not configured on this host. Check its credentials in .env, or
+                  start its container if it runs locally.
+                </div>
+              </div>
+            );
+          }
           // Live panel while capturing; the stored run when a saved recording is
           // open. Its avgLatencyMs is the value that was MEASURED at the time —
           // recomputing it from anything now would be a different number.

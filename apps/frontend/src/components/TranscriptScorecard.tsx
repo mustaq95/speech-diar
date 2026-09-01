@@ -10,9 +10,18 @@ interface TranscriptScorecardProps {
 
 /** One comparable figure per engine, plus how to read it.
  *
- * `lowerIsBetter` drives the bar length, because a bar that grows with the error
- * rate would make the worse engine look like the fuller one. `unavailable`
- * carries the reason a figure is missing, which is never rendered as zero. */
+ * `lowerIsBetter` drives RANK (which engine sorts first, and which bar is
+ * coloured best/worst) but NOT bar length. Bar length is the measured value
+ * itself, as a share of the largest value in the tile.
+ *
+ * The bar used to be share-of-best, so a 6.7% WER drew a full bar and a 108%
+ * WER drew a stub -- length ran opposite to the number printed beside it, and
+ * every reader had to hold "longer means better here" in their head. Now length
+ * tracks magnitude the way a bar chart normally does, and direction is carried
+ * by the sort order and the colour instead.
+ *
+ * `unavailable` carries the reason a figure is missing, which is never rendered
+ * as zero. */
 interface Tile {
   title: string;
   hint: string;
@@ -120,13 +129,33 @@ export function TranscriptScorecard({ runs, engines, referenceWords }: Transcrip
           const worst = values.length
             ? tile.lowerIsBetter ? Math.max(...values) : Math.min(...values)
             : null;
+          // Bar length is a share of the LARGEST value present, so the longest
+          // bar is the biggest number regardless of which direction is good.
+          const scale = values.length ? Math.max(...values) : null;
+          // Ranked best-first, so the reader gets the ordering from the layout
+          // and does not have to scan for the smallest number. A run with no
+          // figure (queued, or real-time bound) sorts last rather than counting
+          // as a zero, which would rank an unmeasured engine as the winner.
+          // Copied before sorting: `runs` is the caller's array and the other tiles
+          // sort it differently. oxlint flags the bare .sort(); the spread is the
+          // fix, and `toSorted` is not available at this project's TS lib target.
+          const ranked = [...runs].sort((a, b) => {
+            const av = tile.valueOf(a);
+            const bv = tile.valueOf(b);
+            if (av == null && bv == null) return 0;
+            if (av == null) return 1;
+            if (bv == null) return -1;
+            return tile.lowerIsBetter ? av - bv : bv - av;
+          });
 
           return (
             <div className="score-tile" key={tile.title}>
               <strong>{tile.title}</strong>
               <small className="muted">{tile.hint}</small>
-              <span className="eyebrow">Bar length = better score</span>
-              {runs.map((run) => {
+              <span className="eyebrow">
+                Bar length = measured value · ranked best first
+              </span>
+              {ranked.map((run) => {
                 const value = tile.valueOf(run);
                 // A run the worker has not finished yet reports THAT, ahead of
                 // any per-tile reason: "—" beside a finished engine's number
@@ -136,14 +165,26 @@ export function TranscriptScorecard({ runs, engines, referenceWords }: Transcrip
                 const reason = pending
                   ? (run.status === "running" ? "transcribing…" : "queued…")
                   : tile.unavailable?.(run) ?? null;
-                // Bar length is share-of-best, so the better engine is always the
-                // fuller bar regardless of which direction is good.
+                // Proportional to the value itself. A floor of 1.5% keeps a
+                // genuine near-zero (a 0.0% error rate) visible as a sliver
+                // rather than as nothing, which would read as "not measured".
                 let fill = 0;
-                if (value != null && best != null && worst != null) {
-                  if (best === worst) fill = 100;
-                  else if (tile.lowerIsBetter) fill = (best / value) * 100;
-                  else fill = (value / best) * 100;
+                if (value != null && scale != null && scale > 0) {
+                  fill = Math.max(1.5, (value / scale) * 100);
+                } else if (value != null) {
+                  fill = 1.5; // every value is 0 in this tile
                 }
+                // Colour carries the direction that bar length no longer does.
+                // Only applied once there is a spread to rank: with every engine
+                // on the same number, nothing is best or worst.
+                const rankClass =
+                  value == null || best == null || best === worst
+                    ? ""
+                    : value === best
+                      ? " is-best"
+                      : value === worst
+                        ? " is-worst"
+                        : "";
                 const transport = transportOf(run);
                 return (
                   <div className={`score-row${pending ? " is-pending" : ""}`} key={keyOf(run)}>
@@ -156,7 +197,7 @@ export function TranscriptScorecard({ runs, engines, referenceWords }: Transcrip
                         {value != null ? tile.format(value) : <span className="muted">{reason ?? "—"}</span>}
                       </b>
                     </div>
-                    <div className="score-bar">
+                    <div className={`score-bar${rankClass}`}>
                       <i style={{ width: `${Math.max(0, Math.min(100, fill))}%` }} />
                     </div>
                     {/* The transport is on every row, not in a footnote: it is

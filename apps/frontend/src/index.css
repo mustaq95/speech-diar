@@ -128,7 +128,14 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
    overflowed the flex container for `.page { overflow: auto }` to act on.
    `min-height: auto` (the flex default) floors this at its content, so the page
    scrolls instead of stacking two things in one place. */
-.engine-panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; margin-bottom: 0; flex: 1; }
+/* Three across, hard. auto-fit was right for three engines and wrong for nine:
+   it packs as many 320px columns as the viewport allows, so a wide screen put
+   five or six panels in one row and the engine name, its rate and its transport
+   label stopped being readable. Rows of three wrap to a second and third row.
+   minmax(0, 1fr) rather than 1fr because a grid item floors at min-content, and
+   one long unbroken transcript would otherwise widen its column past its share
+   and overflow the row -- the same reason .transcript-grid above uses it. */
+.engine-panels { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-bottom: 0; flex: 1; }
 .engine-panel { display: flex; flex-direction: column; gap: 12px; }
 .engine-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
 .engine-name { display: inline-flex; align-items: center; gap: 8px; font-weight: 650; font-size: 14px; }
@@ -239,7 +246,11 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .scorecard-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
 .scorecard-head h2 { margin: 0; font-size: 16px; }
 .scorecard-head .mono { font-size: 11px; flex: 1; min-width: 200px; }
-.scorecard-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+/* FOUR across, one per metric, so Word Error Rate / Character Error Rate /
+   Word Count / Real-Time Factor read as one row and can be compared left to
+   right. Three columns wrapped Real-Time Factor onto a line of its own, which
+   made it look like a separate section rather than the fourth metric. */
+.scorecard-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
 .score-tile { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 4px; }
 .score-tile > strong { font-size: 13px; }
 .score-tile > small { font-size: 11px; line-height: 1.4; }
@@ -248,7 +259,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .score-row-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; font-size: 12px; }
 .score-row-head b { font-size: 15px; }
 .score-bar { height: 4px; border-radius: 3px; background: var(--line); overflow: hidden; }
-.score-bar i { display: block; height: 100%; background: var(--good); border-radius: 3px; }
+.score-bar i { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
 .score-transport { font-size: 10px; color: var(--faint); }
 .scorecard-ops { border-top: 1px solid var(--line); padding-top: 14px; display: flex; flex-direction: column; gap: 6px; }
 .ops-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; font-size: 12px; }
@@ -270,6 +281,8 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   .transcript-grid { grid-template-columns: minmax(0, 1fr); }
   .recorder-bar { flex-wrap: wrap; }
   .record-wave { order: 3; flex-basis: 100%; }
+  .engine-panels, .scorecard-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .score-tile { min-width: 0; }
 }
 .page-empty { max-width: 1160px; width: 100%; margin: 0 auto; }
 .narrow, .settings-page { max-width: 920px; width: 100%; margin: 0 auto; }
@@ -574,6 +587,10 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   .config-bar, .file-bar { align-items: flex-start; flex-direction: column; }
 }
 @media (max-width: 720px) {
+  /* Must live in THIS block, not the 720px block higher up: that one precedes
+     the 980px rules, so at <=720px the two-column rule would win the cascade and
+     the single column would never apply. */
+  .engine-panels, .scorecard-grid { grid-template-columns: minmax(0, 1fr); }
   .page, .dashboard { padding-left: 14px; padding-right: 14px; }
   .empty-head, .view-head { align-items: flex-start; flex-direction: column; }
   .animated-bars { display: none; }
@@ -583,3 +600,26 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   .studio-shell { overflow-x: auto; }
   .studio-grid { grid-template-columns: 190px minmax(0, 1fr); }
 }
+
+/* An engine the host cannot run right now. It keeps its slot in the grid so the
+   comparison has a stable shape and the gap is visible where the result would
+   be, rather than being named in a banner above the fold. Dimmed, not hidden. */
+.engine-panel.is-not-ready { opacity: .55; }
+.engine-dot.not-ready { background: var(--muted); }
+.engine-not-ready {
+  font-size: 10.5px; letter-spacing: .04em; text-transform: uppercase;
+  padding: 2px 7px; border-radius: 999px; color: var(--muted);
+  border: 1px solid var(--line); white-space: nowrap;
+}
+.engine-body-empty { color: var(--muted); font-size: 13px; line-height: 1.6; }
+
+/* Bar length is the measured value, so direction is carried by colour instead:
+   green is the best figure in that tile, red the worst, and everything between
+   is the neutral accent. Neither class is applied when every engine scored the
+   same, because then nothing is best or worst.
+
+   The base bar had to stop being green for this to read: with length tracking
+   magnitude, an all-green scale made the LONGEST bar -- the worst engine -- the
+   most emphatic thing in the tile. */
+.score-bar.is-best > i { background: var(--good); }
+.score-bar.is-worst > i { background: var(--bad); }

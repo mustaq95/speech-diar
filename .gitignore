@@ -1,5 +1,6 @@
 node_modules
 dist
+docs/
 project/
 .DS_Store
 .env
@@ -12,7 +13,7 @@ apps/frontend/*.tsbuildinfo
 .cursor/
 .gstack/
 test/samples/
-
+tests/fixtures/
 # Python
 .venv
 __pycache__
@@ -21,3 +22,5 @@ __pycache__
 *.egg-info
 *.env
 agent-browser.json
+# Local markdown issue tracker (docs/agents/issue-tracker.md)
+.scratch/

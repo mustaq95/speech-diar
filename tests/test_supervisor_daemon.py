@@ -41,6 +41,11 @@ def _wire_test_session(db_session_factory: sessionmaker[Session], monkeypatch: p
             "container_stop_grace_sec": 30,
             "supervisor_stale_grace_sec": 60,
             "unhealthy_retry_backoff_sec": 120,
+            # Off, so these tests keep exercising idle-unload itself. The pin
+            # that STT_PRESTART_CONTAINERS applies is covered separately in
+            # test_supervisor_stt_prestart.py, and leaving it on here would make
+            # every sweep below skip the models it is trying to unload.
+            "stt_prestart_containers": False,
         },
     )()
     monkeypatch.setattr(daemon, "get_settings", lambda: fake_settings)
