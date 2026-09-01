@@ -56,6 +56,25 @@ def adapt(raw: SpeechmaticsRawOutput) -> str:
     return " ".join(out).strip()
 
 
+def adapt_stream(frames: list[dict]) -> str:
+    """Concatenate the text from a replay-live pass through Speechmatics RT.
+
+    Different native shape from `adapt` above: the batch runner returns one
+    json-v2 body with a `results` array of tokens; the realtime WebSocket
+    returns a series of `AddTranscript` frames each with its own `metadata`
+    block. `metadata.transcript` is the already-joined-and-punctuated string
+    for that segment (the RT protocol does the token join server-side, so
+    the `results` array's alternate-content shape does not apply here).
+
+    Order is arrival order (which is also chronological).
+    """
+    return " ".join(
+        text
+        for frame in frames
+        if (text := str((frame.get("metadata") or {}).get("transcript") or "").strip())
+    ).strip()
+
+
 def language_pack(raw: SpeechmaticsRawOutput) -> str | None:
     """The language pack the job actually ran, as the API describes it.
 

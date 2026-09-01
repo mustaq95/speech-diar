@@ -40,6 +40,7 @@ from .adeo_whisper import runner as adeo_whisper_runner
 from .cohere import adapter as cohere_adapter
 from .cohere import runner as cohere_runner
 from .elevenlabs import adapter as elevenlabs_adapter
+from .elevenlabs import live_relay as elevenlabs_live_relay
 from .elevenlabs import runner as elevenlabs_runner
 from .hamsa import adapter as hamsa_adapter
 from .hamsa import runner as hamsa_runner
@@ -48,6 +49,7 @@ from .inception import runner as inception_runner
 from .moss import adapter as moss_adapter
 from .moss import runner as moss_runner
 from .speechmatics import adapter as speechmatics_adapter
+from .speechmatics import live_relay as speechmatics_live_relay
 from .speechmatics import runner as speechmatics_runner
 from .vibevoice import adapter as vibevoice_adapter
 from .vibevoice import runner as vibevoice_runner
@@ -84,6 +86,16 @@ class AsrEngine:
     #: 200 OK, with nothing to notice but two suspiciously identical columns.
     run_chunk: Callable[[bytes, str], Any] | None = None
     chunk_text: Callable[[Any], str] | None = None
+    #: audio path -> (native frames, per-final-arrival lag in ms). The
+    #: replay-live path for a STREAM engine: feeds stored audio through the
+    #: engine's real-time WebSocket at 1x, returning the frames that would
+    #: have arrived if a human read the same audio aloud. Paired with
+    #: `stream_text` (which extracts text from those frames) the way
+    #: `run_chunk` is paired with `chunk_text` for chunked engines. None for
+    #: an engine whose live transport is `chunks` -- the invariant test in
+    #: `tests/test_model_registration.py` pins the biconditional.
+    run_stream: Callable[[str], tuple[Any, list[int]]] | None = None
+    stream_text: Callable[[Any], str] | None = None
     #: native output -> how many pieces a BATCH run cut the recording into.
     #: Supplied by the adapter, because only it may read the native shape. None
     #: for an engine whose batch run is a single call (cohere: transport "file",
@@ -148,7 +160,11 @@ ASR_ENGINES: dict[str, AsrEngine] = {
         AsrEngine(
             asr_id="cohere-transcribe",
             mode="offline",
-            name="Cohere",
+            # The served model is Arabic-specific and its language field is not a
+            # hint (see cohere_transcribe_language in settings). Naming it plainly
+            # keeps a reader from taking a row labelled "Cohere" for Cohere's
+            # general multilingual ASR.
+            name="Cohere Transcribe Arabic",
             run=cohere_runner.run,
             adapt=cohere_adapter.adapt,
             run_chunk=cohere_runner.transcribe_bytes,
@@ -159,17 +175,23 @@ ASR_ENGINES: dict[str, AsrEngine] = {
         ),
         AsrEngine(
             asr_id="speechmatics",
-            # Hosted job API: the audio is uploaded off this host.
+            # Hosted job API for batch; hosted RT WebSocket for live. Audio
+            # leaves this host either way, hence `online`.
             mode="online",
             name="Speechmatics",
             run=speechmatics_runner.run,
             adapt=speechmatics_adapter.adapt,
-            run_chunk=speechmatics_runner.transcribe_bytes,
-            # `adapt` IS the chunk reader: a chunk job returns the same json-v2
-            # body as a whole-file job, so reusing it keeps the punctuation
-            # attachment rule in one place instead of forking a second joiner
-            # that would drift.
-            chunk_text=speechmatics_adapter.adapt,
+            # No `run_chunk`/`chunk_text`: live now speaks Real-Time v2 over
+            # a WebSocket (see `speechmatics/live_relay.py` and
+            # `LIVE_TRANSPORTS` below), not one batch JOB per chunk. Leaving
+            # the chunk pair in place would trip the invariant that says an
+            # engine is chunkable iff its live transport declares `chunks`.
+            # `run_stream` is the replay-live entry point: feed stored audio
+            # through the same RT WS at 1x pace, same measurement a
+            # read-aloud makes, so "replay live" on a saved recording is a
+            # comparable row to a real live one rather than a JOB per chunk.
+            run_stream=speechmatics_live_relay.stream_replay,
+            stream_text=speechmatics_adapter.adapt_stream,
             configured=lambda s: bool(s.speechmatics_api_key),
         ),
         AsrEngine(
@@ -178,8 +200,19 @@ ASR_ENGINES: dict[str, AsrEngine] = {
             name="ElevenLabs Scribe v2",
             run=elevenlabs_runner.run,
             adapt=elevenlabs_adapter.adapt,
-            run_chunk=elevenlabs_runner.transcribe_bytes,
-            chunk_text=elevenlabs_runner.text_of,
+            # No `run_chunk`/`chunk_text`: this engine's LIVE transport is now
+            # stream (see `LIVE_TRANSPORTS` and `live_relay.py`), so it is fed
+            # over a WebSocket rather than through the chunk route. Leaving the
+            # chunk pair in place would trip the invariant that says an engine
+            # is chunkable iff its live transport declares `chunks`.
+            # `run_stream` is the replay-live entry point: feed stored audio
+            # through the same Scribe Realtime WS at 1x pace, so a replayed
+            # row measures the streaming product (`scribe_v2_realtime`) the
+            # same way a read-aloud one does. Batch stays on `scribe_v2`
+            # (`run` above), because the two are DIFFERENT models on the
+            # vendor side and the comparison exists to show that.
+            run_stream=elevenlabs_live_relay.stream_replay,
+            stream_text=elevenlabs_adapter.adapt_stream,
             batch_segments=elevenlabs_adapter.segment_count,
             configured=lambda s: bool(s.elevenlabs_api_key),
         ),
@@ -376,21 +409,26 @@ ASR_FEED_MODES: dict[str, tuple[str, ...]] = {
     "hamsa": ("live",),
     "inception-stt": ("live", "batch"),
     "cohere-transcribe": ("live", "batch"),
-    # The three fast hosted engines take a live chunk fine: each is a single
-    # short request/response, the same shape the live chunk route already posts.
+    # ElevenLabs' live transport is `stream` (Scribe v2 Realtime WebSocket) --
+    # see `LIVE_TRANSPORTS` below and `elevenlabs/live_relay.py`. Batch is the
+    # whole-file HTTP POST in `elevenlabs/runner.py`.
     "elevenlabs-scribe-v2": ("live", "batch"),
+    # Two fast hosted engines take a live chunk fine: each is a single short
+    # request/response, the same shape the live chunk route already posts.
     "adeo-qwen3-asr": ("live", "batch"),
     "adeo-whisper": ("live", "batch"),
-    # These three also run live. Their INPUT is identical to every other chunked
-    # engine's (one recorder, one interval, the same bytes fanned out), so their
-    # error rates are comparable. Their live LATENCY is not, and each carries the
-    # reason in its own runner docstring:
-    #   speechmatics -- one submit/poll/fetch JOB per chunk, so the figure is
-    #                   queue turnaround rather than inference.
-    #   vibevoice    -- ~0.9x realtime, so it falls further behind as it goes.
-    #   moss         -- fast (4.1 s for 61 s), but a 3 s window gives a joint
-    #                   diarization model no context to diarize with.
+    # Speechmatics live now runs on its Real-Time v2 WebSocket, not the batch
+    # job API (see `LIVE_TRANSPORTS` below and `speechmatics/live_relay.py`).
+    # Batch is unchanged: still the whole-file POST/poll/fetch in
+    # `speechmatics/runner.py`.
     "speechmatics": ("live", "batch"),
+    # Two more live engines. Their INPUT is identical to every other chunked
+    # engine's (one recorder, one interval, the same bytes fanned out), so
+    # their error rates are comparable. Their live LATENCY is not, and each
+    # carries the reason in its own runner docstring:
+    #   vibevoice -- ~0.9x realtime, so it falls further behind as it goes.
+    #   moss      -- fast (4.1 s for 61 s), but a 3 s window gives a joint
+    #                diarization model no context to diarize with.
     "moss-transcribe": ("live", "batch"),
     "vibevoice": ("live", "batch"),
 }
@@ -402,10 +440,19 @@ LIVE_TRANSPORTS: dict[str, str] = {
     "hamsa": "stream",
     "inception-stt": "chunks",
     "cohere-transcribe": "chunks",
-    "elevenlabs-scribe-v2": "chunks",
+    # Scribe v2 Realtime WebSocket, verified end to end on 2026-09-01. See
+    # `elevenlabs/live_relay.py`. This is a DIFFERENT model id from the batch
+    # runner's `scribe_v2` and speaks a different wire protocol; the two share
+    # only the account credential.
+    "elevenlabs-scribe-v2": "stream",
     "adeo-qwen3-asr": "chunks",
     "adeo-whisper": "chunks",
-    "speechmatics": "chunks",
+    # Speechmatics Real-Time v2 WebSocket, verified end to end on 2026-09-01
+    # (time-to-first-partial 856 ms, 53 finals for the 30 s pyannote sample).
+    # See `speechmatics/live_relay.py`. Same account credential as the batch
+    # runner, DIFFERENT host (`<region>.rt.speechmatics.com`, no `.api.`),
+    # a short-lived JWT per session minted from the API key.
+    "speechmatics": "stream",
     "moss-transcribe": "chunks",
     "vibevoice": "chunks",
 }

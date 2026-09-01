@@ -1,5 +1,7 @@
-"""Speechmatics -- execution code. A hosted BATCH job API, so audio leaves this
-host and this engine is `online`.
+"""Speechmatics -- BATCH execution code. Live streaming lives next door in
+`live_relay.py` and speaks a different product (`<region>.rt.speechmatics.com`
+WebSocket) with the same account credential. This module handles the
+whole-file job-queue path only.
 
 Unlike every other engine here it is not one request. It is three:
 
@@ -45,12 +47,9 @@ Arabic/English clip. Four findings, each load-bearing:
    Repointing SPEECHMATICS_URL at another region is an auth change, not a
    latency tweak.
 
-Live mode costs one full JOB per chunk. `transcribe_bytes` submits, polls and
-fetches for each chunk it is handed, so its latency is dominated by queue
-turnaround and our own poll granularity rather than by inference. The INPUT is
-still fair -- every chunked engine gets byte-identical bytes from one recorder --
-but this engine's live latency measures the job pipeline and must be read with
-its transport label attached.
+Live streaming does NOT go through this file. That path is in `live_relay.py`
+and opens a Real-Time v2 WebSocket to `<region>.rt.speechmatics.com`, which
+is a separate product from this batch host. Same API key mints its temp JWT.
 
 Configuration (`.env`, read via `packages/config/settings.py`):
   SPEECHMATICS_API_KEY / SPEECHMATICS_URL   -- credential and regional endpoint
@@ -188,16 +187,6 @@ def _run_job(wav_bytes: bytes, filename: str) -> SpeechmaticsRawOutput:
     transcript["job_id"] = job_id
     transcript["turnaround_ms"] = int((time.perf_counter() - started) * 1000)
     return transcript
-
-
-def transcribe_bytes(wav_bytes: bytes, filename: str = "chunk.wav") -> SpeechmaticsRawOutput:
-    """Transcribe one already-short WAV -- the live chunk path.
-
-    One chunk is one whole JOB. Nothing is batched across chunks and no session
-    is held open, because the batch API has no such concept; see the module
-    docstring for what that means for the reported latency.
-    """
-    return _run_job(wav_bytes, filename)
 
 
 def run(audio_path: str) -> SpeechmaticsRawOutput:

@@ -370,23 +370,36 @@ async def transcribe_chunk(
 async def live_stream(websocket: WebSocket, session_id: str, asr_id: str) -> None:
     """Relay microphone PCM to a streaming engine and its text back, live.
 
-    One engine session for the whole recording, which is TryHamsa's native mode:
-    its VAD segments speech as the audio arrives, and cutting the audio into
-    independent short sessions would destroy that context across every boundary.
-    Giving it its native transport is the point — matching it to the chunked
-    engine's shape would handicap it and call the result fairness.
+    One engine session for the whole recording -- each streaming engine's
+    native mode. Its VAD segments speech as the audio arrives, and cutting
+    the audio into independent short sessions would destroy that context
+    across every boundary. Giving it its native transport is the point;
+    matching it to the chunked engine's shape would handicap it and call the
+    result fairness.
 
-    **Latency here is lag behind live, not per-call processing time.** A streaming
-    protocol consumes audio at 1x by definition, so "how long did the call take"
-    is not a question that has an answer. What is measurable, and what the panel's
-    lag figure means, is: at the moment a piece of text arrived, how far behind the
-    speaker was it — wall-clock elapsed minus the seconds of audio delivered so
-    far. A chunked engine's figure is its own send-to-return time. Both are
-    labelled with their transport, because they are not the same measurement.
+    Three streaming engines: TryHamsa (custom handshake, raw binary frames
+    with a client-side ack contract), ElevenLabs Scribe v2 Realtime
+    (server-first `session_started`, base64-inside-JSON `input_audio_chunk`
+    frames) and Speechmatics Real-Time v2 (JSON `StartRecognition`, raw
+    binary PCM frames server-acked with `AudioAdded{seq_no}`, an explicit
+    `EndOfStream{last_seq_no}` at stop). The wire shapes are different enough
+    that abstracting them into one function would obscure rather than clarify;
+    each engine's relay lives with its runner (`<engine>/live_relay.py`) and
+    this route just dispatches.
 
-    Audio is NOT paced here. `hamsa_stt_chunk_sleep_sec` exists to feed a stored
-    file at roughly real time; microphone audio already arrives at real time, and
-    pacing it again would add delay to a number reported as the engine's.
+    **Latency here is lag behind live, not per-call processing time.** A
+    streaming protocol consumes audio at 1x by definition, so "how long did
+    the call take" is not a question that has an answer. What is measurable,
+    and what the panel's lag figure means, is: at the moment a piece of text
+    arrived, how far behind the speaker was it -- wall-clock elapsed minus
+    the seconds of audio delivered so far. A chunked engine's figure is its
+    own send-to-return time. Both are labelled with their transport, because
+    they are not the same measurement.
+
+    Audio is NOT paced here. `hamsa_stt_chunk_sleep_sec` exists to feed a
+    stored file at roughly real time; microphone audio already arrives at
+    real time, and pacing it again would add delay to a number reported as
+    the engine's.
     """
     await websocket.accept()
 
@@ -399,6 +412,32 @@ async def live_stream(websocket: WebSocket, session_id: str, asr_id: str) -> Non
         await websocket.close()
         return
 
+    # Dispatch to the engine's own relay. Only engines whose LIVE transport is
+    # `stream` belong here; a chunks engine on this route is caller error and
+    # we surface it rather than falling into the wrong engine's protocol.
+    from apps.background_worker.transcription import LIVE_TRANSPORTS
+
+    if LIVE_TRANSPORTS.get(asr_id) != "stream":
+        await websocket.send_json(
+            {"type": "error", "message": f"engine {asr_id!r} has no stream transport"}
+        )
+        await websocket.close()
+        return
+    if asr_id == "elevenlabs-scribe-v2":
+        from apps.background_worker.transcription.elevenlabs import live_relay as elevenlabs_live_relay
+
+        await elevenlabs_live_relay.run(websocket, session_id, asr_id)
+        return
+    if asr_id == "speechmatics":
+        from apps.background_worker.transcription.speechmatics import live_relay as speechmatics_live_relay
+
+        await speechmatics_live_relay.run(websocket, session_id, asr_id)
+        return
+
+    # Fall-through is Hamsa's inline relay. Kept inline rather than moved into
+    # `hamsa/live_relay.py` because touching it would be a refactor unrelated
+    # to adding a second engine, and the two engines' handshakes are different
+    # enough that a "shared" version would obscure both.
     import asyncio
     import json
     import time

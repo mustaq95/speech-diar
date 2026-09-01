@@ -1,6 +1,8 @@
+import { useState } from "react";
 import type { TranscriptRun } from "../types/diarization";
 import type { TranscriptEngineInfo } from "../adapters";
 import { buildTranscriptReportHtml, downloadReport } from "../report";
+import { Segmented } from "./controls";
 
 interface TranscriptScorecardProps {
   runs: TranscriptRun[];
@@ -91,19 +93,43 @@ function keyOf(run: TranscriptRun): string {
   return `${run.asrId}::${run.source}`;
 }
 
+type FeedFilter = "all" | "live" | "batch";
+
 export function TranscriptScorecard({ runs, engines, referenceWords }: TranscriptScorecardProps) {
   const transportOf = (run: TranscriptRun) =>
     run.transport ?? engines.find((engine) => engine.asrId === run.asrId)?.transport ?? null;
   const nameOf = (run: TranscriptRun) =>
     engines.find((engine) => engine.asrId === run.asrId)?.name ?? run.asrName ?? run.asrId;
 
-  const scored = runs.some((run) => run.metrics);
-  const first = runs[0]?.metrics;
+  const [feedFilter, setFeedFilter] = useState<FeedFilter>("all");
+  const feedOf = (run: TranscriptRun): FeedFilter =>
+    run.source === "live" ? "live" : "batch";
+  const visibleRuns =
+    feedFilter === "all" ? runs : runs.filter((run) => feedOf(run) === feedFilter);
+
+  const scored = visibleRuns.some((run) => run.metrics);
+  const first = visibleRuns[0]?.metrics;
 
   return (
     <section className="panel scorecard">
       <div className="scorecard-head">
         <h2>Eval result</h2>
+        {/* Filter, not sort: mixing live and batch in one ranking hides the
+            fact that they are measurements of two different pipelines. Always
+            shown so every eval-result view -- fresh read-aloud or a saved
+            recording rescored later -- reads the same. Sits next to the
+            heading, before the reference-words line, so it reads as part of
+            what the section IS rather than a control tucked over on the right. */}
+        <Segmented<FeedFilter>
+          value={feedFilter}
+          options={[
+            { value: "all", label: "All" },
+            { value: "live", label: "Live" },
+            { value: "batch", label: "Batch" },
+          ]}
+          onChange={setFeedFilter}
+          label="Filter by feed mode"
+        />
         <span className="mono muted">
           {scored
             ? `scored against the reference · ${first?.refWordCount ?? referenceWords} reference words · normalization on`
@@ -112,7 +138,7 @@ export function TranscriptScorecard({ runs, engines, referenceWords }: Transcrip
         <button
           type="button"
           className="ghost-btn"
-          onClick={() => downloadReport(buildTranscriptReportHtml(runs, engines))}
+          onClick={() => downloadReport(buildTranscriptReportHtml(visibleRuns, engines))}
         >
           Export report →
         </button>
@@ -120,7 +146,7 @@ export function TranscriptScorecard({ runs, engines, referenceWords }: Transcrip
 
       <div className="scorecard-grid">
         {TILES.map((tile) => {
-          const values = runs
+          const values = visibleRuns
             .map((run) => tile.valueOf(run))
             .filter((value): value is number => value != null);
           const best = values.length
@@ -136,10 +162,11 @@ export function TranscriptScorecard({ runs, engines, referenceWords }: Transcrip
           // and does not have to scan for the smallest number. A run with no
           // figure (queued, or real-time bound) sorts last rather than counting
           // as a zero, which would rank an unmeasured engine as the winner.
-          // Copied before sorting: `runs` is the caller's array and the other tiles
-          // sort it differently. oxlint flags the bare .sort(); the spread is the
-          // fix, and `toSorted` is not available at this project's TS lib target.
-          const ranked = [...runs].sort((a, b) => {
+          // Copied before sorting: `visibleRuns` is derived from the caller's
+          // array and the other tiles sort it differently. oxlint flags the
+          // bare .sort(); the spread is the fix, and `toSorted` is not
+          // available at this project's TS lib target.
+          const ranked = [...visibleRuns].sort((a, b) => {
             const av = tile.valueOf(a);
             const bv = tile.valueOf(b);
             if (av == null && bv == null) return 0;
@@ -214,7 +241,7 @@ export function TranscriptScorecard({ runs, engines, referenceWords }: Transcrip
                           : run.chunkIntervalSec
                             ? `chunks · ${run.chunkIntervalSec.toFixed(1)}s`
                             : "chunks"}
-                      {run.source ? ` · ${run.replayed ? "replay" : run.source}` : ""}
+                      {run.source ? ` · ${run.replayed ? "live" : run.source}` : ""}
                     </small>
                   </div>
                 );
@@ -226,7 +253,7 @@ export function TranscriptScorecard({ runs, engines, referenceWords }: Transcrip
 
       {scored && (
         <div className="scorecard-ops">
-          {runs.map((run) => (
+          {visibleRuns.map((run) => (
             <div key={keyOf(run)} className="ops-row">
               {/* The mode is part of the label, not a footnote: two rows for one
                   engine differ only by it, and an unlabelled pair reads as the
@@ -234,7 +261,7 @@ export function TranscriptScorecard({ runs, engines, referenceWords }: Transcrip
               <span>
                 {nameOf(run)}
                 <span className="muted">
-                  {" · "}{run.source === "live" ? (run.replayed ? "replay" : "stream") : "batch"}
+                  {" · "}{run.source === "live" ? (run.replayed ? "live" : "stream") : "batch"}
                 </span>
               </span>
               {run.metrics ? (

@@ -126,27 +126,37 @@ def _locate_audio(session: Session, row: TranscriptResult) -> tuple[str, str] | 
     return audio_file.s3_key, Path(audio_file.filename).suffix or ".wav"
 
 
-def _replay_live(engine, audio_path: str, interval_sec: float) -> dict[str, object]:
-    """Cut stored audio at `interval_sec` and feed it through the engine's LIVE
-    chunk route, measuring every call.
+def _replay_live(engine, audio_path: str, interval_sec: float, asr_id: str) -> dict[str, object]:
+    """Replay stored audio through the engine's LIVE transport, measuring every
+    call.
 
-    This is what `source="live"` means for a recording that already exists. It is
-    NOT a read-aloud: nobody is speaking, so the pacing is this loop's, and the
-    latencies describe the gateway's round trip rather than how far behind a
-    speaker the engine ran. The row is stamped `replayed=True` and every figure
-    derived from those latencies is labelled with it. The TEXT is comparable —
-    the engine sees the same cuts a live run would have handed it.
+    Two shapes here, one per transport:
 
-    Cuts are fixed at the interval, exactly like `split_wav_fixed` and the live
-    route: no silence detection, no lookback, no boundary "improvement". A word
-    split across a boundary counts against this transport, which is a real
-    property of it.
+      * `chunks` -- cut the WAV into `interval_sec` pieces and POST each to
+        the engine's live chunk route. Latencies are per-post RTTs. This is
+        the original meaning of "replay live" and the only mode chunked
+        engines have.
+      * `stream` -- feed the WAV through the engine's real-time WebSocket at
+        1x pace (see each engine's `live_relay.stream_replay`). "Chunks" in
+        the returned dict are the engine's own committed segments; latencies
+        are per-final arrival lag (wall clock minus audio consumed), the
+        same formula a read-aloud measures. `chunk_interval_sec` is None
+        for a stream replay because there IS no cut interval -- the segment
+        boundaries are the engine's own.
 
-    Assembled exactly the way `live_session.transcript` assembles a real one, so
-    a replayed row and a captured one are built by the same rules: chunk texts
-    joined with a single space in audio order, blank chunks still counted, native
-    payloads kept in index order.
+    Neither shape does silence detection, lookback, or boundary
+    "improvement": the point is to measure what the transport actually
+    delivers on this audio, and that is what a live read-aloud would have
+    seen too.
+
+    The returned dict is the same shape regardless of transport, so the
+    caller in `run_asr` does not need to branch.
     """
+    from apps.background_worker.transcription import LIVE_TRANSPORTS
+
+    if LIVE_TRANSPORTS.get(asr_id) == "stream":
+        return _replay_stream(engine, audio_path)
+
     send_path, cleanup = ensure_canonical_wav(audio_path)
     try:
         pieces = split_wav_fixed(send_path, interval_sec)
@@ -175,6 +185,35 @@ def _replay_live(engine, audio_path: str, interval_sec: float) -> dict[str, obje
             "chunk_latencies_ms": latencies,
             "first_latency_ms": latencies[0] if latencies else None,
             "avg_latency_ms": round(sum(latencies) / len(latencies)) if latencies else None,
+        }
+    finally:
+        if cleanup:
+            with suppress(OSError):
+                os.unlink(cleanup)
+
+
+def _replay_stream(engine, audio_path: str) -> dict[str, object]:
+    """Feed stored audio through a STREAM engine's real-time WS at 1x pace.
+
+    Dispatched from `_replay_live` when the engine's live transport is
+    stream. Same return shape as the chunks branch above so the caller does
+    not need to branch. `chunk_interval_sec` is set to None on the row by
+    `run_asr` for a stream replay -- there is no cut interval, only the
+    engine's own segment boundaries.
+    """
+    send_path, cleanup = ensure_canonical_wav(audio_path)
+    try:
+        frames, latencies = engine.run_stream(send_path)
+        text = engine.stream_text(frames)
+        return {
+            "text": text.strip(),
+            "raw": list(frames) if frames else None,
+            "chunk_count": len(frames),
+            "chunk_latencies_ms": latencies,
+            "first_latency_ms": latencies[0] if latencies else None,
+            "avg_latency_ms": (
+                round(sum(latencies) / len(latencies)) if latencies else None
+            ),
         }
     finally:
         if cleanup:
@@ -214,15 +253,40 @@ def run_asr(
         s3_key, suffix = located
         _mark_running(session, row, "asr")
 
-    if source == "live" and (engine.run_chunk is None or engine.chunk_text is None):
-        with SessionLocal() as session:
-            row = get_transcript_row(session, audio_file_id, asr_id, source)
-            if row is not None:
-                _mark_failed(
-                    session, row,
-                    f"{engine.name} has no chunk transport, so it cannot be replayed live",
-                )
-        return
+    if source == "live":
+        # An engine can be replayed live if it has EITHER the chunk pair
+        # (chunks transport) or the stream pair (stream transport). Hamsa is
+        # currently the only stream engine with neither -- its `run` streams
+        # from a file but does not report per-final latencies, and the
+        # invariant on run_stream is that it carries them. Fail loud so the
+        # row records why rather than silently running a batch job under a
+        # `source="live"` label.
+        #
+        # `getattr` here because pipeline tests build SimpleNamespace mocks
+        # that predate the run_stream field; on a real AsrEngine the fields
+        # always exist (dataclass default `None`).
+        from apps.background_worker.transcription import LIVE_TRANSPORTS
+
+        live_transport = LIVE_TRANSPORTS.get(asr_id)
+        chunkable = engine.run_chunk is not None and engine.chunk_text is not None
+        streamable = (
+            getattr(engine, "run_stream", None) is not None
+            and getattr(engine, "stream_text", None) is not None
+        )
+        replayable = (
+            (live_transport == "chunks" and chunkable)
+            or (live_transport == "stream" and streamable)
+        )
+        if not replayable:
+            with SessionLocal() as session:
+                row = get_transcript_row(session, audio_file_id, asr_id, source)
+                if row is not None:
+                    _mark_failed(
+                        session, row,
+                        f"{engine.name} has no {live_transport} transport implementation, "
+                        f"so it cannot be replayed live",
+                    )
+            return
 
     interval = chunk_interval_sec or get_settings().live_chunk_default_sec
     replay: dict[str, object] | None = None
@@ -231,7 +295,7 @@ def run_asr(
         with tempfile.NamedTemporaryFile(suffix=suffix) as scratch:
             download_to(s3_key, Path(scratch.name))
             if source == "live":
-                replay = _replay_live(engine, scratch.name, interval)
+                replay = _replay_live(engine, scratch.name, interval, asr_id)
                 raw, text = replay["raw"], replay["text"]
             else:
                 # Two statements, not one: the engine's native output is persisted
@@ -273,7 +337,12 @@ def run_asr(
             # ARE the run. `replayed` is what stops the latencies below from
             # being read as a read-aloud's lag.
             row.replayed = True
-            row.chunk_interval_sec = interval
+            # Only the CHUNKS replay has an interval concept. A stream replay
+            # cuts nothing -- its "chunks" are the engine's own committed
+            # segments -- so the interval column stays null and the UI
+            # prints "engine VAD" or similar rather than a made-up seconds
+            # value that would describe a cut that never happened.
+            row.chunk_interval_sec = interval if row.transport == "chunks" else None
             row.chunk_count = replay["chunk_count"]
             row.chunk_latencies_ms = replay["chunk_latencies_ms"]
             row.first_latency_ms = replay["first_latency_ms"]

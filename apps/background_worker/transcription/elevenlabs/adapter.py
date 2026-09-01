@@ -33,6 +33,26 @@ def segment_count(raw: ElevenLabsRawOutput) -> int:
     return len(raw)
 
 
+def adapt_stream(frames: list[dict]) -> str:
+    """Concatenate the text from a replay-live pass through Scribe realtime.
+
+    Different native shape from `adapt` above: those come from the batch HTTP
+    product (one `{"response": {"text": ...}, ...}` per POST), these are the
+    realtime WebSocket's own frames (`committed_transcript` /
+    `committed_transcript_with_timestamps`, each with `text` at the top
+    level). Only committed frames are here -- partials are dropped upstream
+    for the same reason a live run does not score them.
+
+    Order is arrival order (which is also chronological, because the server
+    emits one segment as its audio is consumed).
+    """
+    return " ".join(
+        text
+        for frame in frames
+        if (text := str(frame.get("text") or "").strip())
+    ).strip()
+
+
 def detected_language(raw: ElevenLabsRawOutput) -> str | None:
     """The language this engine says it detected, or None if absent.
 

@@ -355,10 +355,26 @@ def _queue_transcript(
                 status_code=422,
                 detail=f"{engine.name} does not offer a live feed mode",
             )
-        if engine.run_chunk is None or engine.chunk_text is None:
+        # An engine can be replayed live if it has EITHER a chunk pair OR a
+        # stream pair. Chunks route through `_replay_live`'s per-post loop;
+        # stream routes through the engine's `run_stream` which feeds the
+        # WAV through its realtime WS at 1x pace. Rejecting one without the
+        # other would leave a stream engine (ElevenLabs, Speechmatics)
+        # unrepayable while it has a working transport, which is the bug
+        # this branch was tripping over before.
+        from apps.background_worker.transcription import LIVE_TRANSPORTS
+
+        live_transport = LIVE_TRANSPORTS.get(asr_id)
+        chunkable = engine.run_chunk is not None and engine.chunk_text is not None
+        streamable = engine.run_stream is not None and engine.stream_text is not None
+        if not ((live_transport == "chunks" and chunkable)
+                or (live_transport == "stream" and streamable)):
             raise HTTPException(
                 status_code=422,
-                detail=f"{engine.name} has no chunk transport, so it cannot be replayed live",
+                detail=(
+                    f"{engine.name} has no {live_transport} transport implementation, "
+                    f"so it cannot be replayed live"
+                ),
             )
 
     row = (

@@ -424,6 +424,42 @@ class Settings(BaseSettings):
     speechmatics_poll_interval_sec: float = 3
     speechmatics_timeout_sec: float = 1800
 
+    # --- Speechmatics REAL-TIME (WebSocket streaming) ---
+    # A DIFFERENT product from the batch host above. Batch lives on
+    # `asr.api.speechmatics.com` (jobs POST/poll/fetch); Real-Time lives on
+    # `<region>.rt.speechmatics.com` (WebSocket v2). Same account credential,
+    # different endpoint AND a different subdomain scheme (no `.api.` in the
+    # RT host -- inserting one NXDOMAIN'd every probe until 2026-09-01).
+    #
+    # Region matches the JWT audience: our SPEECHMATICS_API_KEY mints a temp
+    # RT token with aud=['eu','eu-1'], which is what `eu.rt.speechmatics.com`
+    # accepts. `global` is a fallback that routes to a nearest cluster.
+    speechmatics_rt_url: str = "wss://eu.rt.speechmatics.com/v2"
+    # The Management-Plane host that mints short-lived RT tokens from the
+    # long-lived API key. Kept in settings, not hardcoded, because the URL is
+    # part of the account contract and moving accounts (staging/prod) is a
+    # `.env` change here rather than a code change.
+    speechmatics_rt_mint_url: str = "https://mp.speechmatics.com/v1/api_keys"
+    # Seconds the minted temp key is valid for. Long enough to cover a full
+    # read-aloud, short enough that a captured token from logs is useless
+    # within minutes. Default matches Speechmatics' own SDK.
+    speechmatics_rt_temp_key_ttl_sec: int = 300
+    # `enable_partials=True` gets AddPartialTranscript frames alongside the
+    # finals. Partials are visual feedback in the UI; ONLY AddTranscript is
+    # recorded and scored (see live_relay.py). Turning partials off saves no
+    # cost but hides the "engine is reacting" signal, so on is the default.
+    speechmatics_rt_enable_partials: bool = True
+    # `max_delay` (seconds) is how long the engine will wait before finalising
+    # a segment even without silence. 2 s is the default the docs use and what
+    # the 2026-09-01 probe measured cleanly with (time-to-first-partial 856 ms
+    # for the 30 s pyannote sample). Lower gives faster finals at the cost of
+    # more segment revisions; higher is smoother but laggier.
+    speechmatics_rt_max_delay: float = 2
+    # Socket-idle timeout: how long the relay waits for a server frame before
+    # re-checking whether the client is done. Same shape as Hamsa's.
+    speechmatics_rt_idle_timeout_sec: float = 30
+    speechmatics_rt_session_timeout_sec: float = 3600
+
     # --- ElevenLabs Scribe (hosted, one whole-file POST) ---
     elevenlabs_api_key: str | None = None
     elevenlabs_stt_url: str = "https://api.elevenlabs.io/v1/speech-to-text"
@@ -437,6 +473,34 @@ class Settings(BaseSettings):
     # can only take that away, so auto is the default.
     elevenlabs_stt_language: str = "auto"
     elevenlabs_stt_timeout_sec: float = 600
+
+    # --- ElevenLabs Scribe v2 REALTIME (WebSocket streaming) ---
+    # A DIFFERENT product from `elevenlabs_stt_url` above. That one is the
+    # whole-file batch POST used for stored audio; this one is the WebSocket
+    # streaming endpoint used for the read-aloud surface's stream transport.
+    # Different model (`scribe_v2_realtime`, distinct from `scribe_v2`), same
+    # account credential (xi-api-key).
+    #
+    # Protocol probed end to end on 2026-09-01 against the real API with a
+    # 30 s pyannote sample: on connect the server sends `session_started` with
+    # the full accepted config; the client sends `input_audio_chunk` frames
+    # carrying base64-encoded PCM16 in `audio_base_64` plus `commit` and
+    # `sample_rate`; the server streams `partial_transcript` and
+    # `committed_transcript` frames back. Raw binary makes the server close
+    # cleanly with no error, so the base64-inside-JSON envelope is not
+    # decoration -- see apps/background_worker/transcription/elevenlabs/live_relay.py.
+    elevenlabs_stt_realtime_url: str = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
+    elevenlabs_stt_realtime_model: str = "scribe_v2_realtime"
+    # "manual" | "vad". Manual means the client (us) commits explicitly on stop;
+    # vad lets Scribe auto-commit on internal silence detection. Manual is the
+    # default because the scorecard's committed segments are what get measured,
+    # and letting a server-side VAD heuristic decide their cadence would move
+    # the boundary this comparison is meant to hold fixed across engines.
+    elevenlabs_stt_realtime_commit_strategy: str = "manual"
+    # How long the relay waits for a server frame before re-checking whether the
+    # client is done. Same shape as HAMSA_STT_IDLE_TIMEOUT_SEC.
+    elevenlabs_stt_realtime_idle_timeout_sec: float = 15
+    elevenlabs_stt_realtime_session_timeout_sec: float = 3600
 
     # --- ADEO Qwen3-ASR (hosted, per-model proxy on the ADEO inference host) ---
     # A per-model proxy URL, not a gateway with a model list: each model has its

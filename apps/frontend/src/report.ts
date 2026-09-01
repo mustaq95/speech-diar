@@ -306,6 +306,7 @@ export function buildTranscriptReportHtml(
     asrName?: string;
     transport?: string | null;
     source?: string;
+    replayed?: boolean;
     chunkIntervalSec?: number;
     chunkCount?: number;
     avgLatencyMs?: number;
@@ -338,8 +339,8 @@ export function buildTranscriptReportHtml(
       const m = run.metrics;
       const isStream = (run.transport ?? "") === "stream";
       return `<tr>
-        <td><strong>${escapeHtml(nameOf(run.asrId, run.asrName))}</strong><br>
-            <span class="sub">${escapeHtml(transportLabel(run))}${run.source ? ` · ${escapeHtml(run.source)}` : ""}</span></td>
+        <td><strong>${escapeHtml(`${nameOf(run.asrId, run.asrName)} (${feedModeLabel(run)})`)}</strong><br>
+            <span class="sub">${escapeHtml(transportLabel(run))}</span></td>
         <td>${m ? ratePct(m.wer) : "<span class='sub'>not scored</span>"}</td>
         <td>${m ? ratePct(m.werRaw) : "—"}</td>
         <td>${m ? ratePct(m.cer) : "—"}</td>
@@ -442,10 +443,15 @@ interface EngineTotals {
   asrId: string;
   /** (engine, feed mode) — what the per-recording `wer` record is keyed on. */
   key: string;
-  /** Display name WITH its feed mode, because an engine contributes up to two
-   *  columns (its live measurement and its batch one) and they are different
-   *  pipelines. An unlabelled pair reads as one engine measured twice. */
+  /** Which mode's table this belongs in. An engine contributes up to two sets of
+   *  totals (its live measurement and its batch one) and they are different
+   *  pipelines, so they are never summed together. */
+  feed: FeedMode;
+  /** Plain engine name, no mode suffix: the table it sits in names the mode. */
   name: string;
+  /** True when any run behind these totals was a replay rather than a real
+   *  read-aloud. Marks the latency column only — see `feedModeLabel`. */
+  replayed: boolean;
   transport: string;
   recordings: number;
   /** Summed edit operations and reference words — WER is recomputed from these
@@ -465,9 +471,11 @@ interface EngineTotals {
   rtfCount: number;
 }
 
-function emptyTotals(key: string, asrId: string, name: string, transport: string): EngineTotals {
+function emptyTotals(
+  key: string, asrId: string, feed: FeedMode, name: string, transport: string,
+): EngineTotals {
   return {
-    key, asrId, name, transport, recordings: 0,
+    key, asrId, feed, name, replayed: false, transport, recordings: 0,
     sub: 0, del: 0, ins: 0, refWords: 0, hypWords: 0,
     cerWeighted: 0, werRawWeighted: 0,
     latencySum: 0, latencyCount: 0, rtfSum: 0, rtfCount: 0,
@@ -487,22 +495,37 @@ function weightedWer(totals: EngineTotals): number | null {
   return (totals.sub + totals.del + totals.ins) / totals.refWords;
 }
 
-/** A report column's identity: the engine and the mode it ran in. */
+/** A report column's identity: the engine, the mode it ran in, AND the transport
+ *  it actually used.
+ *
+ * The transport belongs in the key because one engine can have both inside a
+ * single feed mode — Speechmatics has 14 live `stream` runs and one older live
+ * `chunks` run. Merged, the totals took their label from the first row and their
+ * RTF from the other, printing "stream · engine VAD" over a factor no streaming
+ * run produced. Every figure carries the transport that produced it, so a
+ * different transport is a different row. */
 function runColumnKey(run: TranscriptRun): string {
-  return `${run.asrId}::${run.source}`;
+  return `${run.asrId}::${run.source}::${run.transport ?? ""}`;
 }
 
-/** What produced this run, in the words the UI uses. "replay" is its own label
- *  and not folded into "stream": a replayed row's latency is the gateway's round
- *  trip, not how far behind a speaker the engine ran, so its speed columns are
- *  not comparable with a read-aloud's. */
-function feedModeLabel(run: TranscriptRun): string {
-  if (run.source !== "live") return "batch";
-  return run.replayed ? "replay" : "stream";
+/** The feed mode a run belongs to, in the two words the UI toggle uses.
+ *
+ * A replay counts as "stream": it went through the same live chunk route with the
+ * same cuts, so its transcript belongs beside a read-aloud's. Its LATENCY does
+ * not — that figure is the gateway's round trip rather than lag behind a speaker
+ * — which is why the avg-latency column carries a footnote instead of the engine
+ * name carrying a third label. */
+function feedModeLabel(run: { source?: string; replayed?: boolean }): FeedMode {
+  return run.source === "live" ? "stream" : "batch";
 }
+
+type FeedMode = "stream" | "batch";
 
 function accumulate(totals: EngineTotals, run: TranscriptRun): void {
   const metrics = run.metrics;
+  // Set before the metrics guard: a replay that failed to score still means the
+  // latency behind these totals is not a read-aloud's.
+  if (run.replayed) totals.replayed = true;
   if (!metrics) return;
   totals.recordings += 1;
   totals.sub += metrics.subCount;
@@ -592,10 +615,11 @@ export function computeTranscriptReport(entries: TranscriptReportEntry[]): Trans
       // single bucket would report the mean of two different pipelines under one
       // name, and the per-recording row would silently keep whichever came last.
       const key = runColumnKey(run);
-      const name = `${run.asrName || run.asrId} (${feedModeLabel(run)})`;
-      if (!overall.has(key)) overall.set(key, emptyTotals(key, run.asrId, name, transport));
+      const feed = feedModeLabel(run);
+      const name = run.asrName || run.asrId;
+      if (!overall.has(key)) overall.set(key, emptyTotals(key, run.asrId, feed, name, transport));
       if (!languageBucket.has(key)) {
-        languageBucket.set(key, emptyTotals(key, run.asrId, name, transport));
+        languageBucket.set(key, emptyTotals(key, run.asrId, feed, name, transport));
       }
       accumulate(overall.get(key)!, run);
       accumulate(languageBucket.get(key)!, run);
@@ -644,12 +668,43 @@ function bestOf(values: Array<number | null>): number | null {
   return real.length ? Math.min(...real) : null;
 }
 
-export function buildTranscriptAggregateReportHtml(report: TranscriptReportData): string {
-  const engines = report.engines;
-  const engineHeads = engines.map((engine) => `<th>${escapeHtml(engine.name)}</th>`).join("");
+/** The two modes, in the order they appear throughout the report. Stream first:
+ *  it is the surface's primary artifact (someone read a script aloud), and batch
+ *  is the after-the-fact comparison against it. */
+const FEED_MODES: ReadonlyArray<{ feed: FeedMode; label: string; blurb: string }> = [
+  {
+    feed: "stream",
+    label: "stream",
+    blurb: "Fed while the recording played, in the engine's own live transport — continuous "
+      + "for a streaming engine, fixed cuts for a chunked one. Every rate here includes the "
+      + "cost of that transport.",
+  },
+  {
+    feed: "batch",
+    label: "batch",
+    blurb: "Run over the finished recording from storage. No boundary cost for a whole-file "
+      + "engine, and no live pacing, so these rates and speeds are not comparable with the "
+      + "stream table above.",
+  },
+];
 
-  const overallRows = engines
-    .map((engine) => {
+/** Best (lowest) weighted WER first; anything unscored sinks to the bottom rather
+ *  than sorting as if it were 0%. Returns a new array — `report.engines` is used
+ *  again by the other tables and must not be reordered under them. */
+function rankedByWer(engines: EngineTotals[]): EngineTotals[] {
+  return [...engines].sort((a, b) => {
+    const wa = weightedWer(a);
+    const wb = weightedWer(b);
+    if (wa == null && wb == null) return 0;
+    if (wa == null) return 1;
+    if (wb == null) return -1;
+    return wa - wb;
+  });
+}
+
+export function buildTranscriptAggregateReportHtml(report: TranscriptReportData): string {
+  const engineRows = (engines: EngineTotals[]) => engines
+    .map((engine, index) => {
       const wer = weightedWer(engine);
       const cer = engine.refWords ? engine.cerWeighted / engine.refWords : null;
       const werRaw = engine.refWords ? engine.werRawWeighted / engine.refWords : null;
@@ -662,16 +717,23 @@ export function buildTranscriptAggregateReportHtml(report: TranscriptReportData)
           : engine.transport === "file"
             ? "file · whole recording"
             : "chunks";
+      // Green on the single lowest WER in this table, the same treatment the
+      // by-language table already gives its winner.
+      const best = bestOf(engines.map((item) => weightedWer(item)));
+      const winner = wer != null && best != null && wer === best && engines.length > 1;
       return `<tr>
+        <td class="num sub">${index + 1}</td>
         <td><strong>${escapeHtml(engine.name)}</strong><br>
             <span class="sub">${escapeHtml(transportLabel)}</span></td>
         <td class="num">${engine.recordings}</td>
-        <td class="num">${ratePctOrDash(wer)}</td>
+        <td class="num${winner ? " win" : ""}">${ratePctOrDash(wer)}</td>
         <td class="num">${ratePctOrDash(werRaw)}</td>
         <td class="num">${ratePctOrDash(cer)}</td>
         <td class="num">${engine.sub} / ${engine.del} / ${engine.ins}</td>
         <td class="num">${engine.refWords} → ${engine.hypWords}</td>
-        <td class="num">${latency == null ? "—" : `${Math.round(latency)} ms`}</td>
+        <td class="num">${
+          latency == null ? "—" : `${Math.round(latency)} ms${engine.replayed ? "<sup>*</sup>" : ""}`
+        }</td>
         <td class="num">${
           rtf == null
             ? `<span class="sub">${isStream ? "real-time bound" : "—"}</span>`
@@ -681,7 +743,7 @@ export function buildTranscriptAggregateReportHtml(report: TranscriptReportData)
     })
     .join("\n");
 
-  const languageRows = report.byLanguage
+  const languageRows = (engines: EngineTotals[]) => report.byLanguage
     .map((group) => {
       const cells = engines.map((engine) => {
         // Matched on `key`, not asrId: an engine contributes one column per feed
@@ -698,7 +760,7 @@ export function buildTranscriptAggregateReportHtml(report: TranscriptReportData)
         const winner = wer != null && best != null && wer === best && engines.length > 1;
         return `<td class="num${winner ? " win" : ""}">${ratePctOrDash(wer)}</td>`;
       });
-      const words = group.engines[0]?.refWords ?? 0;
+      const words = group.engines.find((item) => item.refWords)?.refWords ?? 0;
       return `<tr>
         <td><strong>${escapeHtml(group.label)}</strong></td>
         <td class="num">${group.recordings}</td>
@@ -708,7 +770,7 @@ export function buildTranscriptAggregateReportHtml(report: TranscriptReportData)
     })
     .join("\n");
 
-  const recordingRows = report.perRecording
+  const recordingRows = (engines: EngineTotals[]) => report.perRecording
     .map((row) => {
       const cells = engines
         .map((engine) => `<td class="num">${ratePctOrDash(row.wer[engine.key] ?? null)}</td>`)
@@ -729,13 +791,60 @@ export function buildTranscriptAggregateReportHtml(report: TranscriptReportData)
 
   // Lowest error rate wins. A reduce rather than a sort: one pass, no mutation of
   // the intermediate array, and finding a minimum never needed an ordering.
-  const winner = engines
-    .map((engine) => ({ name: engine.name, wer: weightedWer(engine) }))
+  const winner = report.engines
+    .map((engine) => ({ name: `${engine.name} · ${engine.feed}`, wer: weightedWer(engine) }))
     .filter((item): item is { name: string; wer: number } => item.wer != null)
     .reduce<{ name: string; wer: number } | null>(
       (best, item) => (best == null || item.wer < best.wer ? item : best),
       null,
     );
+
+  // One section per mode, each self-contained: its own engine ranking, its own
+  // by-language columns and its own by-recording columns. The two are never in
+  // one table because they are different pipelines and a reader scanning a column
+  // would compare a live rate against a stored-audio one.
+  const sections = FEED_MODES.map(({ feed, label, blurb }) => {
+    const ranked = rankedByWer(report.engines.filter((engine) => engine.feed === feed));
+    if (!ranked.length) return "";
+    const heads = ranked.map((engine) => `<th>${escapeHtml(engine.name)}</th>`).join("");
+    const anyReplayed = ranked.some((engine) => engine.replayed);
+    return `
+<h2>By engine · ${escapeHtml(label)}</h2>
+<p class="sub">${escapeHtml(blurb)} Ranked best (lowest) WER first.</p>
+<table>
+  <thead><tr>
+    <th class="num">#</th><th>Engine</th><th class="num">Scored</th><th class="num">WER</th>
+    <th class="num">WER (raw)</th><th class="num">CER</th>
+    <th class="num">Sub / Del / Ins</th><th class="num">Words ref → out</th>
+    <th class="num">Avg latency</th><th class="num">RTF</th>
+  </tr></thead>
+  <tbody>${engineRows(ranked)}</tbody>
+</table>${
+  anyReplayed
+    ? `\n<p class="sub">* Replayed from stored audio through the live chunk route rather than `
+      + `measured while someone read aloud. The transcript is comparable; this latency is the `
+      + `gateway's round trip, not lag behind a speaker.</p>`
+    : ""
+}
+
+<h3>By language · ${escapeHtml(label)}</h3>
+<table>
+  <thead><tr>
+    <th>Language of script</th><th class="num">Recordings</th>
+    <th class="num">Reference words</th>${heads}
+  </tr></thead>
+  <tbody>${languageRows(ranked)}</tbody>
+</table>
+
+<h3>By recording · ${escapeHtml(label)}</h3>
+<table>
+  <thead><tr>
+    <th>Recording</th><th class="num">Duration</th><th>Language</th>
+    <th class="num">Ref words</th>${heads}
+  </tr></thead>
+  <tbody>${recordingRows(ranked)}</tbody>
+</table>`;
+  }).join("\n");
 
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -770,7 +879,9 @@ export function buildTranscriptAggregateReportHtml(report: TranscriptReportData)
 <div class="cards">
   <div class="card"><span class="sub">Recordings scored</span><b>${report.scoredRecordings}</b></div>
   <div class="card"><span class="sub">Reference words</span><b>${report.totalReferenceWords}</b></div>
-  <div class="card"><span class="sub">Engines compared</span><b>${engines.length}</b></div>
+  <div class="card"><span class="sub">Engines compared</span><b>${
+    new Set(report.engines.map((engine) => engine.asrId)).size
+  }</b><span class="sub">${report.engines.length} engine/mode runs</span></div>
   <div class="card"><span class="sub">Lowest word error rate</span><b>${
     winner ? `${(winner.wer * 100).toFixed(1)}%` : "—"
   }</b><span class="sub">${winner ? escapeHtml(winner.name) : "not scored"}</span></div>
@@ -788,42 +899,16 @@ export function buildTranscriptAggregateReportHtml(report: TranscriptReportData)
   slightly above a plain word count because punctuation-joined tokens separate.
 </div>
 
-<h2>By engine</h2>
-<table>
-  <thead><tr>
-    <th>Engine</th><th class="num">Scored</th><th class="num">WER</th>
-    <th class="num">WER (raw)</th><th class="num">CER</th>
-    <th class="num">Sub / Del / Ins</th><th class="num">Words ref → out</th>
-    <th class="num">Avg latency</th><th class="num">RTF</th>
-  </tr></thead>
-  <tbody>${overallRows}</tbody>
-</table>
+${sections}
+
 <p class="sub">WER (raw) is the same comparison without Arabic normalisation — no tashkeel
   stripping, no alef/hamza or ta-marbuta folding, Arabic-Indic digits left as they are. The
   gap between the two columns is orthographic variation rather than misrecognition.
-  CER is reference-word weighted, because character totals are not stored per run.</p>
-
-<h2>By language</h2>
-<table>
-  <thead><tr>
-    <th>Language of script</th><th class="num">Recordings</th>
-    <th class="num">Reference words</th>${engineHeads}
-  </tr></thead>
-  <tbody>${languageRows}</tbody>
-</table>
-<p class="sub">Word Error Rate per engine, per language of the source script. The lower rate
-  in each row is highlighted. Language is what the script was REQUESTED in; the per-recording
-  table below also shows the Arabic share actually measured in the generated text, which
-  differs because the generator follows a mix instruction loosely.</p>
-
-<h2>By recording</h2>
-<table>
-  <thead><tr>
-    <th>Recording</th><th class="num">Duration</th><th>Language</th>
-    <th class="num">Ref words</th>${engineHeads}
-  </tr></thead>
-  <tbody>${recordingRows}</tbody>
-</table>
+  CER is reference-word weighted, because character totals are not stored per run.
+  In the by-language tables the lowest rate in each row is highlighted; language is what the
+  script was REQUESTED in, while the by-recording table also shows the Arabic share actually
+  measured in the generated text, which differs because the generator follows a mix
+  instruction loosely.</p>
 
 <div class="note">
   <b>What these numbers are measurements of.</b>

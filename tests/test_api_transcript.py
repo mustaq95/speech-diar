@@ -73,7 +73,7 @@ def test_config_reports_per_mode_availability(client: TestClient) -> None:
 
     assert body["defaultTranscriptionMode"] == "offline"
     assert body["transcriptionModes"]["online"] == {"asrName": "TryHamsa", "configured": True}
-    assert body["transcriptionModes"]["offline"] == {"asrName": "Cohere", "configured": True}
+    assert body["transcriptionModes"]["offline"] == {"asrName": "Cohere Transcribe Arabic", "configured": True}
     # The pre-existing key must keep working; the frontend reads both.
     assert isinstance(body["pollIntervalMs"], int)
 
@@ -144,7 +144,7 @@ def test_get_transcript_returns_the_row_with_its_recorded_engine(
     assert body["status"] == "done"
     assert body["asrId"] == "cohere-transcribe"
     assert body["mode"] == "offline"
-    assert body["asrName"] == "Cohere"
+    assert body["asrName"] == "Cohere Transcribe Arabic"
     assert body["text"] == "مرحبا"
     assert body["words"] == [{"w": "مرحبا", "s": 0.1, "e": 0.5, "score": 0.9}]
     # The two stages report separately — that is what the panel exists to show.
@@ -824,12 +824,21 @@ def test_a_live_replay_passes_the_operators_interval_to_the_job(
     assert _asr_jobs(fake_queue) == [(audio_file_id, "cohere-transcribe", "live", 8.0)]
 
 
-def test_an_engine_with_no_chunk_transport_cannot_be_replayed_live(
+def test_an_engine_with_no_live_replay_implementation_cannot_be_replayed(
     client: TestClient, db_session_factory: sessionmaker[Session], fake_queue: Queue
 ) -> None:
-    """hamsa is a socket protocol with no chunk call. Replaying it as chunks
-    would be a different measurement wearing the same label, so it is refused at
-    the request rather than producing a row nobody can interpret."""
+    """Hamsa's live transport is stream, and its runner streams stored audio
+    but does not report per-final arrival latencies -- so it has no
+    `run_stream` in the sense the replay-live path needs. Replaying it as
+    chunks would be a different measurement wearing the same label, and
+    replaying it as an untimed stream would leave the row with no
+    latencies. Either way it is refused at the request rather than
+    producing a row nobody can interpret.
+
+    ElevenLabs and Speechmatics, whose live transport is also stream, DO
+    have `run_stream` (see `<engine>/live_relay.py::stream_replay`), so
+    they are covered by `test_a_stream_engine_with_run_stream_can_be_replayed`.
+    """
     audio_file_id = _recording(db_session_factory)
 
     response = client.post(
@@ -838,7 +847,7 @@ def test_an_engine_with_no_chunk_transport_cannot_be_replayed_live(
     )
 
     assert response.status_code == 422
-    assert "chunk transport" in response.json()["detail"]
+    assert "cannot be replayed live" in response.json()["detail"]
     with db_session_factory() as session:
         assert session.query(TranscriptResult).filter_by(audio_file_id=audio_file_id).count() == 0
     assert _asr_jobs(fake_queue) == []
