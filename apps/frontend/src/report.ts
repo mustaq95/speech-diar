@@ -314,6 +314,7 @@ export function buildTranscriptReportHtml(
     text?: string;
     metrics?: {
       wer: number; cer: number; werRaw: number; cerRaw: number;
+      mer: number; merRaw: number; overall: number; overallRaw: number;
       refWordCount: number; hypWordCount: number;
       subCount: number; delCount: number; insCount: number;
       rtf?: number;
@@ -344,6 +345,8 @@ export function buildTranscriptReportHtml(
         <td>${m ? ratePct(m.wer) : "<span class='sub'>not scored</span>"}</td>
         <td>${m ? ratePct(m.werRaw) : "—"}</td>
         <td>${m ? ratePct(m.cer) : "—"}</td>
+        <td>${m ? ratePct(m.mer) : "—"}</td>
+        <td><strong>${m ? ratePct(m.overall) : "—"}</strong></td>
         <td>${m ? m.hypWordCount : "—"}</td>
         <td>${m ? `${m.subCount} / ${m.delCount} / ${m.insCount}` : "—"}</td>
         <td>${run.avgLatencyMs != null ? `${Math.round(run.avgLatencyMs)} ms` : "—"}</td>
@@ -394,13 +397,23 @@ export function buildTranscriptReportHtml(
   interval because it cannot accept a longer piece of audio, and a word split across a
   boundary counts against it; a streaming engine has no boundaries. These are therefore
   measurements of two <em>pipelines</em>, not of two models in the abstract.
+  <br><br>
+  <strong>MER</strong> (Match Error Rate, Morris/Maier/Green 2004) uses the same edit counts
+  as WER but divides by <em>(S+D+I+C)</em> instead of by the reference length, so it stays
+  bounded 0..1 even when an engine emits more wrong words than the script contains — WER can
+  and does exceed 100% in that case. <strong>Overall</strong> is the mean of WER, CER (each
+  capped at 1.0 for this composite only) and MER, so one column ranks engines without an
+  edit-distance blowup swamping the comparison. Individual WER and CER on their own rows
+  stay uncapped.
+  <br><br>
   Real-Time Factor is blank for a streaming engine because a real-time protocol consumes
   audio at 1&times; by definition — there is no factor to report, so none is invented.
 </div>
 
 <table>
   <thead><tr>
-    <th>Engine</th><th>WER</th><th>WER (raw)</th><th>CER</th><th>Words</th>
+    <th>Engine</th><th>WER</th><th>WER (raw)</th><th>CER</th>
+    <th>MER</th><th>Overall</th><th>Words</th>
     <th>Sub / Del / Ins</th><th>Avg latency</th><th>RTF</th>
   </tr></thead>
   <tbody>${rows}</tbody>
@@ -462,8 +475,12 @@ interface EngineTotals {
   refWords: number;
   hypWords: number;
   /** Reference-word-weighted sums, for the rates that cannot be recomputed from
-   * counts because character totals are not stored. */
+   * counts because character totals are not stored. `cerRawWeighted` is the raw
+   * companion; the aggregate Overall (raw) needs it, otherwise the raw column
+   * would be computed against the normalized CER and the row would silently mix
+   * two comparisons under one label. */
   cerWeighted: number;
+  cerRawWeighted: number;
   werRawWeighted: number;
   latencySum: number;
   latencyCount: number;
@@ -477,7 +494,7 @@ function emptyTotals(
   return {
     key, asrId, feed, name, replayed: false, transport, recordings: 0,
     sub: 0, del: 0, ins: 0, refWords: 0, hypWords: 0,
-    cerWeighted: 0, werRawWeighted: 0,
+    cerWeighted: 0, cerRawWeighted: 0, werRawWeighted: 0,
     latencySum: 0, latencyCount: 0, rtfSum: 0, rtfCount: 0,
   };
 }
@@ -493,6 +510,48 @@ function emptyTotals(
 function weightedWer(totals: EngineTotals): number | null {
   if (!totals.refWords) return null;
   return (totals.sub + totals.del + totals.ins) / totals.refWords;
+}
+
+/**
+ * Aggregate MER over a set of recordings.
+ *
+ * Same identity as per-recording MER, over the summed counts: (S+D+I) / (refWords + I).
+ * This is exact from the counts (unlike the aggregate CER, which is reference-word
+ * weighted because character totals are not stored per run). Aggregate MER stays
+ * bounded 0..1 even when one recording's WER blew past 100% — that is what makes it
+ * safe to hand a stakeholder as one figure per engine.
+ */
+function weightedMer(totals: EngineTotals): number | null {
+  const errors = totals.sub + totals.del + totals.ins;
+  const denom = totals.refWords + totals.ins;
+  return denom ? errors / denom : null;
+}
+
+/**
+ * Aggregate Overall for a set of recordings: the mean of aggregate WER, aggregate CER
+ * (each capped at 1.0 for this composite only) and aggregate MER. Every input comes
+ * from the same summed counts a reader can find in the row above, so the composite is
+ * not a second opinion — it is the same measurement expressed on one scale.
+ */
+function weightedOverall(totals: EngineTotals): number | null {
+  const wer = weightedWer(totals);
+  const cer = totals.refWords ? totals.cerWeighted / totals.refWords : null;
+  const mer = weightedMer(totals);
+  if (wer == null || cer == null || mer == null) return null;
+  return (Math.min(wer, 1.0) + Math.min(cer, 1.0) + mer) / 3.0;
+}
+
+/** Overall on the raw (un-normalized) side. See `weightedOverall`. */
+function weightedOverallRaw(totals: EngineTotals): number | null {
+  const werRaw = totals.refWords ? totals.werRawWeighted / totals.refWords : null;
+  const cerRaw = totals.refWords ? totals.cerRawWeighted / totals.refWords : null;
+  // Raw counts are not stored separately, so the raw-side MER falls back to
+  // the normalized MER — same behaviour as the backfill script and the API's
+  // TranscriptMetrics fallback. Normalization affects tokenization boundaries
+  // more than it affects the S/D/I split, so the two rarely disagree by much.
+  const mer = weightedMer(totals);
+  if (werRaw == null || cerRaw == null || mer == null) return null;
+  return (Math.min(werRaw, 1.0) + Math.min(cerRaw, 1.0) + mer) / 3.0;
 }
 
 /** A report column's identity: the engine, the mode it ran in, AND the transport
@@ -534,6 +593,7 @@ function accumulate(totals: EngineTotals, run: TranscriptRun): void {
   totals.refWords += metrics.refWordCount;
   totals.hypWords += metrics.hypWordCount;
   totals.cerWeighted += metrics.cer * metrics.refWordCount;
+  totals.cerRawWeighted += metrics.cerRaw * metrics.refWordCount;
   totals.werRawWeighted += metrics.werRaw * metrics.refWordCount;
   if (run.avgLatencyMs != null) {
     totals.latencySum += run.avgLatencyMs;
@@ -708,6 +768,8 @@ export function buildTranscriptAggregateReportHtml(report: TranscriptReportData)
       const wer = weightedWer(engine);
       const cer = engine.refWords ? engine.cerWeighted / engine.refWords : null;
       const werRaw = engine.refWords ? engine.werRawWeighted / engine.refWords : null;
+      const mer = weightedMer(engine);
+      const overall = weightedOverall(engine);
       const latency = engine.latencyCount ? engine.latencySum / engine.latencyCount : null;
       const rtf = engine.rtfCount ? engine.rtfSum / engine.rtfCount : null;
       const isStream = engine.transport === "stream";
@@ -718,7 +780,9 @@ export function buildTranscriptAggregateReportHtml(report: TranscriptReportData)
             ? "file · whole recording"
             : "chunks";
       // Green on the single lowest WER in this table, the same treatment the
-      // by-language table already gives its winner.
+      // by-language table already gives its winner. WER is still the ranking
+      // column: it is the standard reference every stakeholder knows, and MER
+      // + Overall sit beside it as additional views rather than replacements.
       const best = bestOf(engines.map((item) => weightedWer(item)));
       const winner = wer != null && best != null && wer === best && engines.length > 1;
       return `<tr>
@@ -729,6 +793,8 @@ export function buildTranscriptAggregateReportHtml(report: TranscriptReportData)
         <td class="num${winner ? " win" : ""}">${ratePctOrDash(wer)}</td>
         <td class="num">${ratePctOrDash(werRaw)}</td>
         <td class="num">${ratePctOrDash(cer)}</td>
+        <td class="num">${ratePctOrDash(mer)}</td>
+        <td class="num"><strong>${ratePctOrDash(overall)}</strong></td>
         <td class="num">${engine.sub} / ${engine.del} / ${engine.ins}</td>
         <td class="num">${engine.refWords} → ${engine.hypWords}</td>
         <td class="num">${
@@ -815,6 +881,7 @@ export function buildTranscriptAggregateReportHtml(report: TranscriptReportData)
   <thead><tr>
     <th class="num">#</th><th>Engine</th><th class="num">Scored</th><th class="num">WER</th>
     <th class="num">WER (raw)</th><th class="num">CER</th>
+    <th class="num">MER</th><th class="num">Overall</th>
     <th class="num">Sub / Del / Ins</th><th class="num">Words ref → out</th>
     <th class="num">Avg latency</th><th class="num">RTF</th>
   </tr></thead>
@@ -893,6 +960,14 @@ export function buildTranscriptAggregateReportHtml(report: TranscriptReportData)
   than model agreement. Word Error Rate is substitutions plus deletions plus insertions,
   over the number of words in the script; lower is better and it can exceed 100% when an
   engine emits more wrong words than the script contains.
+  <br><br>
+  <b>MER</b> (Match Error Rate) uses the same edit counts but divides by <em>(S+D+I+C)</em>
+  instead of by the reference length, so it stays bounded 0..1 and is safe as one figure
+  per engine even when a run's WER blew past 100%. <b>Overall</b> is the mean of WER, CER
+  (each capped at 1.0 for this composite only) and MER, giving one column that ranks engines
+  without an edit-distance blowup swamping the comparison. WER and CER on their own rows
+  stay uncapped.
+  <br><br>
   Rates over a set of recordings are computed as total errors over total reference words,
   <em>not</em> as an average of each recording's rate — otherwise one short clip would carry
   the same weight as a long one. Reference counts are of the tokenized script, which runs

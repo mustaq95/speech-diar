@@ -97,6 +97,67 @@ def test_wer_above_one_is_not_clamped() -> None:
     assert score("a", "x y z").wer == pytest.approx(3.0)
 
 
+# --- MER (Match Error Rate) and Overall Score ------------------------------
+#
+# MER is Morris/Maier/Green (2004): (S+D+I) / (S+D+I+C). Same counts as WER,
+# but bounded to [0, 1] where WER can exceed 1. It sits beside WER, not
+# instead of it: the two answer different questions and both are reported.
+
+
+def test_mer_is_bounded_at_one_when_wer_exceeds_it() -> None:
+    """The whole reason MER exists next to WER: a 100%-plus WER should still
+    give a reader a bounded figure they can rank on."""
+    result = score("a", "x y z")
+    assert result.wer == pytest.approx(3.0)
+    # 3 errors, 1 reference word, 3 insertions -> 3/(1+3) with S+D+I=3, C=0.
+    # But wait: over one ref word, the alignment is one substitution + two
+    # insertions, so S=1, D=0, I=2, C=0, MER = 3/(0+1+2+0) = 1.0.
+    assert result.mer == pytest.approx(1.0)
+
+
+def test_mer_matches_hand_computed_case() -> None:
+    """5 reference words, 2 substituted, 1 inserted -> S+D+I=3, C=3, MER=3/6=0.5."""
+    result = score("the quick brown fox jumps",
+                   "the quik brown cat jumps high")
+    assert (result.sub, result.delete, result.ins) == (2, 0, 1)
+    assert result.mer == pytest.approx(3 / (5 + 1))
+
+
+def test_mer_is_zero_for_a_perfect_transcript() -> None:
+    assert score("the quick brown fox", "the quick brown fox").mer == 0.0
+
+
+def test_overall_is_the_mean_of_wer_capped_cer_and_mer() -> None:
+    """The composite is defined and stable, so it can be regressed on."""
+    result = score("the quick brown fox jumps",
+                   "the quik brown cat jumps")
+    expected = (min(result.wer, 1.0) + result.cer + result.mer) / 3.0
+    assert result.overall == pytest.approx(expected)
+
+
+def test_overall_caps_wer_and_cer_for_the_mean() -> None:
+    """Both edit-distance rates can exceed 1.0 on the same failure mode (a
+    hypothesis much longer than a very short reference: 'a' -> 'x y z' gives
+    WER=3.0 and CER=5.0). The composite must stay bounded. Rows still report
+    the uncapped values."""
+    result = score("a", "x y z")
+    assert result.wer == pytest.approx(3.0), "individual WER stays uncapped"
+    assert result.cer > 1.0, "individual CER stays uncapped"
+    assert 0.0 <= result.overall <= 1.0
+    # (1.0 + 1.0 + mer) / 3
+    assert result.overall == pytest.approx((1.0 + 1.0 + result.mer) / 3.0)
+
+
+def test_mer_and_overall_are_structurally_bounded() -> None:
+    """MER and Overall are the two whose formula guarantees 0..1 for every input.
+    WER and CER can each exceed 1.0 on a very short reference — see the caps
+    inside `overall`. On a normal-length reference all three sit inside 0..1,
+    which is the case a reader spends 99% of their time in."""
+    result = score("hello world", "helo wrld extras here now")
+    assert 0 <= result.mer <= 1
+    assert 0 <= result.overall <= 1
+
+
 def test_empty_hypothesis_is_all_deletions() -> None:
     result = score("a b c", "")
     assert result.wer == pytest.approx(1.0)

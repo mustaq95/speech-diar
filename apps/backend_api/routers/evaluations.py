@@ -276,11 +276,33 @@ def _transcript_metrics(row: TranscriptResult) -> TranscriptMetrics | None:
     """
     if row.wer is None:
         return None
+    # MER + overall are backfilled on rows that predate their columns from the
+    # stored sub/del/ins/ref_word counts, so the response is complete for those
+    # rows too. Identities: MER = (S+D+I) / (ref_words + I); overall = mean of
+    # WER-capped-at-1.0, CER, MER. Anywhere the stored value is present it wins
+    # over the recomputed one, since scoring.py wrote it against the exact same
+    # counts the row exposes.
+    wer = row.wer or 0.0
+    cer = row.cer or 0.0
+    wer_raw = row.wer_raw if row.wer_raw is not None else wer
+    cer_raw = row.cer_raw if row.cer_raw is not None else cer
+    mer = row.mer if row.mer is not None else _mer_from_counts(
+        row.sub_count, row.del_count, row.ins_count, row.ref_word_count
+    )
+    mer_raw = row.mer_raw if row.mer_raw is not None else mer
+    overall = row.overall if row.overall is not None else _overall_from_rates(wer, cer, mer)
+    overall_raw = row.overall_raw if row.overall_raw is not None else _overall_from_rates(
+        wer_raw, cer_raw, mer_raw
+    )
     return TranscriptMetrics(
-        wer=row.wer,
-        cer=row.cer or 0.0,
-        wer_raw=row.wer_raw if row.wer_raw is not None else row.wer,
-        cer_raw=row.cer_raw if row.cer_raw is not None else (row.cer or 0.0),
+        wer=wer,
+        cer=cer,
+        wer_raw=wer_raw,
+        cer_raw=cer_raw,
+        mer=mer,
+        mer_raw=mer_raw,
+        overall=overall,
+        overall_raw=overall_raw,
         ref_word_count=row.ref_word_count or 0,
         hyp_word_count=row.hyp_word_count or 0,
         sub_count=row.sub_count or 0,
@@ -291,6 +313,30 @@ def _transcript_metrics(row: TranscriptResult) -> TranscriptMetrics | None:
         # fast" instead of "not applicable".
         rtf=row.rtf,
     )
+
+
+def _mer_from_counts(
+    sub: int | None, dele: int | None, ins: int | None, ref_words: int | None
+) -> float:
+    """MER computed from stored counts, for rows that predate the mer column.
+
+    Same identity `score()` uses: (S+D+I) / (ref_words + I). Guarded because a
+    row with an empty reference has both numerator and denominator zero.
+    """
+    sub_v = sub or 0
+    del_v = dele or 0
+    ins_v = ins or 0
+    ref_v = ref_words or 0
+    errors = sub_v + del_v + ins_v
+    denom = ref_v + ins_v
+    return errors / denom if denom else 0.0
+
+
+def _overall_from_rates(wer: float, cer: float, mer: float) -> float:
+    """Mean of WER, CER (each capped at 1.0), MER. Both edit-distance rates are
+    capped so the composite stays bounded when a very short reference produces
+    a hypothesis much longer than itself (WER and CER both go above 1.0 there)."""
+    return (min(wer, 1.0) + min(cer, 1.0) + mer) / 3.0
 
 
 @router.get("/{audio_file_id}/transcript", response_model=list[TranscriptRun], response_model_by_alias=True)

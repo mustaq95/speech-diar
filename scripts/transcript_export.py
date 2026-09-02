@@ -246,6 +246,7 @@ every rate includes the cost of that transport, so these are measurements of two
     # --- per-engine summary --------------------------------------------------
     add("<h2>Overall, by engine</h2>\n<table><thead><tr>"
         "<th>Engine</th><th>Transport</th><th class='num'>WER</th><th class='num'>CER</th>"
+        "<th class='num'>MER</th><th class='num'>Overall</th>"
         "<th class='num'>Sub / Del / Ins</th><th class='num'>Words ref &rarr; out</th>"
         "<th class='num'>Avg latency</th></tr></thead><tbody>")
     best = min(
@@ -256,6 +257,17 @@ every rate includes the cost of that transport, so these are measurements of two
         bucket = engines[asr_id]
         wer = (bucket["sub"] + bucket["del"] + bucket["ins"]) / bucket["ref"] if bucket["ref"] else None
         cer = bucket["cer_weighted"] / bucket["ref"] if bucket["ref"] else None
+        # Aggregate MER = (S+D+I) / (refWords + I), exact from summed counts.
+        # Aggregate Overall = mean of capped WER, capped CER, MER — same shape as
+        # the app's aggregate report, so a reader who cross-references the two
+        # sees the same numbers.
+        mer_denom = bucket["ref"] + bucket["ins"]
+        mer = (bucket["sub"] + bucket["del"] + bucket["ins"]) / mer_denom if mer_denom else None
+        overall = (
+            (min(wer, 1.0) + min(cer, 1.0) + mer) / 3.0
+            if wer is not None and cer is not None and mer is not None
+            else None
+        )
         latency = (
             f"{round(sum(bucket['latencies']) / len(bucket['latencies']))} ms"
             if bucket["latencies"] else "—"
@@ -264,6 +276,8 @@ every rate includes the cost of that transport, so these are measurements of two
             f"<td class='sub'>{esc(TRANSPORT_LABELS.get(bucket['transport'], bucket['transport']))}</td>"
             f"<td class='num{' win' if asr_id == best else ''}'>{pct(wer)}</td>"
             f"<td class='num'>{pct(cer)}</td>"
+            f"<td class='num'>{pct(mer)}</td>"
+            f"<td class='num'><strong>{pct(overall)}</strong></td>"
             f"<td class='num'>{bucket['sub']} / {bucket['del']} / {bucket['ins']}</td>"
             f"<td class='num'>{bucket['ref']} &rarr; {bucket['hyp']}</td>"
             f"<td class='num'>{latency}</td></tr>")

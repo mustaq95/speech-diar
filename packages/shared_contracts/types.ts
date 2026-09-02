@@ -173,6 +173,14 @@ export interface TranscriptMetrics {
   werRaw: number;
   /** Character error rate WITHOUT normalization. */
   cerRaw: number;
+  /** Match Error Rate (Morris/Maier/Green 2004), bounded 0..1, normalized. */
+  mer: number;
+  /** Match Error Rate WITHOUT normalization, bounded 0..1. */
+  merRaw: number;
+  /** Mean of WER, CER (each capped at 1.0), MER on normalized text; the composite ranking figure. */
+  overall: number;
+  /** Overall composite WITHOUT normalization. */
+  overallRaw: number;
   refWordCount: number;
   hypWordCount: number;
   subCount: number;

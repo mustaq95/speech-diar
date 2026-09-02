@@ -197,6 +197,18 @@ class TranscriptMetrics(ContractModel):
     cer: float = Field(ge=0, description="Character error rate, normalized text")
     wer_raw: float = Field(ge=0, description="Word error rate WITHOUT normalization")
     cer_raw: float = Field(ge=0, description="Character error rate WITHOUT normalization")
+    mer: float = Field(ge=0, le=1, description="Match Error Rate (Morris/Maier/Green 2004), bounded 0..1, normalized")
+    mer_raw: float = Field(ge=0, le=1, description="Match Error Rate WITHOUT normalization, bounded 0..1")
+    overall: float = Field(
+        ge=0,
+        le=1,
+        description="Mean of WER, CER (each capped at 1.0), MER (normalized); a single composite ranking figure",
+    )
+    overall_raw: float = Field(
+        ge=0,
+        le=1,
+        description="Overall composite WITHOUT normalization",
+    )
     ref_word_count: int = Field(ge=0)
     hyp_word_count: int = Field(ge=0)
     sub_count: int = Field(ge=0)

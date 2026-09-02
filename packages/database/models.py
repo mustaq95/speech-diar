@@ -207,6 +207,14 @@ class TranscriptResult(Base):
     cer: Mapped[float | None] = mapped_column(Float, nullable=True)
     wer_raw: Mapped[float | None] = mapped_column(Float, nullable=True)
     cer_raw: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # MER and Overall Score, added after WER/CER shipped. MER is bounded to
+    # [0,1] where WER can exceed it; overall is a mean of (WER capped, CER,
+    # MER) so a WER blowup does not swamp the composite. Backfilled once for
+    # rows that predate these columns from the stored sub/del/ins counts.
+    mer: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mer_raw: Mapped[float | None] = mapped_column(Float, nullable=True)
+    overall: Mapped[float | None] = mapped_column(Float, nullable=True)
+    overall_raw: Mapped[float | None] = mapped_column(Float, nullable=True)
     ref_word_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     hyp_word_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     sub_count: Mapped[int | None] = mapped_column(Integer, nullable=True)

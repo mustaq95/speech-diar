@@ -53,23 +53,25 @@ const TILES: Tile[] = [
     valueOf: (run) => run.metrics?.cer ?? null,
   },
   {
-    title: "Word Count",
-    hint: "Words emitted against the reference",
-    lowerIsBetter: false,
-    format: (value) => String(Math.round(value)),
-    valueOf: (run) => run.metrics?.hypWordCount ?? null,
+    // Same S/D/I inputs as WER but bounded to 0..1, so an engine whose extra
+    // insertions push WER past 100% cannot flatten this beyond it. That is why
+    // it sits beside WER rather than replacing it.
+    title: "Match Error Rate",
+    hint: "(S + D + I) ÷ (S + D + I + C) · bounded 0..1 · lower is better",
+    lowerIsBetter: true,
+    format: pct,
+    valueOf: (run) => run.metrics?.mer ?? null,
   },
   {
-    title: "Real-Time Factor",
-    hint: "Processing time ÷ audio duration · lower is better",
+    // Straight mean of WER and CER (each capped at 1.0 for this mean only) and
+    // MER, so one column can be ranked without an edit-distance blowup swamping
+    // the composite. Every input is normalized-side and is what the on-page
+    // columns show.
+    title: "Overall Score",
+    hint: "Mean of WER, CER (both capped) and MER · lower is better",
     lowerIsBetter: true,
-    format: (value) => value.toFixed(3),
-    valueOf: (run) => run.metrics?.rtf ?? null,
-    // Not a missing measurement: a real-time protocol consumes audio at 1x by
-    // definition, so there is no factor to report. Saying so beats printing a
-    // number that would look like one.
-    unavailable: (run) =>
-      run.transport === "stream" ? "real-time bound" : null,
+    format: pct,
+    valueOf: (run) => run.metrics?.overall ?? null,
   },
 ];
 

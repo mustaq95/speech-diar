@@ -53,6 +53,10 @@ def score_row(
     row.cer = normalized.cer
     row.wer_raw = raw.wer
     row.cer_raw = raw.cer
+    row.mer = normalized.mer
+    row.mer_raw = raw.mer
+    row.overall = normalized.overall
+    row.overall_raw = raw.overall
     row.ref_word_count = normalized.ref_words
     row.hyp_word_count = normalized.hyp_words
     row.sub_count = normalized.sub

@@ -39,10 +39,22 @@ class ErrorRates:
     `wer` can exceed 1.0. That is not a bug to clamp: an engine that emits more
     wrong words than the reference has words has an error rate above 100%, and
     hiding that would flatter it.
+
+    `mer` is Morris/Maier/Green (2004) Match Error Rate, (S+D+I) / (S+D+I+C).
+    Same counts as WER, but bounded to [0, 1]: an engine whose extra insertions
+    push WER past 100% still cannot push MER past it. That is the whole reason
+    it lives beside WER. `overall` is the straight mean of WER and CER (each
+    capped at 1.0 for the mean only) and MER, so a single ranking figure exists
+    without an edit-distance blowup swamping the composite. Both WER and CER can
+    exceed 1.0 in the same failure mode (a hypothesis much longer than a very
+    short reference), so both need the cap. The uncapped values on their own
+    rows are what the reader sees for those metrics.
     """
 
     wer: float
     cer: float
+    mer: float
+    overall: float
     sub: int
     delete: int
     ins: int
@@ -133,9 +145,28 @@ def score(reference: str, hypothesis: str, *, normalized: bool = True) -> ErrorR
 
     ref_chars = normalize(reference) if normalized else reference.strip()
     hyp_chars = normalize(hypothesis) if normalized else hypothesis.strip()
+    cer = _char_error_rate(ref_chars, hyp_chars)
+
+    # MER = (S + D + I) / (S + D + I + C), where C = correctly recognized words.
+    # From the backtrace, C = ref_count - subs - dels, so the denominator is
+    # ref_count + inses. Guarded because both counts can be zero (empty ref AND
+    # empty hyp), in which case there is nothing to fail at.
+    errors = subs + dels + inses
+    mer_denom = ref_count + inses
+    mer = errors / mer_denom if mer_denom else 0.0
+
+    # Overall = mean of WER and CER (each capped at 1.0 for this mean only) and
+    # MER. Both WER and CER can exceed 1.0 in the same failure mode (an engine
+    # produces far more output than the reference has), so both are capped for
+    # the composite while their own rows stay uncapped. MER is already bounded.
+    # See ErrorRates docstring for why.
+    overall = (min(wer, 1.0) + min(cer, 1.0) + mer) / 3.0
+
     return ErrorRates(
         wer=wer,
-        cer=_char_error_rate(ref_chars, hyp_chars),
+        cer=cer,
+        mer=mer,
+        overall=overall,
         sub=subs,
         delete=dels,
         ins=inses,
