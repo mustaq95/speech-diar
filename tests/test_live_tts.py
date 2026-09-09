@@ -18,6 +18,14 @@ assumes away, both of which would otherwise ship green:
     (always `audio/mpeg`, even for a WAV body), so the adapter sniffs magic
     bytes; if the gateway ever stops honouring `response_format`, only a real
     call notices.
+  * hamsa-tts-new's gateway MODEL ID. The vendor's guide says `hamsa-tts-new`;
+    probed 2026-09-09 that is a 403 on our key and the working id is
+    `hamsa-tts`. Only a live call can tell us the day that flips, and the
+    symptom would otherwise be every synthesis failing in the UI with a green
+    suite behind it.
+  * That hamsa-tts-new is honestly labelled `single`. It is consumed with
+    `client.stream()` like the pod engine, so nothing but a real timed call can
+    show that its first byte lands at ~total rather than early.
 """
 
 import wave
@@ -39,7 +47,7 @@ MIN_SEC, MAX_SEC = 0.5, 20.0
 
 
 @pytest.mark.live
-@pytest.mark.parametrize("tts_id", ["hamsa-tts", "inception-tts"])
+@pytest.mark.parametrize("tts_id", ["hamsa-tts", "hamsa-tts-new", "inception-tts"])
 def test_engine_returns_playable_audio(tts_id: str) -> None:
     settings = get_settings()
     engine = TTS_ENGINES[tts_id]
@@ -112,3 +120,70 @@ def test_inception_honours_the_requested_response_format() -> None:
 
     probe = probe_audio(render.audio)
     assert probe.sample_rate is not None, "inception-tts's rate should be readable from its container"
+
+
+@pytest.mark.live
+def test_hamsa_new_reaches_the_configured_gateway_model() -> None:
+    """The model id is the one thing here that cannot be checked offline.
+
+    The vendor's guide documents `hamsa-tts-new`; our key answers that with
+    403 `team not allowed to access model` and carries the model as
+    `hamsa-tts`. If this fails with a 403, the id in HAMSA_TTS_NEW_MODEL is no
+    longer the one this key can reach -- read the error, do not "fix" the test.
+    """
+    settings = get_settings()
+    engine = TTS_ENGINES["hamsa-tts-new"]
+    if not engine.configured(settings):
+        pytest.skip("hamsa-tts-new is not configured on this host")
+
+    render = engine.adapt(engine.run(SENTENCE, engine.default_voice(settings)))
+    assert render.audio_format == "wav"
+    assert render.audio[:4] == b"RIFF"
+
+
+@pytest.mark.live
+def test_hamsa_new_rate_is_measured_not_declared() -> None:
+    """The pod engine's rate is an ASSUMPTION (headerless PCM, nothing states
+    it). This engine's is a MEASUREMENT: ffprobe reads it straight off the
+    container, which is why nothing in the UI labels it "(assumed)". If the
+    container ever stops carrying a readable rate, that distinction is gone and
+    the label would become a lie."""
+    settings = get_settings()
+    engine = TTS_ENGINES["hamsa-tts-new"]
+    if not engine.configured(settings):
+        pytest.skip("hamsa-tts-new is not configured on this host")
+
+    render = engine.adapt(engine.run(SENTENCE, engine.default_voice(settings)))
+    probe = probe_audio(render.audio)
+    assert probe.sample_rate is not None, (
+        "hamsa-tts-new's rate must be readable off its own bytes -- the whole "
+        "reason this engine is not labelled (assumed) in the UI"
+    )
+    assert probe.duration_sec is not None
+    assert MIN_SEC < probe.duration_sec < MAX_SEC
+
+
+@pytest.mark.live
+def test_hamsa_new_does_not_front_load_audio() -> None:
+    """The inverse of `test_hamsa_stream_front_loads_audio`, and the evidence
+    for `delivery="single"`.
+
+    Measured 2026-09-09 across three input sizes: first byte at 97-99% of
+    total (ratios 0.973 / 0.979 / 0.989), even for a 166-second clip -- the
+    gateway buffers the whole body upstream. If this engine ever DID start
+    streaming, `delivery` must change to "stream", because the scorecard
+    credits a `stream` engine with a real time-to-first-audio head start.
+    """
+    settings = get_settings()
+    engine = TTS_ENGINES["hamsa-tts-new"]
+    if not engine.configured(settings):
+        pytest.skip("hamsa-tts-new is not configured on this host")
+
+    render = engine.adapt(engine.run(SENTENCE, engine.default_voice(settings)))
+    assert render.first_audio_ms is not None and render.synth_ms > 0
+    share = render.first_audio_ms / render.synth_ms
+    assert share > 0.8, (
+        f"first audio at {render.first_audio_ms}ms of {render.synth_ms}ms ({share:.2f} of total): "
+        "this engine now front-loads audio, so delivery=\"single\" understates it -- "
+        "re-probe and relabel it rather than loosening this bound"
+    )

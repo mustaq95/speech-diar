@@ -328,8 +328,8 @@ export function TtsStudio({ runtimeConfig, audioFileId, onScriptSaved }: TtsStud
 
   // Real peaks decoded from the clip's own PCM bytes, same function the
   // diarization waveform uses — never a synthetic shape. Only for a wav clip:
-  // both engines render wav today, but if one ever answers mp3 instead, no bars
-  // are drawn rather than a wrong or flat picture.
+  // every engine renders wav today, but if one ever answers mp3 instead, no
+  // bars are drawn rather than a wrong or flat picture.
   useEffect(() => {
     if (effectiveAudioFileId == null) return;
     let cancelled = false;
@@ -614,14 +614,6 @@ export function TtsStudio({ runtimeConfig, audioFileId, onScriptSaved }: TtsStud
                         {formatSummary(shownRun, engine.ttsId === "hamsa-tts") || "format not reported"}
                       </span>
                       <span className="tts-clip-actions">
-                        <button
-                          type="button"
-                          className="ghost-btn"
-                          onClick={() => void handleSynthesize(engine, voice)}
-                          disabled={busy || overLimit || !draft.trim()}
-                        >
-                          {busy ? "Synthesizing…" : "Re-synthesize"}
-                        </button>
                         {effectiveAudioFileId != null && (
                           <a
                             className="tts-download"
@@ -642,7 +634,7 @@ export function TtsStudio({ runtimeConfig, audioFileId, onScriptSaved }: TtsStud
               </div>
               {/* Every tile shows a measured figure or the REASON there is none —
                   never a 0 or a blank that reads as zero. There is deliberately no
-                  "chars skipped" tile: neither engine reports what it declined to
+                  "chars skipped" tile: no engine reports what it declined to
                   say, so that number could only be invented. */}
               <div className="tts-tiles">
                 <div className="score-tile">
@@ -673,34 +665,43 @@ export function TtsStudio({ runtimeConfig, audioFileId, onScriptSaved }: TtsStud
                 <div className="score-tile">
                   <span className="eyebrow">Input characters</span>
                   <b className="mono">{shownRun?.textChars != null ? shownRun.textChars : "—"}</b>
-                  {/* Both engines are handed the identical string — that is the whole
+                  {/* Every engine is handed the identical string — that is the whole
                       point of the comparison, so it is stated rather than left for the
-                      reader to infer from two equal numbers. */}
-                  <small className="muted">same text to both</small>
+                      reader to infer from a row of equal numbers. */}
+                  <small className="muted">same text to every engine</small>
                 </div>
               </div>
-              {/* Only the FIRST synthesis gets the full-width primary button. Once a
-                  clip exists, re-running lives beside Download in the meta row, where
-                  it reads as an action on that clip rather than the card's headline. */}
-              {shownRun?.status !== "done" && (
-                <button
-                  type="button"
-                  className="generate-btn"
-                  onClick={() => void handleSynthesize(engine, voice)}
-                  disabled={busy || overLimit || !draft.trim()}
-                  title={
-                    !draft.trim()
-                      ? "Write or generate a script first — there is nothing to synthesize yet"
-                      : overLimit
-                        ? "Reference text is over this host's TTS char limit"
-                        : shownRun
-                          ? "Try again"
+              {/* ONE button per card, always in the same place, relabelled by what
+                  is stored: "Synthesize" until a clip exists, then "Re-synthesize".
+                  There used to be a second ghost button beside Download that did the
+                  identical thing, so the primary action moved position the moment a
+                  clip appeared and the card offered two controls for one action. The
+                  label carries the state instead. */}
+              <button
+                type="button"
+                className="generate-btn"
+                onClick={() => void handleSynthesize(engine, voice)}
+                disabled={busy || overLimit || !draft.trim()}
+                title={
+                  !draft.trim()
+                    ? "Write or generate a script first — there is nothing to synthesize yet"
+                    : overLimit
+                      ? "Reference text is over this host's TTS char limit"
+                      : shownRun?.status === "failed"
+                        ? "Try again"
+                        : shownRun?.status === "done"
+                          ? `Synthesize ${voice} again, replacing the stored clip`
                           : "Synthesize"
-                  }
-                >
-                  {busy ? "Synthesizing…" : shownRun?.status === "failed" ? "Try again" : "Synthesize"}
-                </button>
-              )}
+                }
+              >
+                {busy
+                  ? "Synthesizing…"
+                  : shownRun?.status === "failed"
+                    ? "Try again"
+                    : shownRun?.status === "done"
+                      ? "Re-synthesize"
+                      : "Synthesize"}
+              </button>
             </div>
           );
         })}

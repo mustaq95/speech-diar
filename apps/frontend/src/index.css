@@ -217,9 +217,6 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   padding: 8px 14px; font-size: 12.5px; font-weight: 700; cursor: pointer; text-decoration: none;
   display: inline-flex; align-items: center; }
 .tts-download:hover { filter: brightness(1.08); }
-/* Scoped, not a change to either global .ghost-btn (there are two, and the
-   smaller one at the end of this file wins -- pre-existing, left alone). */
-.tts-clip-actions .ghost-btn { padding: 8px 14px; font-size: 12.5px; border-radius: 8px; }
 /* The measured duration of the stored clip, not the player's own readout. */
 .tts-clip-clock { flex: 0 0 auto; font-size: 13px; font-variant-numeric: tabular-nums; color: var(--muted); }
 /* Reason-in-place-of-a-waveform: an mp3 clip has no bars because the decoder is
@@ -228,12 +225,24 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 /* Hugs its content, unlike .engine-body: a TTS card has a player, not a scrolling
    transcript, so reserving transcript height would leave an empty well. */
 .tts-body { flex: 1; display: flex; flex-direction: column; background: var(--panel-2); border: 1px solid var(--line); border-radius: 9px; padding: 14px; font-size: 14px; }
-.tts-clip-meta { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 10px; font-size: 12px; flex-wrap: wrap; }
+/* nowrap, and that is deliberate: with flex-wrap the browser moves Download to
+   a second flex line rather than shrinking the summary beside it, so a longer
+   summary (hamsa-tts adds "(assumed)" to its rate, worth ~85px) put the same
+   control at a different height in that one panel. Held on one line, the
+   summary shrinks and wraps its OWN text instead, which keeps Download in the
+   same place across all three cards. Safe at narrow widths because the panels
+   go single-column at 720px, where the row has far more room, not less. */
+.tts-clip-meta { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 10px; font-size: 12px; flex-wrap: nowrap; }
+.tts-clip-meta > .mono { flex: 0 1 auto; min-width: 0; }
+.tts-clip-actions { flex: 0 0 auto; }
 .tts-clip-actions { display: inline-flex; align-items: center; gap: 8px; }
-/* Four tiles, matching the transcript scorecard's grid rather than the 3-column
-   .engine-foot: these carry a subtitle each, which needs the extra width. */
-.tts-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
-.tts-tiles .score-tile { display: flex; flex-direction: column; gap: 3px; }
+/* All four figures on ONE line, explicitly 4 columns rather than auto-fit:
+   auto-fit dropped the fourth tile onto a second row at the desktop 3-panel
+   width, which read as "input characters" belonging to a different group than
+   the three timings it is measured beside. minmax(0,...) so a long figure
+   cannot push a column wider than its share. */
+.tts-tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.tts-tiles .score-tile { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .tts-tiles .score-tile b { font-size: 17px; }
 .tts-tiles .score-tile:first-child b { color: var(--engine); }
 .tts-tiles .score-tile small { font-size: 10.5px; line-height: 1.35; }
@@ -591,6 +600,9 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
      the 980px rules, so at <=720px the two-column rule would win the cascade and
      the single column would never apply. */
   .engine-panels, .scorecard-grid { grid-template-columns: minmax(0, 1fr); }
+  /* A phone-width panel cannot hold four legible columns, so the row becomes
+     2x2 rather than four squeezed slivers. */
+  .tts-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .page, .dashboard { padding-left: 14px; padding-right: 14px; }
   .empty-head, .view-head { align-items: flex-start; flex-direction: column; }
   .animated-bars { display: none; }
@@ -623,3 +635,12 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
    most emphatic thing in the tile. */
 .score-bar.is-best > i { background: var(--good); }
 .score-bar.is-worst > i { background: var(--bad); }
+
+/* An engine that could not keep up with the live chunk interval. Warn-coloured
+   like .engine-replayed, because both say "read this figure with a caveat"
+   rather than "this failed". */
+.engine-skipped {
+  margin-left: 6px; font-size: 10.5px; padding: 1px 6px; border-radius: 999px;
+  color: var(--warn); border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
+  white-space: nowrap;
+}

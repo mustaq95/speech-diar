@@ -32,6 +32,50 @@ both paths chunk identically and their numbers stay comparable. A test with one
 short clip cannot catch a regression here: it needs a span long enough to be
 split, compared against a single call on the same audio.
 
+**Re-measured 2026-09-03 across 9 saved recordings (1932 reference words), and
+the mechanism is now known: the cap is on OUTPUT, not on input length.**
+
+Sending a longer prefix stops helping at roughly 40 s. On recording 241 the
+reply was byte-identical at 50, 60, 75, 90, 110 and 130 s of input -- 64 words,
+420 chars, same text every time:
+
+    prefix  5s   10s  15s  20s  25s  30s  40s  50s ... 130s
+    words    7    24   35   41   47   58   64   64 ...   64
+
+So one whole-file call can never cover a long recording, whatever else is tuned.
+That is why `INCEPTION_BATCH_WHOLE_FILE` must be off in practice, and it is what
+made this engine report 66 words against hamsa's 168 on the same 78 s clip.
+
+Aggregate WER by split length -- TOTAL errors over TOTAL reference words, never
+a mean of per-recording rates:
+
+    whole file  0.782   542 words recovered (28%)
+    5 s         0.362  1673 (87%)   <- best measured
+    15 s        0.454  1389
+    20 s        0.462  1323
+    30 s        0.440  1375
+    40 s        0.540  1111         <- past the output cap
+
+The loss stays NON-MONOTONIC per recording: 241 scored BEST at 30 s (0.456) and
+232 scored WORST at 30 s (0.651), on the same setting. Tune from the aggregate,
+never from one clip.
+
+This host runs `INCEPTION_BATCH_WHOLE_FILE=false` with
+`BATCH_SEGMENT_SECONDS=30`. 30 s is an operator choice, not the optimum: 5 s
+scored best (0.362) and 30 s costs ~7.8 WER points and ~300 words, bought back as
+roughly six times fewer requests. 40 s is worse again (0.540) because it sits
+past the output cap.
+
+The loss stays NON-MONOTONIC per recording -- 241 scored BEST at 30 s (0.456)
+while 232 scored WORST at 30 s (0.651) -- so retune from the aggregate, never
+from one clip.
+
+Batch now splits at 30 s while the LIVE path chunks at 3 s, so this engine's two
+rows are two different pipelines. Each stamps its own interval on the row and the
+surfaces label them apart, but the gap between them is mostly chunk size, not a
+live-versus-batch effect. It also means inception-stt and cohere-transcribe no
+longer receive identical input in batch -- cohere still sends the whole file.
+
 Boundaries are fixed, never nudged into a silence: see `split_wav_fixed`.
 
 The gateway also returns `audio_duration`, `usage` and `word_timestamps` keys

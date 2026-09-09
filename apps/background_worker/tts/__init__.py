@@ -14,8 +14,12 @@ byte is visible.
 Same runner/adapter split as everywhere else in this repo: each engine's
 `runner.py` executes it and returns its NATIVE output untouched; its
 `adapter.py` is the only code allowed to understand that shape, and it
-reduces to `TtsRender` below. No abstract base class: two single-use engines
-do not need one.
+reduces to `TtsRender` below. No abstract base class: three single-use
+engines do not need one, and `hamsa-tts` / `hamsa-tts-new` are the reason to
+resist it — the same vendor reached two ways returns two genuinely different
+native shapes (headerless PCM at a declared rate, versus a real RIFF/WAVE
+container), and a shared base class would push exactly that difference into
+somewhere it does not belong.
 """
 
 from dataclasses import dataclass
@@ -74,6 +78,9 @@ class TtsEngine:
 # TtsRender from this package, so importing them earlier would be circular.
 from .hamsa import adapter as hamsa_adapter  # noqa: E402
 from .hamsa import runner as hamsa_runner  # noqa: E402
+from .hamsa_new import adapter as hamsa_new_adapter  # noqa: E402
+from .hamsa_new import runner as hamsa_new_runner  # noqa: E402
+from .hamsa_new.runner import RESPONSE_FORMAT  # noqa: E402
 from .inception import adapter as inception_adapter  # noqa: E402
 from .inception import runner as inception_runner  # noqa: E402
 
@@ -101,6 +108,29 @@ TTS_ENGINES: dict[str, TtsEngine] = {
             },
         ),
         TtsEngine(
+            tts_id="hamsa-tts-new",
+            name="TryHamsa TTS (new)",
+            # "single", not "stream", despite being read with client.stream():
+            # measured, first byte lands at 97-99% of total even for a
+            # 166-second clip, because the gateway buffers the whole body
+            # upstream. Labelling it "stream" would credit it with a
+            # time-to-first-audio head start it does not have.
+            delivery="single",
+            run=hamsa_new_runner.run,
+            adapt=hamsa_new_adapter.adapt,
+            voices=lambda s: s.hamsa_tts_new_voice_options,
+            default_voice=lambda s: s.hamsa_tts_new_default_voice,
+            # The gateway credential, NOT the pod's X-API-Key/bearer pair that
+            # `hamsa-tts` needs: same vendor, different door. Sharing the
+            # predicate with `hamsa-tts` would advertise this engine as ready
+            # on a host that only has the pod configured.
+            configured=lambda s: bool(s.litellm_base_url and s.litellm_api_key),
+            synthesis_params=lambda s: {
+                "model": s.hamsa_tts_new_model,
+                "format": RESPONSE_FORMAT,
+            },
+        ),
+        TtsEngine(
             tts_id="inception-tts",
             name="Inception-TTS",
             delivery="single",
@@ -121,12 +151,16 @@ TTS_ENGINES: dict[str, TtsEngine] = {
 #: tuple, not "every configured engine" -- mirrors COMPARISON_ASR_IDS's own
 #: reasoning: silently gaining a column because someone set a credential
 #: would change what the scorecard means.
-COMPARISON_TTS_IDS: tuple[str, ...] = ("hamsa-tts", "inception-tts")
+COMPARISON_TTS_IDS: tuple[str, ...] = ("hamsa-tts", "hamsa-tts-new", "inception-tts")
 
 #: Which delivery each engine uses. Kept alongside the registry rather than
 #: read off `TtsEngine.delivery` everywhere, mirroring `ASR_TRANSPORTS` /
 #: `transport_for` on the STT side.
-TTS_DELIVERY: dict[str, str] = {"hamsa-tts": "stream", "inception-tts": "single"}
+TTS_DELIVERY: dict[str, str] = {
+    "hamsa-tts": "stream",
+    "hamsa-tts-new": "single",
+    "inception-tts": "single",
+}
 
 
 def delivery_for(tts_id: str) -> str | None:

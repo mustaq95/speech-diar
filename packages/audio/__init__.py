@@ -153,6 +153,14 @@ class AudioProbe:
 #: absent from this map).
 _SAMPLE_FMT_BITS: dict[str, int] = {"u8": 8, "s16": 16, "s32": 32, "s64": 64}
 
+#: The frame count `wave` reports for a WAV whose data-chunk size is the
+#: 0xFFFFFFFF sentinel that streaming backends write when they do not know the
+#: final length. `wave` reads the unsigned field into a signed int, so the
+#: symptom is exactly 2147483647 frames; anything at or above it is a sentinel
+#: rather than a real length (a genuine 2^31-frame mono clip would be 4GB of
+#: PCM, which nothing here produces).
+_WAVE_SIZE_SENTINEL = 0x7FFFFFFF
+
 
 def probe_audio(payload: bytes) -> AudioProbe:
     """Everything readable out of arbitrary audio bytes, as an `AudioProbe`.
@@ -222,9 +230,20 @@ def probe_audio(payload: bytes) -> AudioProbe:
             with wave.open(path, "rb") as wav:
                 rate = wav.getframerate()
                 frames = wav.getnframes()
+                # A frame count at or past the sentinel is not a measurement.
+                # hamsa-tts-new writes 0xFFFFFFFF into the RIFF and data size
+                # fields (a streaming-style header from its backend), which
+                # `wave` reads as 2147483647 frames = 134217 seconds. ffprobe,
+                # tried above, reads those bytes correctly; this branch only
+                # runs on a host without it, and there it must report "this
+                # payload does not say" rather than a 37-hour duration and the
+                # fabricated RTF that would follow from it.
+                unknown_length = frames >= _WAVE_SIZE_SENTINEL
                 return AudioProbe(
                     sample_rate=rate,
-                    duration_sec=(frames / float(rate) if rate else None),
+                    duration_sec=(
+                        frames / float(rate) if rate and not unknown_length else None
+                    ),
                     channels=wav.getnchannels(),
                     bit_depth=wav.getsampwidth() * 8,
                 )

@@ -2,9 +2,10 @@
 
 The adapters are the only code allowed to understand each engine's native
 shape, so these are the tests that pin down what that shape is: Hamsa returns
-headerless PCM that must become a real WAV, and Inception returns a real
-container whose declared Content-Type cannot be trusted (the gateway sends
-`audio/mpeg` even for a WAV body -- measured, see the runner docstring).
+headerless PCM that must become a real WAV, Inception returns a real container
+whose declared Content-Type cannot be trusted (the gateway sends `audio/mpeg`
+even for a WAV body -- measured, see the runner docstring), and hamsa-tts-new
+returns a real WAV whose DECLARED SIZES are the 0xFFFFFFFF sentinel.
 """
 
 import shutil
@@ -15,6 +16,8 @@ from io import BytesIO
 import pytest
 
 from apps.background_worker.tts.hamsa import adapter as hamsa_adapter
+from apps.background_worker.tts.hamsa_new import adapter as hamsa_new_adapter
+from apps.background_worker.tts.hamsa_new.runner import HamsaNewTtsResponseError
 from apps.background_worker.tts.inception import adapter as inception_adapter
 from apps.background_worker.tts.inception.runner import InceptionTtsResponseError
 from packages.audio import probe_audio
@@ -22,6 +25,23 @@ from packages.config.settings import get_settings
 
 MP3_BYTES = b"\xff\xf3\x84\xc4" + b"\x00" * 256
 ID3_BYTES = b"ID3\x04\x00\x00" + b"\x00" * 256
+
+#: hamsa-tts-new's REAL 44-byte response header, copied byte for byte off a
+#: live call on 2026-09-09: PCM, mono, 16000 Hz, and BOTH size fields set to
+#: 0xFFFFFFFF -- the backend writes a streaming-style header and never goes
+#: back to fill in the length. A synthetic `wave`-built header would carry
+#: real sizes and so would not exercise any of this, which is the whole
+#: reason the real bytes are pinned here.
+HAMSA_NEW_HEADER = bytes.fromhex(
+    "52494646"          # "RIFF"
+    "ffffffff"          # riff size: the sentinel, not a length
+    "57415645"          # "WAVE"
+    "666d7420" "10000000"   # "fmt " chunk, 16 bytes
+    "0100" "0100"           # PCM, 1 channel
+    "803e0000" "007d0000"   # 16000 Hz, 32000 bytes/sec
+    "0200" "1000"           # block align 2, 16 bits
+    "64617461" "ffffffff"   # "data" chunk, sentinel size again
+)
 
 
 def _wav_bytes(rate: int = 24000, seconds: float = 0.5) -> bytes:
@@ -116,6 +136,122 @@ def test_inception_adapter_rejects_an_unrecognizable_body(monkeypatch) -> None:
         inception_adapter.adapt(_native(b"<html>gateway error</html>"))
 
 
+# --- hamsa-tts-new -------------------------------------------------------
+#
+# Every payload below is the shape the LIVE gateway actually returned on
+# 2026-09-09, not what its vendor guide documents. The guide was wrong about
+# the status codes, the Content-Type and the honoured response_format, so the
+# probe is what these tests encode.
+
+
+def _hamsa_new_native(audio: bytes) -> dict:
+    """The runner's native dict, carrying the gateway's real lying header."""
+    return _native(audio) | {"voice": "Zeina"}
+
+
+def test_hamsa_new_adapter_accepts_the_sentinel_header_wav() -> None:
+    """The real body: a RIFF/WAVE whose declared sizes are 0xFFFFFFFF. An
+    adapter that validated those fields would reject every real response."""
+    render = hamsa_new_adapter.adapt(_hamsa_new_native(HAMSA_NEW_HEADER + b"\x00\x00" * 8000))
+    assert render.audio_format == "wav"
+    assert render.voice == "Zeina"
+
+
+def test_hamsa_new_adapter_ignores_the_lying_content_type() -> None:
+    """The gateway always says `audio/mpeg`, even for this real WAV -- the same
+    lie inception-tts tells on the same gateway. Branching on it would store
+    WAV bytes under an .mp3 key."""
+    native = _hamsa_new_native(HAMSA_NEW_HEADER + b"\x00\x00" * 100)
+    assert native["headers"]["content-type"] == "audio/mpeg"
+    assert hamsa_new_adapter.adapt(native).audio_format == "wav"
+
+
+def test_hamsa_new_adapter_passes_the_container_through_untouched() -> None:
+    """Stored verbatim, never canonicalized: the download has to be the bytes
+    the engine sent, sentinel header included."""
+    payload = HAMSA_NEW_HEADER + bytes(range(256)) * 8
+    assert hamsa_new_adapter.adapt(_hamsa_new_native(payload)).audio == payload
+
+
+def test_hamsa_new_adapter_rejects_a_header_with_no_frames() -> None:
+    """Empty input returns 200 and EXACTLY this 44-byte header -- probed, not
+    hypothetical. Storing it would put a clip in the UI whose duration renders
+    as 0, which reads as a measurement of silence rather than a refusal."""
+    with pytest.raises(HamsaNewTtsResponseError, match="no audio frames"):
+        hamsa_new_adapter.adapt(_hamsa_new_native(HAMSA_NEW_HEADER))
+
+
+@pytest.mark.parametrize(
+    "payload, label",
+    [
+        (MP3_BYTES, "mp3"),
+        (b"<html>gateway error</html>", "an error page"),
+        (b"", "an empty body"),
+    ],
+)
+def test_hamsa_new_adapter_rejects_anything_that_is_not_wav(payload: bytes, label: str) -> None:
+    """This gateway IGNORES response_format and returns WAV whatever is asked
+    for (probed: asking mp3 got real WAV back). So a non-WAV body here does not
+    mean a different format was requested -- it means the contract changed, and
+    guessing at it would mislabel the stored clip."""
+    with pytest.raises(HamsaNewTtsResponseError):
+        hamsa_new_adapter.adapt(_hamsa_new_native(payload))
+
+
+def test_hamsa_new_adapter_keeps_the_audio_out_of_raw_meta() -> None:
+    render = hamsa_new_adapter.adapt(_hamsa_new_native(HAMSA_NEW_HEADER + b"\x00\x00" * 100))
+    assert render.raw_meta == {"status_code": 200, "headers": {"content-type": "audio/mpeg"}}
+    assert "audio" not in render.raw_meta
+
+
+# --- the 0xFFFFFFFF sentinel, end to end through probe_audio -------------
+
+
+def test_probe_reads_the_sentinel_header_wav_via_ffprobe() -> None:
+    """ffprobe reads these bytes correctly where `wave` cannot, which is why
+    probe_audio tries it first. 8000 frames at 16 kHz is 0.5s."""
+    if shutil.which("ffprobe") is None:
+        pytest.skip("ffprobe not available")
+    probe = probe_audio(HAMSA_NEW_HEADER + b"\x00\x00" * 8000)
+    assert probe.sample_rate == 16000
+    assert probe.duration_sec == pytest.approx(0.5, abs=0.05)
+    assert probe.channels == 1
+
+
+def test_wave_fallback_reports_unknown_for_a_sentinel_length() -> None:
+    """The guard for a host with no ffprobe installed.
+
+    Python's `wave` reads the 0xFFFFFFFF data size as 2147483647 frames, i.e.
+    134217 seconds -- a 37-hour duration for a half-second clip, and an RTF
+    derived from it that would look like a real measurement. `duration_sec`
+    must come back None so the UI renders the absence instead.
+
+    Forced down the fallback by hiding ffprobe, because on this host the
+    ffprobe path above succeeds and this branch would never run.
+    """
+    payload = HAMSA_NEW_HEADER + b"\x00\x00" * 8000
+
+    # Sanity: this is genuinely what `wave` does with these bytes.
+    with wave.open(BytesIO(payload), "rb") as wav:
+        assert wav.getnframes() == 0x7FFFFFFF
+
+    import packages.audio as audio_module
+
+    original = audio_module.shutil.which
+    try:
+        audio_module.shutil.which = lambda name: None if name == "ffprobe" else original(name)
+        probe = probe_audio(payload)
+    finally:
+        audio_module.shutil.which = original
+
+    assert probe.duration_sec is None, "a sentinel length must never be reported as a duration"
+    # The fields that ARE readable off the header must survive: the point is to
+    # drop the unknowable one, not to discard the whole probe.
+    assert probe.sample_rate == 16000
+    assert probe.channels == 1
+    assert probe.bit_depth == 16
+
+
 # --- timing invariant ----------------------------------------------------
 
 
@@ -123,9 +259,10 @@ def test_inception_adapter_rejects_an_unrecognizable_body(monkeypatch) -> None:
     "adapt, payload",
     [
         (hamsa_adapter.adapt, b"\x00\x00" * 4000),
+        (hamsa_new_adapter.adapt, HAMSA_NEW_HEADER + b"\x00\x00" * 4000),
         (inception_adapter.adapt, _wav_bytes()),
     ],
-    ids=["hamsa", "inception"],
+    ids=["hamsa", "hamsa-new", "inception"],
 )
 def test_first_audio_never_exceeds_total_synthesis(monkeypatch, adapt, payload: bytes) -> None:
     """First audio is measured inside the same wall-clock bracket as the total,

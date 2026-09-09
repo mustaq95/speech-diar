@@ -141,3 +141,120 @@ def test_every_engine_declares_synthesis_params() -> None:
         assert params, f"{tts_id!r} declares no synthesis params"
         for key, value in params.items():
             assert isinstance(key, str) and isinstance(value, str), f"{tts_id!r}: {key!r}={value!r}"
+
+
+# --- hamsa-tts-new's voice dropdown -----------------------------------------
+#
+# 113 bundled speakers, and every one was swept against the live gateway on
+# 2026-09-09 (113/113 returned real RIFF audio). The dropdown is that list, so
+# these pin the properties a dropdown actually needs: no duplicates, no blanks,
+# nothing that would post as a malformed speaker name, and a default that is a
+# single real voice.
+
+#: What the vendor's guide documents, and what the sweep confirmed.
+EXPECTED_HAMSA_NEW_VOICE_COUNT = 113
+
+#: Named in the vendor's guide as the commonly-used ones. Spot-checked here
+#: because a dropdown that silently lost the voices people ask for by name is
+#: the failure nobody notices until a demo.
+COMMON_HAMSA_NEW_VOICES = (
+    "Zeina", "Amir", "Layla", "Yara", "Salma", "Tamer", "Noor", "Sami", "Hiba", "Fahd",
+)
+
+
+def test_hamsa_new_offers_every_bundled_voice() -> None:
+    voices = TTS_ENGINES["hamsa-tts-new"].voices(get_settings())
+    assert len(voices) == EXPECTED_HAMSA_NEW_VOICE_COUNT, (
+        f"expected {EXPECTED_HAMSA_NEW_VOICE_COUNT} bundled speakers, got {len(voices)}"
+    )
+
+
+def test_hamsa_new_voice_list_has_no_duplicates() -> None:
+    """A duplicate would render the same voice twice in the picker and, because
+    the stored clip is keyed on (recording, engine, voice), make two entries
+    that resolve to one row."""
+    voices = TTS_ENGINES["hamsa-tts-new"].voices(get_settings())
+    duplicates = sorted({v for v in voices if voices.count(v) > 1})
+    assert not duplicates, f"duplicated voices: {duplicates}"
+
+
+@pytest.mark.parametrize("voice", COMMON_HAMSA_NEW_VOICES)
+def test_hamsa_new_offers_the_commonly_used_voices(voice: str) -> None:
+    assert voice in TTS_ENGINES["hamsa-tts-new"].voices(get_settings())
+
+
+def test_hamsa_new_voices_are_all_clean_names() -> None:
+    """Every entry has to survive being posted as `voice` AND slugified into an
+    object-store key. A blank or comma-bearing entry is the `Ruba,Sandra` bug
+    class again, and the gateway answers a malformed speaker with a 500 that
+    reads as an outage."""
+    for voice in TTS_ENGINES["hamsa-tts-new"].voices(get_settings()):
+        assert voice == voice.strip() and voice, f"{voice!r} is blank or padded"
+        assert "," not in voice, f"{voice!r} contains a comma"
+
+
+def test_hamsa_new_default_voice_is_a_single_real_voice() -> None:
+    """Entry 0 is what gets posted when the caller chooses nothing."""
+    settings = get_settings()
+    engine = TTS_ENGINES["hamsa-tts-new"]
+    default = engine.default_voice(settings)
+    assert "," not in default
+    assert default in engine.voices(settings)
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("Zeina", ["Zeina"]),
+        ("Zeina,Amir", ["Zeina", "Amir"]),
+        ("Zeina, Amir", ["Zeina", "Amir"]),
+        ("Zeina,Amir,", ["Zeina", "Amir"]),
+        (" Zeina , Amir ", ["Zeina", "Amir"]),
+        ("Zeina,,Amir", ["Zeina", "Amir"]),
+    ],
+)
+def test_hamsa_new_voice_list_parsing(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: list[str]
+) -> None:
+    """Same parsing contract as HAMSA_TTS_SPEAKER, for the same reason: the
+    override in .env is hand-written."""
+    settings = get_settings()
+    monkeypatch.setattr(settings, "hamsa_tts_new_voice", raw)
+    assert settings.hamsa_tts_new_voice_options == expected
+    assert settings.hamsa_tts_new_default_voice == expected[0]
+
+
+# --- the two TryHamsa engines are genuinely separate ------------------------
+
+
+def test_the_two_hamsa_engines_are_distinct_pipelines() -> None:
+    """Same vendor, two doors, and the repo treats them as two engines.
+
+    They must not share a runner, an adapter or a `configured` predicate: the
+    pod needs HAMSA_TTS_KEY + a bearer token, the gateway needs
+    LITELLM_API_KEY, and a shared predicate would advertise one as ready on a
+    host that only has the other's credentials.
+    """
+    pod = TTS_ENGINES["hamsa-tts"]
+    gateway = TTS_ENGINES["hamsa-tts-new"]
+
+    assert pod.run is not gateway.run
+    assert pod.adapt is not gateway.adapt
+    assert pod.name != gateway.name
+    # The measurable difference that justifies running both.
+    assert pod.delivery == "stream" and gateway.delivery == "single"
+
+
+def test_hamsa_new_is_configured_by_the_gateway_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Not by the pod's key: an engine that reports ready and then 401s on
+    every run reads as an outage, which is the bug the pod engine's own
+    `configured` predicate already paid for."""
+    settings = get_settings()
+    engine = TTS_ENGINES["hamsa-tts-new"]
+
+    monkeypatch.setattr(settings, "litellm_base_url", "https://gateway.example")
+    monkeypatch.setattr(settings, "litellm_api_key", "k")
+    assert engine.configured(settings) is True
+
+    monkeypatch.setattr(settings, "litellm_api_key", None)
+    assert engine.configured(settings) is False

@@ -17,6 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
+from packages.config.settings import get_settings
 from packages.database.models import AudioFile, TranscriptReference, TranscriptResult, User
 from packages.database.session import DEV_USER_EMAIL
 from tests.conftest import make_wav_bytes
@@ -777,7 +778,8 @@ def test_the_same_engine_takes_either_mode_across_two_sessions(
 
 def test_both_engines_get_the_whole_file_in_batch_mode(
     client: TestClient, db_session_factory: sessionmaker[Session],
-    live_session, stub_s3, stub_queue,
+    live_session, stub_s3, stub_queue, monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     """The symmetry batch mode exists for.
 
@@ -791,6 +793,17 @@ def test_both_engines_get_the_whole_file_in_batch_mode(
     carries that. INCEPTION_BATCH_WHOLE_FILE is what trades it, and
     `transport_for` follows the same setting so the label cannot drift from it.
     """
+    # Pinned, not inherited from the host .env. This test describes what happens
+    # with whole-file batching ON; a host that turns it off (to recover the
+    # content this gateway truncates) is making a different, legitimate choice
+    # and must not fail the test that documents this one.
+    monkeypatch.setenv("INCEPTION_BATCH_WHOLE_FILE", "true")
+    # Settings are lru_cached, so the env change only lands after a clear -- and
+    # it must be cleared again afterwards, or this value leaks into every later
+    # test in the session.
+    get_settings.cache_clear()
+    request.addfinalizer(get_settings.cache_clear)
+
     live_session.create(
         ["inception-stt", "cohere-transcribe"], 3.0,
         modes={"inception-stt": "batch", "cohere-transcribe": "batch"},

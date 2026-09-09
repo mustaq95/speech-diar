@@ -534,9 +534,10 @@ class Settings(BaseSettings):
     adeo_whisper_timeout_sec: float = 600
 
     # --- TTS synthesis engines (script -> read-aloud audio) ---
-    # Two synthesis engines, mirroring the two STT engines above: TryHamsa TTS
-    # (streaming) and Inception-TTS (single-shot, via the same LiteLLM gateway
-    # as inception-stt). Both are compared the same way the STT engines are:
+    # Three synthesis engines: TryHamsa TTS (streaming, straight to the
+    # inference pod), TryHamsa TTS (new) (the same vendor through the LiteLLM
+    # gateway, single-shot) and Inception-TTS (single-shot, same gateway as
+    # inception-stt). All three are compared the same way the STT engines are:
     # each fed in its own native delivery mode, nothing smoothed to match.
 
     # --- TryHamsa TTS (streaming) ---
@@ -580,6 +581,49 @@ class Settings(BaseSettings):
     # this engine has no meaningful streaming (~6.7s wall clock measured for a
     # 10-word Arabic sentence, whole body buffered before any bytes arrive).
     inception_tts_timeout_sec: float = 180
+    # --- TryHamsa TTS (new) — the same vendor via the LiteLLM gateway ---
+    # A THIRD engine, not a replacement for hamsa_tts_* above: that one talks
+    # to the inference pod directly and gets headerless PCM at an ASSUMED rate,
+    # this one goes through the gateway and gets a real RIFF/WAVE container
+    # whose rate ffprobe can actually measure. Same voices reach both (probed:
+    # the pod accepts Zeina and Amir too), so what the comparison measures here
+    # is the two PIPELINES, not two models — the same reasoning as the STT
+    # side's stream-vs-chunks pairing.
+    #
+    # The vendor's guide calls this model `hamsa-tts-new`. Probed 2026-09-09:
+    # that id returns 403 `team not allowed to access model` on our key, whose
+    # gateway list carries it as `hamsa-tts`. Kept as a setting precisely so
+    # flipping to `hamsa-tts-new` is an .env edit once the team is granted
+    # access, with no code change.
+    hamsa_tts_new_model: str = "hamsa-tts"
+    # A COMMA LIST, entry 0 is the default. Same shape as hamsa_tts_speaker.
+    #
+    # All 113 bundled speakers, and every one was swept against the live
+    # gateway on 2026-09-09: 113/113 returned real RIFF audio. Zeina leads
+    # because entry 0 IS the default voice, it is the voice the vendor's own
+    # examples use, and it is the one probed most here; the remaining 112 keep
+    # the vendor's alphabetical order so a name can be found in the dropdown.
+    hamsa_tts_new_voice: str = (
+        "Zeina,ASSY,AbdelQader,Ahmed,Akmal,Ali,Alia,Amanda,Amir,Amira,Amjad,Aml,Arjun,"
+        "Ayman,Barbara,Brian,Carla,Dalal,David,Dima,Edward,Eman,Eyad,Fady,Fahd,Faiza,"
+        "Fares,Fatma,Fouad,Gannat,Gassan,Ghazal,Hady,Hafsa,Hamdan,Haneen,Hasan,Hatem,"
+        "Hiba,Hind,Jaber,Jana,Jasem,John,Kamla,Khadiga,Khadija,Lana,Layan,Layla,Lyali,"
+        "Magda,Maha,Maher,Mai,Mais,Majd,Majid,Mansour,Mariam,Marwa,Marwan,Mazen,Michael,"
+        "Nabil,Nada,Nadya,Nagib,Nermin,Noah,Noor,Noura,Nouran,Obida,Ola,Othman,Raghad,"
+        "Rami,Rania,Razan,Reem,Rema,Renat,Rihanna,Robert,Roger,Ruba,Safa,Salam,Saleh,"
+        "Salem,Salim,Salma,Salwa,Saly,Samer,Sami,Samir,Sandra,Sarah,Sawsan,Sayed,Shaker,"
+        "Somaya,Souad,Suzan,Talin,Tamer,Tasneem,Wael,William,Yara,Yehya"
+    )
+    # Must comfortably exceed the longest allowed script's synthesis time.
+    # Measured 2026-09-09: 36.7s for 3144 chars (RTF ~0.22), so a full
+    # 4000-char script lands near 47s. 180s leaves real headroom without
+    # letting a hung gateway hold the request forever.
+    hamsa_tts_new_timeout_sec: float = 180
+    # NO response_format setting on purpose. Probed: the gateway IGNORES the
+    # field and returns RIFF/WAVE whatever is asked for (`mp3` came back as
+    # real WAV). A setting that cannot change the outcome is worse than none,
+    # so the runner posts "wav" and the adapter requires the body to be one.
+
     # 422 guard so a runaway script fails fast at the request, not as a
     # gateway timeout minutes later.
     tts_max_input_chars: int = 4000
@@ -751,6 +795,20 @@ class Settings(BaseSettings):
     @property
     def inception_tts_default_voice(self) -> str:
         return self.inception_tts_voice_options[0]
+
+    @property
+    def hamsa_tts_new_voice_options(self) -> list[str]:
+        """Every voice this host offers for hamsa-tts-new, in .env order.
+
+        Same degenerate-value fallback as `hamsa_tts_speaker_options`: an empty
+        list would make the dropdown unopenable and the default raise
+        IndexError at request time.
+        """
+        return _split_csv(self.hamsa_tts_new_voice) or [self.hamsa_tts_new_voice.strip()]
+
+    @property
+    def hamsa_tts_new_default_voice(self) -> str:
+        return self.hamsa_tts_new_voice_options[0]
 
     @property
     def llm_chat_url(self) -> str | None:

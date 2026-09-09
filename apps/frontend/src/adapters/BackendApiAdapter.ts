@@ -384,13 +384,21 @@ export async function sendLiveChunk(
   asrId: string,
   chunkIndex: number,
   wav: Blob,
+  signal?: AbortSignal,
 ): Promise<{ text: string; latencyMs: number; chunkIndex: number }> {
   const form = new FormData();
   form.append("sessionId", sessionId);
   form.append("asrId", asrId);
   form.append("chunkIndex", String(chunkIndex));
   form.append("file", wav, `chunk${chunkIndex}.wav`);
-  const response = await fetch(`${API_BASE_URL}/transcript/chunk`, { method: "POST", body: form });
+  // `signal` is not optional in practice: a chunk request can outlive the
+  // recording by MINUTES (moss-transcribe measured 243s for one 3s chunk), and
+  // the browser allows only ~6 connections per origin. Without cancellation
+  // those requests hold every connection and the finalize POST that Stop
+  // depends on queues behind them, so Stop appears to hang.
+  const response = await fetch(`${API_BASE_URL}/transcript/chunk`, {
+    method: "POST", body: form, signal,
+  });
   if (!response.ok) throw new Error(await errorDetail(response));
   return await response.json();
 }

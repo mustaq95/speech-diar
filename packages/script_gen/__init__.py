@@ -23,6 +23,7 @@ Two things this module refuses to do:
 """
 
 import logging
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -144,7 +145,11 @@ class GeneratedScript:
 
 
 def build_prompt(
-    minutes: float, language_mix: str, hard_cases: list[str], words_per_minute: int
+    minutes: float,
+    language_mix: str,
+    hard_cases: list[str],
+    words_per_minute: int,
+    focus: str | None = None,
 ) -> str:
     """The instruction sent to the model, assembled from the chosen options.
 
@@ -182,13 +187,21 @@ def build_prompt(
         "- Refer to colleagues only in the third person, as people whose work is "
         "being described.",
         "",
+        "THIS BRIEFING IS ABOUT: "
+        f"{focus or 'one current operational issue inside an Abu Dhabi entity'}. "
+        "Invent a fresh situation around that. Do not reuse a stock plot, and do "
+        "not turn every briefing into a proposal to create a new authority, "
+        "consolidate inspections, or close with an endorse-and-approve ask.",
+        "",
         "Draw the subject matter from what these executives actually discuss: digital "
         "transformation and service delivery, quarterly KPI and performance reviews, "
         "budget cycles and capital allocation, Emiratisation and workforce targets, "
         "AI and data platform rollouts, entity restructuring, regulatory approvals, "
         "and inter-entity coordination. Use the real institutional vocabulary of Abu "
         "Dhabi (entities, authorities, departments, programme and initiative names, "
-        "committee and board structures, government fiscal years and quarters).",
+        "committee and board structures, government fiscal years and quarters). When "
+        "a number, name, or date is useful, make it specific rather than 'recently' "
+        "or 'the department'.",
         "",
         "It should sound like one person talking naturally: continuous prose, no "
         "speaker labels, no stage directions, no headings, no bullet points.",
@@ -222,6 +235,33 @@ def _clean(content: str) -> str:
     return text
 
 
+#: One focus per generation, picked at random so two clicks do not land on the
+#: same briefing. The previous prompt listed a single ADEO agenda shape
+#: (consolidate fragmented inspections, Year 1 / Year 3, close with an
+#: endorse-and-approve ask) as if it were the domain. The model then produced
+#: that plot every time. These are situations, not a template: invent a fresh
+#: story around the one that was picked.
+TOPIC_FOCUSES: tuple[str, ...] = (
+    "a quarterly digital-service KPI review that slipped this quarter",
+    "a mid-year budget reallocation on a delayed capital project",
+    "Emiratisation progress and a hiring freeze in one entity",
+    "a cross-entity data-platform go-live that is two weeks late",
+    "a customer-satisfaction dip on a high-volume municipal service",
+    "readiness for a large public event and the traffic plan around it",
+    "a cybersecurity incident after-action and what changes next month",
+    "a smart-city pilot that under-delivered and whether to extend it",
+    "procurement of a new system and why the current vendor is being dropped",
+    "housing or permit backlog and the overtime plan to clear it",
+    "a healthcare or education wait-time target that will be missed",
+    "an energy or climate commitment and the gap to the published number",
+    "a regulatory licence renewal and the conditions attached to it",
+    "talent secondment between two entities and who pays for it",
+    "a tourism or culture programme overrunning its marketing spend",
+    "food-safety or workplace-inspection findings from last month's sweep",
+    "a board paper on entity restructuring that is still being redrafted",
+    "inter-entity coordination that broke on a shared resident-facing form",
+)
+
 #: The mix whose balance can be checked. `ar` and `en` ask for one language and
 #: get it; only an even split has a measurable target to miss.
 CHECKED_MIX = "mixed-50-50"
@@ -247,8 +287,11 @@ def generate(
     than silently expensive.
     """
     settings = settings or get_settings()
+    # Same focus on every mix retry so a lopsided split does not also change
+    # the briefing. Variety is across Generate clicks, not across attempts.
+    focus = random.choice(TOPIC_FOCUSES)
     attempts = max(1, settings.script_mix_max_attempts) if language_mix == CHECKED_MIX else 1
-    result = _generate_once(minutes, language_mix, hard_cases, settings)
+    result = _generate_once(minutes, language_mix, hard_cases, settings, focus)
     for attempt in range(2, attempts + 1):
         arabic = result.params["languageSplit"]["arabic"]
         if abs(arabic - 0.5) <= settings.script_mix_tolerance:
@@ -257,7 +300,7 @@ def generate(
             "script mix %.0f%% Arabic is outside the band; regenerating (attempt %d of %d)",
             arabic * 100, attempt, attempts,
         )
-        result = _generate_once(minutes, language_mix, hard_cases, settings)
+        result = _generate_once(minutes, language_mix, hard_cases, settings, focus)
         result.params["mixAttempts"] = attempt
     return result
 
@@ -267,6 +310,7 @@ def _generate_once(
     language_mix: str,
     hard_cases: list[str] | None,
     settings: Settings,
+    focus: str | None = None,
 ) -> GeneratedScript:
     """One generation call. Raises rather than returning a placeholder."""
     if not settings.llm_chat_url or not settings.llm_api_key or not settings.llm_model:
@@ -276,7 +320,9 @@ def _generate_once(
         )
 
     hard_cases = hard_cases or []
-    prompt = build_prompt(minutes, language_mix, hard_cases, settings.script_words_per_minute)
+    prompt = build_prompt(
+        minutes, language_mix, hard_cases, settings.script_words_per_minute, focus
+    )
 
     started = time.perf_counter()
     try:
@@ -334,6 +380,7 @@ def _generate_once(
             "minutes": minutes,
             "languageMix": language_mix,
             "hardCases": hard_cases,
+            "topicFocus": focus,
             "generatorModel": settings.llm_model,
             "targetWords": max(1, int(round(minutes * settings.script_words_per_minute))),
             # Recorded because it explains a script that came back short: the

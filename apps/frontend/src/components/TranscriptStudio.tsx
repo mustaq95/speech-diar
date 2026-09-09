@@ -56,10 +56,31 @@ interface LivePanel {
   text: string;
   latencies: number[];
   chunkCount: number;
+  /** Chunks NOT sent to this engine because it had not answered the previous
+   *  one. Counted and shown rather than hidden: an engine that cannot keep up
+   *  with the interval is a real property of that pipeline, and silently
+   *  queueing the chunk instead produces a "live" answer minutes late. */
+  skipped: number;
   error: string | null;
 }
 
-const EMPTY_PANEL: LivePanel = { text: "", latencies: [], chunkCount: 0, error: null };
+const EMPTY_PANEL: LivePanel = {
+  text: "", latencies: [], chunkCount: 0, skipped: 0, error: null,
+};
+
+/** How many chunk requests one engine may have outstanding.
+ *
+ * One. A live chunk is only a live measurement if it is answered before the
+ * next one is cut; past that the engine is not keeping up and every extra
+ * request just holds a connection.
+ *
+ * This is a real ceiling, not tidiness. The browser allows roughly SIX
+ * connections per origin, and measured per-chunk latencies against a 3s
+ * interval are moss-transcribe 243s (81x over budget), speechmatics 33s (11x)
+ * and vibevoice 3-6s (1.1-1.9x). Unbounded, those three fill every connection
+ * within about twenty seconds and everything afterwards -- other engines'
+ * chunks AND the finalize POST that Stop depends on -- queues behind them. */
+const MAX_INFLIGHT_CHUNKS_PER_ENGINE = 1;
 
 interface TranscriptStudioProps {
   /** Null until GET /config lands; the surface stays disabled until it does
@@ -225,6 +246,13 @@ export function TranscriptStudio({
   const [panels, setPanels] = useState<Record<string, LivePanel>>({});
   const [runError, setRunError] = useState<string | null>(null);
   const [finalizing, setFinalizing] = useState(false);
+  /** Aborts every in-flight chunk request for the current run. Stop fires this
+   *  BEFORE finalizing, so finalize is not queued behind requests that can take
+   *  minutes to return. */
+  const chunkAbortRef = useRef<AbortController | null>(null);
+  /** Outstanding chunk requests per engine, so a slow engine cannot accumulate
+   *  a backlog that starves every other request on the origin. */
+  const inFlightRef = useRef<Map<string, number>>(new Map());
   const [results, setResults] = useState<TranscriptRun[] | null>(null);
 
 
@@ -413,6 +441,13 @@ export function TranscriptStudio({
   const cleanupRun = useCallback(() => {
     if (tickRef.current != null) window.clearInterval(tickRef.current);
     tickRef.current = null;
+    // Cancel every outstanding chunk request. Without this they keep holding
+    // the origin's connections after the run ends -- moss-transcribe measured
+    // 243s for a single 3s chunk -- and the next request to be issued, which is
+    // the finalize POST, waits behind them.
+    chunkAbortRef.current?.abort();
+    chunkAbortRef.current = null;
+    inFlightRef.current.clear();
     for (const socket of socketsRef.current.values()) {
       if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "stop" }));
       socket.close();
@@ -546,6 +581,9 @@ export function TranscriptStudio({
       // handshakes instead of the slowest one.
       await Promise.all(opening);
 
+      // One controller per run, created before capture so the very first chunk
+      // is already cancellable.
+      chunkAbortRef.current = new AbortController();
       const recorder = await startRecording({
         sampleRate: session.sampleRate,
         chunkIntervalSec: session.chunkIntervalSec,
@@ -564,8 +602,25 @@ export function TranscriptStudio({
           if (buffered.length > 400) buffered.splice(0, buffered.length - 400);
         },
         onChunk: (wav, index) => {
+          const inFlight = inFlightRef.current;
           for (const engine of chunkEngines) {
-            void sendLiveChunk(session.sessionId, engine.asrId, index, wav)
+            const outstanding = inFlight.get(engine.asrId) ?? 0;
+            // Backpressure. The engine still owes an answer for the previous
+            // chunk, so this one is dropped rather than queued: queueing it
+            // would hold another of the origin's ~6 connections and return a
+            // "live" result long after the read finished.
+            if (outstanding >= MAX_INFLIGHT_CHUNKS_PER_ENGINE) {
+              setPanels((previous) => {
+                const panel = previous[engine.asrId] ?? EMPTY_PANEL;
+                return { ...previous, [engine.asrId]: { ...panel, skipped: panel.skipped + 1 } };
+              });
+              continue;
+            }
+            inFlight.set(engine.asrId, outstanding + 1);
+            void sendLiveChunk(
+              session.sessionId, engine.asrId, index, wav,
+              chunkAbortRef.current?.signal,
+            )
               .then((result) => {
                 setPanels((previous) => {
                   const panel = previous[engine.asrId] ?? EMPTY_PANEL;
@@ -581,10 +636,16 @@ export function TranscriptStudio({
                 });
               })
               .catch((error: Error) => {
+                // An abort is Stop doing its job, not an engine failure, and
+                // must never be painted onto the panel as one.
+                if (error.name === "AbortError") return;
                 setPanels((previous) => ({
                   ...previous,
                   [engine.asrId]: { ...(previous[engine.asrId] ?? EMPTY_PANEL), error: error.message },
                 }));
+              })
+              .finally(() => {
+                inFlight.set(engine.asrId, Math.max(0, (inFlight.get(engine.asrId) ?? 1) - 1));
               });
           }
         },
@@ -619,6 +680,11 @@ export function TranscriptStudio({
     setRecording(false);
     setFinalizing(true);
     try {
+      // Order matters. `cleanupRun` aborts the outstanding chunk requests, and
+      // it runs BEFORE finalize so finalize is issued onto a free connection
+      // rather than queued behind requests that can take minutes. Stopping the
+      // recorder first is deliberate too: it releases the microphone and cuts
+      // the tail chunk, and it never touches the network.
       const wav = await recorder.stop();
       recorderRef.current = null;
       cleanupRun();
@@ -665,7 +731,7 @@ export function TranscriptStudio({
           <h1>Transcript</h1>
           <p>
             {transcriptSubMode === "tts"
-              ? "Generate a script, synthesize it with both engines, and compare the audio they return. Every figure here is measured."
+              ? "Generate a script, synthesize it with every engine, and compare the audio they return. Every figure here is measured."
               : "Read a script aloud; each engine is scored on its own native transport."}
           </p>
         </div>
@@ -933,6 +999,10 @@ export function TranscriptStudio({
                 text: stored.text ?? "",
                 latencies: [],
                 chunkCount: stored.chunkCount ?? 0,
+                // A stored row records what the engine ANSWERED, not what the
+                // browser declined to send it; that count only exists for the
+                // run happening now.
+                skipped: 0,
                 error: stored.error ?? null,
               }
             : live;
@@ -966,6 +1036,18 @@ export function TranscriptStudio({
                     {avg != null && <> lag {fmtMs(avg)}</>}
                     {" "}
                     {panel.text.split(/\s+/).filter(Boolean).length} words
+                    {/* Chunks this engine was never sent, because it had not
+                        answered the previous one. Shown, not hidden: it is the
+                        difference between "transcribed badly" and "could not
+                        keep up with the interval", and only this number tells
+                        them apart. */}
+                    {panel.skipped > 0 && (
+                      <span className="engine-skipped" title={
+                        `${panel.skipped} chunk(s) not sent: this engine had not answered the previous one`
+                      }>
+                        {panel.skipped} skipped
+                      </span>
+                    )}
                   </span>
                   {/* Only for an engine that offers a real choice, and only while
                       a new run can still be configured. Locked during capture:
