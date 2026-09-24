@@ -590,12 +590,16 @@ class Settings(BaseSettings):
     # is the two PIPELINES, not two models — the same reasoning as the STT
     # side's stream-vs-chunks pairing.
     #
-    # The vendor's guide calls this model `hamsa-tts-new`. Probed 2026-09-09:
-    # that id returns 403 `team not allowed to access model` on our key, whose
-    # gateway list carries it as `hamsa-tts`. Kept as a setting precisely so
-    # flipping to `hamsa-tts-new` is an .env edit once the team is granted
-    # access, with no code change.
-    hamsa_tts_new_model: str = "hamsa-tts"
+    # `hamsa-tts-new`, and reaching it is a matter of WHICH KEY is in .env,
+    # not of the model id. Probed 2026-09-09: the key this repo shipped with
+    # answered 403 `team not allowed to access model` for it and listed 10
+    # models; the key now in .env lists 14, including this one, and is a
+    # strict superset (it loses no model the old one had, and inception-stt /
+    # inception-tts behave identically on both). `hamsa-tts` is the older
+    # deployment and is still reachable, but the cloned customer voices exist
+    # ONLY on this one -- so a 403 or a wave of voice 500s here means the
+    # credential regressed, not that the model moved.
+    hamsa_tts_new_model: str = "hamsa-tts-new"
     # A COMMA LIST, entry 0 is the default. Same shape as hamsa_tts_speaker.
     #
     # All 113 bundled speakers, and every one was swept against the live
@@ -614,6 +618,36 @@ class Settings(BaseSettings):
         "Salem,Salim,Salma,Salwa,Saly,Samer,Sami,Samir,Sandra,Sarah,Sawsan,Sayed,Shaker,"
         "Somaya,Souad,Suzan,Talin,Tamer,Tasneem,Wael,William,Yara,Yehya"
     )
+    # The vendor's CLONED customer voices, a SEPARATE comma list from the
+    # built-ins above and deliberately not merged into it. Three reasons:
+    # the UI badges exactly this set as NEW (one list, so the badge can never
+    # name a voice the dropdown does not offer), these are the only voices
+    # that can vanish without warning, and turning them off is then one .env
+    # line rather than an edit inside a 113-name string.
+    #
+    # PROBED 2026-09-09: all 12 return real WAV, and so do all 113 built-ins
+    # -- 125/125 swept green in 31s against `hamsa-tts-new`. They live ONLY on
+    # that model: on `hamsa-tts` every clone answers 500 while built-ins on the
+    # same call return audio, and the direct pod drops the stream for them.
+    # So a clone failing is a signal about the MODEL or the KEY, never about
+    # the name: casing and separator variants (`adeo_Mariam`, `ADEO_mariam`,
+    # `adeo-mariam`) all 500 even on the right model, and bare `mariam`
+    # resolves to the built-in of that name instead.
+    #
+    # They can still disappear: the vendor's guide says clone reference audio
+    # lives in the pod's EPHEMERAL /tmp, so a pod restart de-registers them and
+    # the clone flow must be re-run. `test_live_tts.py` sweeps them, and is the
+    # only thing that reports it.
+    #
+    # Kept `adeo_`-prefixed, never bare: several clones collide by name with a
+    # built-in (`Mariam`, `Reem`, `Leo`, `Emma`, `Lily`, `Claire`, `Henry`,
+    # `Mia`), and two identically-labelled entries in one dropdown would make
+    # the operator's pick, the stored clip's key and the scorecard's voice
+    # column ambiguous.
+    hamsa_tts_new_cloned_voice: str = (
+        "adeo_mariam,adeo_omar,adeo_karim,adeo_lara,adeo_reem,adeo_faisal,"
+        "adeo_leo,adeo_emma,adeo_lily,adeo_claire,adeo_henry,adeo_mia"
+    )
     # Must comfortably exceed the longest allowed script's synthesis time.
     # Measured 2026-09-09: 36.7s for 3144 chars (RTF ~0.22), so a full
     # 4000-char script lands near 47s. 180s leaves real headroom without
@@ -627,6 +661,43 @@ class Settings(BaseSettings):
     # 422 guard so a runaway script fails fast at the request, not as a
     # gateway timeout minutes later.
     tts_max_input_chars: int = 4000
+
+    # --- Voice cloning (the same TryHamsa pod hamsa-tts synthesizes through) ---
+    # Not a fourth TTS engine: cloning REGISTERS a speaker name that the
+    # existing hamsa-tts engine can then use, so there is nothing here to add
+    # to TTS_ENGINES. Two full URLs rather than a base plus paths, matching how
+    # every other per-model ADEO endpoint is configured (adeo_qwen3_asr_url and
+    # friends): deriving them by stripping "/tts/stream" off hamsa_tts_api_url
+    # would silently build a wrong URL the day that path changes.
+    #
+    # Probed 2026-09-09 against the live pod's own /openapi.json. The vendor's
+    # written guide names these `/v1/voice-clone` and `/v1/voices`; the pod
+    # actually serves `/tts/voice_clone` and `/tts/load_voice_cloning`, and the
+    # guide's `/v1/speech` is this deployment's `/tts/stream`. The spec won.
+    hamsa_voice_clone_url: str | None = None
+    hamsa_load_voice_url: str | None = None
+    # Extraction runs a model over the whole reference clip, so it is slower
+    # than synthesis and gets its own budget rather than borrowing
+    # hamsa_tts_timeout_sec.
+    hamsa_voice_clone_timeout_sec: float = 300
+    # A COMMA LIST, entry 0 is the default -- the same shape (and the same
+    # reasoning) as hamsa_tts_speaker. The pod's own schema defaults `dialect`
+    # to "msa", so that stays entry 0 unless a host overrides it. Nothing
+    # discovers these: the pod has no list-dialects route any more than it has
+    # a list-voices one, so this is exactly what .env holds.
+    voice_clone_dialects: str = "msa,uae,egy,ksa,jor"
+    # Guard on the prompt text, which must be the verbatim transcript of the
+    # reference clip. Separate from tts_max_input_chars: that one bounds what
+    # gets SYNTHESIZED, this one bounds what gets ALIGNED against audio.
+    voice_clone_max_prompt_chars: int = 4000
+    # The pod downloads `audio_url` ITSELF, from wherever it runs -- which is
+    # not this host. An uploaded reference clip is therefore only usable if
+    # this API is reachable from the pod under some absolute base URL; set that
+    # here and uploads are offered, leave it unset and the UI says plainly that
+    # only an already-public URL can be cloned from. Deliberately not defaulted
+    # to anything: guessing a hostname here produces a URL that resolves
+    # nowhere and an opaque upstream 500.
+    voice_clone_public_base_url: str | None = None
 
     # --- Script generation (read-aloud reference text) ---
     # An OpenAI-compatible chat-completions gateway, separate from the STT one
@@ -797,8 +868,8 @@ class Settings(BaseSettings):
         return self.inception_tts_voice_options[0]
 
     @property
-    def hamsa_tts_new_voice_options(self) -> list[str]:
-        """Every voice this host offers for hamsa-tts-new, in .env order.
+    def hamsa_tts_new_builtin_voice_options(self) -> list[str]:
+        """The vendor's bundled speakers only, in .env order.
 
         Same degenerate-value fallback as `hamsa_tts_speaker_options`: an empty
         list would make the dropdown unopenable and the default raise
@@ -807,8 +878,74 @@ class Settings(BaseSettings):
         return _split_csv(self.hamsa_tts_new_voice) or [self.hamsa_tts_new_voice.strip()]
 
     @property
+    def hamsa_tts_new_cloned_voice_options(self) -> list[str]:
+        """The cloned customer voices only — the set the UI badges as NEW.
+
+        No degenerate fallback here, unlike the built-in list: empty is a
+        legitimate, expected state (a host that does not want the clones, or
+        one where they have not been re-registered), and inventing a blank
+        entry would put an unusable row in the dropdown.
+        """
+        return _split_csv(self.hamsa_tts_new_cloned_voice)
+
+    @property
+    def hamsa_tts_new_voice_options(self) -> list[str]:
+        """Every voice the dropdown offers: the default, then the cloned
+        voices, then the rest of the bundled ones.
+
+        The clones sit near the TOP because they are the newly added set and
+        an operator should not scroll 113 names to find them — but never at
+        position 0, because that position IS the default voice
+        (`hamsa_tts_new_default_voice`) and the default must be a bundled
+        speaker that actually resolves. Clones can be de-registered by a pod
+        restart, so defaulting to one would make every no-voice-specified
+        request fail.
+
+        De-duplicated while preserving order, so a name listed in both .env
+        lists yields one dropdown row rather than two that look identical.
+        """
+        builtins = self.hamsa_tts_new_builtin_voice_options
+        ordered = [builtins[0], *self.hamsa_tts_new_cloned_voice_options, *builtins[1:]]
+        seen: set[str] = set()
+        return [v for v in ordered if not (v in seen or seen.add(v))]
+
+    @property
     def hamsa_tts_new_default_voice(self) -> str:
-        return self.hamsa_tts_new_voice_options[0]
+        """Position 0 of the BUILT-IN list, not of the combined one.
+
+        Read off the built-ins directly so it stays a bundled speaker even if
+        the ordering above ever changes.
+        """
+        return self.hamsa_tts_new_builtin_voice_options[0]
+
+    @property
+    def voice_clone_dialect_options(self) -> list[str]:
+        """Every dialect this host offers a cloned voice, in .env order.
+
+        Same degenerate-value fallback as `hamsa_tts_speaker_options`: an empty
+        or comma-only value must still yield one entry, or
+        `voice_clone_default_dialect` raises IndexError at request time.
+        """
+        return _split_csv(self.voice_clone_dialects) or ["msa"]
+
+    @property
+    def voice_clone_default_dialect(self) -> str:
+        return self.voice_clone_dialect_options[0]
+
+    @property
+    def voice_clone_configured(self) -> bool:
+        """Cloning needs BOTH calls plus the pod credentials hamsa-tts uses.
+
+        Extraction alone is useless -- the tokens it returns can only be turned
+        into a usable voice by the registration call -- so a host with one URL
+        set is reported as not configured rather than half-offered.
+        """
+        return bool(
+            self.hamsa_voice_clone_url
+            and self.hamsa_load_voice_url
+            and self.hamsa_tts_key
+            and self.hamsa_tts_bearer_token
+        )
 
     @property
     def llm_chat_url(self) -> str | None:

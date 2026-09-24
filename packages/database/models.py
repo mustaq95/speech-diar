@@ -356,6 +356,98 @@ class TtsResult(Base):
     audio_file: Mapped[AudioFile] = relationship()
 
 
+
+class ClonedVoice(Base):
+    """One voice registered on the TryHamsa TTS pod from a reference clip.
+
+    Not tied to an `AudioFile` and not on either surface. A cloned voice is not
+    a recording or an evaluation of one: it is a speaker name that the
+    `hamsa-tts` engine can subsequently synthesize with, so scoping it to a
+    recording would make the same voice un-reusable across the projects that
+    are the actual point of cloning it.
+
+    **The token arrays are stored because the pod forgets them.** Registration
+    lives in the pod's memory: the vendor's own guide says re-registering a
+    `speaker_id` overwrites it in memory, and the pod exposes no route that
+    lists what it currently holds. A restart therefore silently drops every
+    cloned voice, and synthesis starts failing with no local signal. Keeping
+    `global_token_ids`/`semantic_token_ids` here means re-registering is a
+    re-POST of bytes we already have rather than a re-extraction of a
+    reference clip that may no longer be reachable. They are `deferred=True`
+    for the same reason `EvaluationResult.raw_output` is: a few thousand
+    integers per row that the list route must never drag into memory.
+
+    `status` distinguishes the two calls, which genuinely can fail
+    independently: "extracted" means the tokens exist but no speaker name holds
+    them yet (the pod does not know about this voice), "registered" means the
+    pod accepted them, "failed" means the pod rejected the extraction and
+    `error` says what it returned. Without the middle state a slow or failed
+    registration would be indistinguishable from never having extracted.
+
+    A brand new table, so `create_all` builds its current shape and no
+    `_ADDED_COLUMNS` entry (session.py) is needed -- true only at creation, the
+    same caveat `TtsResult` carries.
+    """
+
+    __tablename__ = "cloned_voices"
+    # The speaker name is the identity. Unique per owner rather than globally:
+    # the pod's namespace is shared by everyone pointed at it, but this table
+    # records what THIS deployment registered, and a per-user unique keeps one
+    # operator's catalogue from colliding with another's. The pod itself has no
+    # such protection -- it overwrites in memory, which is exactly the surprise
+    # `EXISTS - WILL OVERWRITE` warns about in the UI.
+    __table_args__ = (
+        UniqueConstraint("user_id", "speaker_id", name="uq_cloned_voices_user_speaker"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    # Case-sensitive at registration but looked up case-insensitively by the
+    # synthesis route, per the vendor guide. Stored with the case that was
+    # actually sent, so what is displayed is what the pod was told.
+    speaker_id: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(16))  # extracted|registered|failed
+    error: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    registered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # --- the reference clip this voice came from ---
+    # The URL AS SENT to the pod. Kept even after the clip is mirrored to
+    # object storage, because it is what the pod was actually asked to fetch
+    # and is the only way to explain a download failure after the fact.
+    audio_url: Mapped[str] = mapped_column(Text)
+    # Set only when the operator uploaded a clip and this API stored it. Null
+    # for a clip cloned straight from someone else's URL -- we did not keep a
+    # copy and must not imply we did.
+    s3_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    audio_format: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    audio_sec: Mapped[float | None] = mapped_column(Float, nullable=True)
+    size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    native_sample_rate: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    channels: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The verbatim transcript of the clip, which is a REQUIRED input to
+    # extraction rather than a note: the pod uses it to separate voice identity
+    # from spoken content.
+    prompt_text: Mapped[str] = mapped_column(Text)
+    dialect: Mapped[str] = mapped_column(String(16))
+
+    # --- what the pod returned ---
+    global_token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    semantic_token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Deferred: see the class docstring. Re-posted verbatim, never parsed.
+    global_token_ids: Mapped[dict | None] = mapped_column(JSON, nullable=True, deferred=True)
+    semantic_token_ids: Mapped[dict | None] = mapped_column(JSON, nullable=True, deferred=True)
+    extract_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    register_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Status code and headers from both calls -- metadata only, the same rule
+    # TtsResult.raw_output follows, and small enough to leave un-deferred.
+    raw_output: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    owner: Mapped[User] = relationship()
+
+
 class ModelContainerState(Base):
     """One row per GPU container-managed local model (see
     apps/background_worker/supervisor/registry.py MANAGED_CONTAINERS).

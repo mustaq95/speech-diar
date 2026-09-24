@@ -8,6 +8,7 @@ import type {
   TranscriptTransport,
 } from "../types/diarization";
 import type { RuntimeConfig, TranscriptEngineInfo } from "../adapters";
+import type { TranscriptSubMode } from "../types";
 import {
   audioStreamUrl,
   fetchReference,
@@ -23,6 +24,7 @@ import { startRecording, type Recorder } from "../recording";
 import { StoredRecordingScorer } from "./StoredRecordingScorer";
 import { TranscriptScorecard } from "./TranscriptScorecard";
 import { TtsStudio } from "./TtsStudio";
+import { CloneStudio } from "./CloneStudio";
 
 /** A transcript row's identity: the engine AND the feed mode it ran in.
  *
@@ -97,8 +99,8 @@ interface TranscriptStudioProps {
   /** Which sub-activity this page is doing: scoring STT engines live, or
    * comparing TTS engines' synthesis of the same reference. Explicit state owned
    * by App.tsx, never inferred from what happens to be open. */
-  transcriptSubMode: "stt" | "tts";
-  onTranscriptSubMode: (next: "stt" | "tts") => void;
+  transcriptSubMode: TranscriptSubMode;
+  onTranscriptSubMode: (next: TranscriptSubMode) => void;
   /** Called once a capture is finalized and its backend row exists, so the
    * recordings list can pick it up. Without this the recording was stored but
    * never appeared anywhere in the UI. */
@@ -711,7 +713,7 @@ export function TranscriptStudio({
   // Switching sub-mode while a live capture is running must tear it down the
   // same way unmounting does — the microphone and sockets are real resources
   // and a switch is not a reason to leave them running unseen.
-  const handleSubModeChange = (next: "stt" | "tts") => {
+  const handleSubModeChange = (next: TranscriptSubMode) => {
     if (next === transcriptSubMode) return;
     if (recording) {
       cleanupRun();
@@ -730,9 +732,11 @@ export function TranscriptStudio({
           <span className="eyebrow">Evaluation</span>
           <h1>Transcript</h1>
           <p>
-            {transcriptSubMode === "tts"
-              ? "Generate a script, synthesize it with every engine, and compare the audio they return. Every figure here is measured."
-              : "Read a script aloud; each engine is scored on its own native transport."}
+            {transcriptSubMode === "clone"
+              ? "Register a voice from one reference clip, then use it in TTS like any built-in voice. Neither cloning call is billed, but each holds a concurrency slot while it runs."
+              : transcriptSubMode === "tts"
+                ? "Generate a script, synthesize it with every engine, and compare the audio they return. Every figure here is measured."
+                : "Read a script aloud; each engine is scored on its own native transport."}
           </p>
         </div>
         <div className="transcript-mode-toggle">
@@ -741,6 +745,7 @@ export function TranscriptStudio({
             options={[
               { value: "stt", label: "STT" },
               { value: "tts", label: "TTS" },
+              { value: "clone", label: "Clone" },
             ]}
             onChange={handleSubModeChange}
             label="Transcript sub-mode"
@@ -748,14 +753,21 @@ export function TranscriptStudio({
           {/* Counted from what /config actually returned, so an unconfigured host
               says "1 engine" rather than claiming a comparison it cannot run. */}
           <small className="mono muted transcript-mode-caption">
-            {transcriptSubMode === "tts"
-              ? `speech synthesis · ${ttsEngineCount} ${ttsEngineCount === 1 ? "engine" : "engines"}`
-              : `speech recognition · ${engines.length} of ${allEngines.length} ready`}
+            {transcriptSubMode === "clone"
+              ? // Not a count of engines: cloning has none. What it says is
+                // whether this host can do it at all, from the same /config the
+                // other two captions read.
+                `voice registry · ${runtimeConfig?.voiceClone?.configured ? "ready" : "not configured"}`
+              : transcriptSubMode === "tts"
+                ? `speech synthesis · ${ttsEngineCount} ${ttsEngineCount === 1 ? "engine" : "engines"}`
+                : `speech recognition · ${engines.length} of ${allEngines.length} ready`}
           </small>
         </div>
       </div>
 
-      {transcriptSubMode === "tts" ? (
+      {transcriptSubMode === "clone" ? (
+        <CloneStudio runtimeConfig={runtimeConfig} onScriptSaved={onScriptSaved} />
+      ) : transcriptSubMode === "tts" ? (
         <TtsStudio
           runtimeConfig={runtimeConfig}
           audioFileId={pendingAudioFileId ?? audioFileId ?? null}

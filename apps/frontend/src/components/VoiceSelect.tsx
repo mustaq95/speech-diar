@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 /**
  * The voice picker for one TTS engine.
@@ -13,6 +13,11 @@ import { useEffect, useRef, useState } from "react";
  *
  * Rendered even when an engine has a single voice. A control that disappears
  * at N=1 made the two engine cards look like different features.
+ *
+ * `newVoices` is the one exception to the no-per-voice-metadata rule above, and
+ * it is not metadata about a voice: it is which voices arrived in the latest
+ * vendor drop, which the host reports from the same setting the dropdown is
+ * built from. It carries no claim about how a voice SOUNDS.
  */
 interface VoiceSelectProps {
   voices: string[];
@@ -23,12 +28,14 @@ interface VoiceSelectProps {
   /** Voices that already have a stored clip. Read off the stored rows, so the
    * marker cannot drift from what actually exists. */
   synthesized?: string[];
+  /** Voices added in the latest vendor drop, badged NEW. A subset of `voices`. */
+  newVoices?: string[];
   disabled?: boolean;
   /** Labels the listbox for screen readers, e.g. "TryHamsa TTS voice". */
   label: string;
 }
 
-export function VoiceSelect({ voices, value, onChange, params, synthesized, disabled, label }: VoiceSelectProps) {
+export function VoiceSelect({ voices, value, onChange, params, synthesized, newVoices, disabled, label }: VoiceSelectProps) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
 
@@ -51,6 +58,11 @@ export function VoiceSelect({ voices, value, onChange, params, synthesized, disa
   }, [open]);
 
   const subtitle = Object.values(params).filter(Boolean).join(" · ");
+
+  // A Set, not .includes: this runs once per rendered option and the list runs
+  // to 125 entries.
+  const newSet = useMemo(() => new Set(newVoices ?? []), [newVoices]);
+  const isNew = (voice: string) => newSet.has(voice);
 
   const step = (delta: number) => {
     const index = voices.indexOf(value);
@@ -79,7 +91,10 @@ export function VoiceSelect({ voices, value, onChange, params, synthesized, disa
       >
         <span className="voice-avatar" aria-hidden="true">{value.slice(0, 1).toUpperCase()}</span>
         <span className="voice-lines">
-          <b>{value}</b>
+          <b>
+            {value}
+            {isNew(value) && <span className="voice-new">NEW</span>}
+          </b>
           {subtitle && <small className="mono">{subtitle}</small>}
         </span>
         <span className="voice-caret" aria-hidden="true">▾</span>
@@ -97,7 +112,12 @@ export function VoiceSelect({ voices, value, onChange, params, synthesized, disa
                 onClick={() => { onChange(voice); setOpen(false); }}
               >
                 <span className="voice-avatar" aria-hidden="true">{voice.slice(0, 1).toUpperCase()}</span>
-                <span className="voice-lines"><b>{voice}</b></span>
+                <span className="voice-lines">
+                  <b>
+                    {voice}
+                    {isNew(voice) && <span className="voice-new">NEW</span>}
+                  </b>
+                </span>
                 {synthesized?.includes(voice) && (
                   <span className="voice-has-clip" title="Already synthesized" aria-label="already synthesized" />
                 )}

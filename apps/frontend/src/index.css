@@ -193,6 +193,16 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .voice-option { width: 100%; display: flex; align-items: center; gap: 10px; text-align: left;
   background: transparent; border: 0; border-radius: 7px; padding: 7px 8px; cursor: pointer; }
 .voice-option:hover { background: var(--panel-2); }
+/* "NEW" beside a voice added in the latest vendor drop. Reads as a tag, not as
+   a second name: uppercase, small, and it sits inline after the name so the
+   name itself stays the thing being scanned. Colour comes from --engine, the
+   same variable the card's dot, play button and waveform read, so the badge
+   belongs to its panel instead of introducing another accent. */
+.voice-new { margin-left: 7px; padding: 1px 5px; border-radius: 4px; font-size: 9px;
+  font-weight: 700; letter-spacing: .06em; vertical-align: 1px;
+  color: var(--engine, var(--accent));
+  background: color-mix(in srgb, var(--engine, var(--accent)) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--engine, var(--accent)) 40%, transparent); }
 .voice-option.is-active { background: color-mix(in srgb, var(--engine) 12%, transparent); }
 .voice-check { flex: 0 0 auto; color: var(--engine); font-size: 12px; }
 /* Marks a voice that already has a stored clip, so you can see what exists
@@ -643,4 +653,82 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   margin-left: 6px; font-size: 10.5px; padding: 1px 6px; border-radius: 999px;
   color: var(--warn); border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
   white-space: nowrap;
+}
+
+/* --- Clone sub-mode -------------------------------------------------------
+   Four numbered steps, each carrying the pod call it makes. Colour is keyed on
+   the step's own --engine variable (set per panel in CloneStudio) exactly the
+   way .engine-panel.is-tts keys on delivery, so dot, badge, bars and player all
+   read one assignment. */
+.clone-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 380px); gap: 14px; margin-bottom: 14px; align-items: start; }
+.clone-step { display: flex; flex-direction: column; gap: 10px; }
+.clone-step-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.clone-step-head h2 { margin: 0; font-size: 16px; }
+.clone-step-n { width: 20px; height: 20px; border-radius: 50%; flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--engine, var(--accent)); color: var(--bg); font-size: 12px; font-weight: 800; }
+/* Pushed right so the endpoint a step calls always sits at the same edge,
+   which is what makes the four steps scannable as a sequence of calls. */
+.clone-endpoint { margin-left: auto; font-size: 11px; }
+
+.clone-input { width: 100%; background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--line-2); border-radius: 8px; padding: 9px 12px; font-size: 13px; }
+.clone-input:disabled { opacity: .55; }
+.clone-upload-link { color: var(--accent); cursor: pointer; text-decoration: underline; }
+.clone-prompt-label { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; margin-top: 6px; }
+.clone-prompt-label .mono { font-size: 10.5px; }
+/* Same 15px/1.8 type as .script-text and .script-paste, for the reason
+   CLAUDE.md gives about the STT/TTS toggle: a size change across sub-modes
+   reads as a different document. */
+.clone-prompt { min-height: 92px; }
+.clone-note { margin: 0; padding: 9px 12px; border-radius: 8px; font-size: 11.5px; line-height: 1.5;
+  color: var(--muted); background: rgba(245,166,35,.06); border: 1px solid rgba(245,166,35,.22); }
+/* The pod's own error text, kept verbatim and monospaced so an opaque upstream
+   body is readable as the raw thing it is rather than dressed as prose. */
+.clone-upstream { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-word; }
+
+.clone-badge { font-size: 10px; letter-spacing: .04em; padding: 3px 7px; border-radius: 5px; border: 1px solid; white-space: nowrap; }
+.clone-badge.is-good { color: var(--good); border-color: rgba(52,211,153,.35); background: rgba(52,211,153,.1); }
+.clone-badge.is-warn { color: var(--warn); border-color: rgba(245,166,35,.35); background: rgba(245,166,35,.1); }
+.clone-badge.is-bad  { color: var(--bad);  border-color: rgba(240,90,90,.35);  background: rgba(240,90,90,.1); }
+
+.clone-extracted { min-width: 0; }
+.clone-token-block { background: var(--panel-2); border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+.clone-token-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+.clone-token-head .mono { font-size: 11.5px; color: var(--muted); }
+.clone-token-head b { font-size: 15px; }
+/* A fixed decorative row scaled to the token COUNT, never a plot of the token
+   values: the pod's tokens are opaque and this repo does not interpret them.
+   The count is printed beside it and the UI says so out loud. */
+.token-bars { display: flex; align-items: flex-end; gap: 2px; height: 34px; }
+.token-bars i { flex: 1 1 0; background: var(--engine, var(--accent)); opacity: .55; border-radius: 1px; min-width: 2px; }
+.clone-echo { background: var(--panel-2); border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; }
+.clone-echo p { margin: 6px 0; font-size: 13px; line-height: 1.6; }
+.clone-match { color: var(--good); font-size: 11px; }
+
+.clone-register-row { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1.2fr) minmax(0, 1fr) auto; gap: 16px; align-items: end; }
+.clone-field { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+.clone-field small { font-size: 10.5px; line-height: 1.4; }
+.clone-token-summary { font-size: 12.5px; }
+.clone-register-btn { align-self: end; white-space: nowrap; }
+
+.clone-registry { display: flex; flex-direction: column; gap: 10px; }
+.clone-registry > small { font-size: 10.5px; line-height: 1.45; margin-top: -4px; }
+.clone-voice-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.clone-voice-list li { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 9px;
+  background: var(--panel-2); border: 1px solid var(--line); }
+.clone-voice-list li.is-active { border-color: color-mix(in srgb, var(--good) 45%, transparent); }
+.clone-voice-list li.muted { justify-content: center; background: none; border-style: dashed; font-size: 12px; padding: 14px 10px; }
+.clone-avatar { width: 26px; height: 26px; flex: none; border-radius: 50%; display: inline-flex;
+  align-items: center; justify-content: center; font-size: 11px; font-weight: 700;
+  background: rgba(76,154,255,.16); color: var(--accent); }
+.clone-voice-main { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }
+.clone-voice-main b { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.clone-voice-main small { font-size: 10.5px; }
+.clone-forget { background: none; border: 0; color: var(--dim); cursor: pointer; font-size: 16px; line-height: 1; padding: 2px 4px; }
+.clone-forget:hover { color: var(--bad); }
+
+@media (max-width: 1180px) {
+  .clone-grid { grid-template-columns: minmax(0, 1fr); }
+  .clone-register-row { grid-template-columns: minmax(0, 1fr); }
 }

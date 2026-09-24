@@ -59,6 +59,11 @@ class TtsEngine:
     adapt: Callable[[Any], TtsRender]
     #: The voice dropdown's options for this engine.
     voices: Callable[[Settings], list[str]]
+    #: The subset of `voices` added in the latest vendor drop, which the UI
+    #: badges as NEW. Always a subset — a name here that is not in `voices`
+    #: would badge a row the dropdown does not have. Empty for an engine whose
+    #: voice list has not changed, which is the normal case.
+    new_voices: Callable[[Settings], list[str]]
     #: The voice used when the caller does not choose one.
     default_voice: Callable[[Settings], str]
     #: Is this engine actually configured on this host? Used to decide
@@ -94,6 +99,7 @@ TTS_ENGINES: dict[str, TtsEngine] = {
             run=hamsa_runner.run,
             adapt=hamsa_adapter.adapt,
             voices=lambda s: s.hamsa_tts_speaker_options,
+            new_voices=lambda s: [],
             default_voice=lambda s: s.hamsa_tts_default_speaker,
             # The bearer is NOT optional: measured, omitting it returns
             # 401 {"detail":"Authorization header is missing"} even with a
@@ -119,6 +125,10 @@ TTS_ENGINES: dict[str, TtsEngine] = {
             run=hamsa_new_runner.run,
             adapt=hamsa_new_adapter.adapt,
             voices=lambda s: s.hamsa_tts_new_voice_options,
+            # The vendor's cloned customer voices. Sourced from the SAME
+            # setting the dropdown builds from, so the badge cannot name a
+            # voice that is not offered.
+            new_voices=lambda s: s.hamsa_tts_new_cloned_voice_options,
             default_voice=lambda s: s.hamsa_tts_new_default_voice,
             # The gateway credential, NOT the pod's X-API-Key/bearer pair that
             # `hamsa-tts` needs: same vendor, different door. Sharing the
@@ -137,6 +147,7 @@ TTS_ENGINES: dict[str, TtsEngine] = {
             run=inception_runner.run,
             adapt=inception_adapter.adapt,
             voices=lambda s: s.inception_tts_voice_options,
+            new_voices=lambda s: [],
             default_voice=lambda s: s.inception_tts_default_voice,
             configured=lambda s: bool(s.litellm_base_url and s.litellm_api_key),
             synthesis_params=lambda s: {

@@ -12,6 +12,7 @@ export type {
   TranscriptEngineInfo,
   TtsConfig,
   TtsEngineInfo,
+  VoiceCloneConfig,
 } from "./BackendApiAdapter";
 export { DEMO_AUDIO_FILE_ID, normalizeModelRun } from "./DiarizationAdapter";
 export {
@@ -43,6 +44,13 @@ export {
   synthesizeTts,
   ttsAudioUrl,
   uploadAudio,
+  clonePreviewAudioUrl,
+  deleteClonedVoice,
+  extractVoiceTokens,
+  fetchClonedVoices,
+  previewClonedVoice,
+  registerClonedVoice,
+  uploadCloneReference,
 } from "./BackendApiAdapter";
 
 // Defaults are derived from whatever models the backend returned, so a new

@@ -1,5 +1,7 @@
 /// <reference types="vite/client" />
 import type {
+  ClonePreview,
+  ClonedVoice,
   DiarizationEvaluation,
   GeneratedScript,
   ModelContainerStatus,
@@ -136,6 +138,10 @@ export interface TtsEngineInfo {
   configured: boolean;
   voices: string[];
   defaultVoice: string;
+  /** The subset of `voices` added in the latest vendor drop, badged NEW in the
+   * picker. Always a subset of `voices`, and sourced from the same setting, so
+   * the badge can never name a voice the dropdown does not offer. */
+  newVoices?: string[];
   /** Engine-level synthesis settings, true of EVERY voice this engine offers.
    * Neither gateway has a list-voices endpoint, so there is no per-voice
    * metadata anywhere; this must never be rendered as a property of one voice. */
@@ -149,12 +155,31 @@ export interface TtsConfig {
   maxInputChars: number;
 }
 
+/** The Clone sub-mode's settings, from .env via GET /config.
+ *
+ * `uploadsReachable` is the one that changes what the UI offers: the pod
+ * downloads the reference clip itself and cannot reach this API unless a host
+ * declares a base URL it can resolve. False means only an already-public clip
+ * URL can be cloned from, and the UI says so rather than showing a file picker
+ * whose every use would fail. */
+export interface VoiceCloneConfig {
+  configured: boolean;
+  /** Exactly what .env holds — the pod has no list-dialects route. */
+  dialects: string[];
+  defaultDialect: string;
+  maxPromptChars: number;
+  uploadsReachable: boolean;
+  /** The engine a cloned voice becomes usable through. */
+  previewTtsId: string;
+}
+
 export interface RuntimeConfig {
   pollIntervalMs: number;
   defaultTranscriptionMode: TranscriptionMode;
   transcriptionModes: Record<TranscriptionMode, ModeAvailability>;
   transcript: TranscriptConfig;
   tts?: TtsConfig;
+  voiceClone?: VoiceCloneConfig;
 }
 
 export async function fetchRuntimeConfig(): Promise<RuntimeConfig> {
@@ -544,4 +569,97 @@ export function ttsAudioUrl(
   if (voice) params.set("voice", voice);
   const suffix = params.toString() ? `?${params}` : "";
   return `${API_BASE_URL}/evaluations/${audioFileId}/tts/${encodeURIComponent(ttsId)}/audio${suffix}`;
+}
+
+
+// --- Voice cloning ---------------------------------------------------------
+// Three calls, one per thing the pod actually does, rather than one "clone
+// this" round trip: extraction is the expensive half and the operator picks a
+// name and dialect once they know it succeeded.
+
+/** Every voice this deployment has cloned, newest first.
+ *
+ * OUR record, not the pod's. The pod holds registrations in memory and exposes
+ * no route that lists them, so a voice listed "registered" here may have been
+ * dropped by a pod restart — the UI states that rather than implying live
+ * state. */
+export async function fetchClonedVoices(): Promise<ClonedVoice[]> {
+  const response = await fetch(`${API_BASE_URL}/voice-clone`);
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return (await response.json()) as ClonedVoice[];
+}
+
+/** Step 1: hand the pod a reference clip URL and its verbatim transcript.
+ *
+ * A rejected clip comes back as a normal ClonedVoice with status "failed" and
+ * the pod's own message in `error`, not as a thrown error — the row is the
+ * record of the attempt. */
+export async function extractVoiceTokens(
+  audioUrl: string,
+  promptText: string,
+  dialect?: string,
+): Promise<ClonedVoice> {
+  const response = await fetch(`${API_BASE_URL}/voice-clone/extract`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ audioUrl, promptText, dialect: dialect ?? null }),
+  });
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return (await response.json()) as ClonedVoice;
+}
+
+/** Step 2: file the extracted tokens under a speaker name. */
+export async function registerClonedVoice(
+  voiceId: number,
+  speakerId: string,
+  dialect?: string,
+): Promise<ClonedVoice> {
+  const response = await fetch(`${API_BASE_URL}/voice-clone/${voiceId}/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ speakerId, dialect: dialect ?? null }),
+  });
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return (await response.json()) as ClonedVoice;
+}
+
+/** Step 3: synthesize with the cloned voice, through the ordinary TTS engine.
+ * Nothing scores the result against the reference — no such measurement exists
+ * here, so the artifact is A/B playback. */
+export async function previewClonedVoice(voiceId: number, text: string): Promise<ClonePreview> {
+  const response = await fetch(`${API_BASE_URL}/voice-clone/${voiceId}/preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return (await response.json()) as ClonePreview;
+}
+
+/** Forget a voice locally. The pod has no delete route, so a registered
+ * speaker stays resident there until it restarts. */
+export async function deleteClonedVoice(voiceId: number): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/voice-clone/${voiceId}`, { method: "DELETE" });
+  if (!response.ok) throw new Error(await errorDetail(response));
+}
+
+/** Upload a reference clip and get back the URL to clone from. Only usable
+ * where `VoiceCloneConfig.uploadsReachable` is true. */
+export async function uploadCloneReference(file: File): Promise<{ audioUrl: string; audioSec?: number }> {
+  const body = new FormData();
+  body.append("file", file);
+  const response = await fetch(`${API_BASE_URL}/voice-clone/reference`, { method: "POST", body });
+  if (!response.ok) throw new Error(await errorDetail(response));
+  return (await response.json()) as { audioUrl: string; audioSec?: number };
+}
+
+/** The stored preview clip. `version` busts the browser cache after a
+ * re-preview replaces the bytes behind an unchanged URL — same reason
+ * `ttsAudioUrl` takes one. The server ignores it. */
+export function clonePreviewAudioUrl(voiceId: number, download?: boolean, version?: number): string {
+  const params = new URLSearchParams();
+  if (download) params.set("download", "1");
+  if (version) params.set("v", String(version));
+  const query = params.toString();
+  return `${API_BASE_URL}/voice-clone/${voiceId}/preview/audio${query ? `?${query}` : ""}`;
 }

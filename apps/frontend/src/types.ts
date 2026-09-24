@@ -13,6 +13,15 @@ export type Metric = "DER" | "JER" | "WDER";
  * studio pane that only exists once one is. */
 export type StudioMode = "diarization" | "transcript";
 
+/** Which sub-mode of the Transcript surface is open.
+ *
+ * NOT a third StudioMode: the surface toggle picks what an AudioFile row IS
+ * (`AudioFile.surface` is single-valued and stays two-valued), while this picks
+ * what you are doing on the transcript surface. Cloning goes further than TTS
+ * did and produces no AudioFile at all — a cloned voice is a speaker name, not
+ * a recording. */
+export type TranscriptSubMode = "stt" | "tts" | "clone";
+
 // The UI-facing data types are aliases of the unified diarization contract:
 // components only ever see data that came through an adapter.
 export type Segment = DiarizationSegment;

@@ -163,10 +163,23 @@ COMMON_HAMSA_NEW_VOICES = (
 
 
 def test_hamsa_new_offers_every_bundled_voice() -> None:
-    voices = TTS_ENGINES["hamsa-tts-new"].voices(get_settings())
-    assert len(voices) == EXPECTED_HAMSA_NEW_VOICE_COUNT, (
-        f"expected {EXPECTED_HAMSA_NEW_VOICE_COUNT} bundled speakers, got {len(voices)}"
+    builtins = get_settings().hamsa_tts_new_builtin_voice_options
+    assert len(builtins) == EXPECTED_HAMSA_NEW_VOICE_COUNT, (
+        f"expected {EXPECTED_HAMSA_NEW_VOICE_COUNT} bundled speakers, got {len(builtins)}"
     )
+
+
+def test_hamsa_new_dropdown_is_builtins_plus_clones() -> None:
+    """The dropdown is both lists, and its length is their sum -- a mismatch
+    means one list silently swallowed the other."""
+    settings = get_settings()
+    voices = TTS_ENGINES["hamsa-tts-new"].voices(settings)
+    assert len(voices) == (
+        len(settings.hamsa_tts_new_builtin_voice_options)
+        + len(settings.hamsa_tts_new_cloned_voice_options)
+    )
+    for cloned in settings.hamsa_tts_new_cloned_voice_options:
+        assert cloned in voices, f"cloned voice {cloned!r} is missing from the dropdown"
 
 
 def test_hamsa_new_voice_list_has_no_duplicates() -> None:
@@ -217,10 +230,15 @@ def test_hamsa_new_voice_list_parsing(
     monkeypatch: pytest.MonkeyPatch, raw: str, expected: list[str]
 ) -> None:
     """Same parsing contract as HAMSA_TTS_SPEAKER, for the same reason: the
-    override in .env is hand-written."""
+    override in .env is hand-written.
+
+    Asserts on the BUILT-IN list, which is what HAMSA_TTS_NEW_VOICE feeds.
+    `hamsa_tts_new_voice_options` is the combined dropdown (built-ins plus
+    cloned voices) and is covered by its own tests below.
+    """
     settings = get_settings()
     monkeypatch.setattr(settings, "hamsa_tts_new_voice", raw)
-    assert settings.hamsa_tts_new_voice_options == expected
+    assert settings.hamsa_tts_new_builtin_voice_options == expected
     assert settings.hamsa_tts_new_default_voice == expected[0]
 
 
@@ -258,3 +276,162 @@ def test_hamsa_new_is_configured_by_the_gateway_credential(monkeypatch: pytest.M
 
     monkeypatch.setattr(settings, "litellm_api_key", None)
     assert engine.configured(settings) is False
+
+
+def test_voice_cloning_is_not_registered_as_a_tts_engine() -> None:
+    """Cloning renders no audio, so it must never appear in the comparison.
+
+    An entry here would put a card in the TTS scorecard that can never produce a
+    clip, a delivery label with nothing to label, and a column in the report
+    whose every figure is blank. What cloning produces is a speaker NAME that
+    `hamsa-tts` then synthesizes with -- which is why the Clone sub-mode reads
+    `TTS_ENGINES[previewTtsId].voices` rather than adding to it.
+    """
+    for tts_id in (*TTS_ENGINES, *COMPARISON_TTS_IDS, *TTS_DELIVERY):
+        assert "clone" not in tts_id, (
+            f"{tts_id!r} looks like a cloning entry in the TTS registry — cloning has no "
+            "delivery and renders no audio, so it cannot be an engine here"
+        )
+
+
+def test_the_preview_engine_the_clone_surface_uses_is_registered() -> None:
+    """A cloned voice is only usable through the engine that talks to the pod it
+    was registered on. If that id ever stops matching a real engine, the Clone
+    sub-mode's step 4 becomes a button that always 422s."""
+    from apps.backend_api.routers.voice_clone import PREVIEW_TTS_ID
+
+    assert PREVIEW_TTS_ID in TTS_ENGINES, (
+        f"voice_clone.PREVIEW_TTS_ID is {PREVIEW_TTS_ID!r}, which is not a registered TTS engine"
+    )
+
+
+def test_cloning_reuses_the_preview_engines_credentials() -> None:
+    """Cloning registers a speaker on the SAME pod `hamsa-tts` synthesizes
+    through, so a host configured for one and not the other would offer a Clone
+    surface whose previews can never run (or the reverse). Pinned because the
+    two predicates live apart and nothing else connects them.
+    """
+    from apps.backend_api.routers.voice_clone import PREVIEW_TTS_ID
+
+    settings = get_settings()
+    # Both read hamsa_tts_key / hamsa_tts_bearer_token. Proven by flipping one
+    # and watching both go false, rather than by reading the lambdas.
+    original_key = settings.hamsa_tts_key
+    try:
+        settings.hamsa_tts_key = None
+        assert not TTS_ENGINES[PREVIEW_TTS_ID].configured(settings)
+        assert not settings.voice_clone_configured
+    finally:
+        settings.hamsa_tts_key = original_key
+
+
+# --- the cloned ("NEW") voices ------------------------------------------------
+#
+# 12 cloned customer voices, badged NEW in the picker. Listed by explicit
+# decision while they are UNREACHABLE: probed 2026-09-09, all 12 answer 500
+# through the gateway and make the direct pod drop the stream, because the
+# clone reference audio lives in the pod's ephemeral /tmp and a restart
+# de-registers it. These tests pin the wiring, which is what has to be correct
+# for them to work the moment they are re-registered; `test_live_tts.py` is
+# what reports whether they actually resolve.
+
+EXPECTED_CLONED_VOICE_COUNT = 12
+
+#: The vendor namespaces every clone this way, and the prefix is load-bearing:
+#: 8 of the 12 collide by name with a bundled speaker.
+CLONED_VOICE_PREFIX = "adeo_"
+
+
+def test_cloned_voices_are_all_listed() -> None:
+    cloned = get_settings().hamsa_tts_new_cloned_voice_options
+    assert len(cloned) == EXPECTED_CLONED_VOICE_COUNT, (
+        f"expected {EXPECTED_CLONED_VOICE_COUNT} cloned voices, got {len(cloned)}"
+    )
+
+
+def test_new_voices_are_a_subset_of_the_dropdown() -> None:
+    """The one cross-check that matters for the badge.
+
+    The picker badges a row by membership in `new_voices`. A name there that is
+    not in `voices` would be a badge with nothing to attach to, and the reverse
+    (a clone missing from `voices`) would be an offered-but-unlisted voice. The
+    two come from the same settings pair precisely so this cannot drift.
+    """
+    settings = get_settings()
+    for tts_id, engine in TTS_ENGINES.items():
+        voices = set(engine.voices(settings))
+        for new in engine.new_voices(settings):
+            assert new in voices, f"{tts_id!r} badges {new!r} as NEW but does not offer it"
+
+
+def test_only_hamsa_new_has_new_voices() -> None:
+    """The other two engines' voice lists have not changed, so a badge on them
+    would be decoration rather than information."""
+    settings = get_settings()
+    assert TTS_ENGINES["hamsa-tts"].new_voices(settings) == []
+    assert TTS_ENGINES["inception-tts"].new_voices(settings) == []
+
+
+def test_cloned_voices_keep_their_prefix() -> None:
+    """Bare names would collide with the bundled speakers of the same name
+    (Mariam, Reem, Leo, Emma, Lily, Claire, Henry, Mia all exist as built-ins),
+    and two identically-labelled dropdown rows make the operator's pick, the
+    stored clip's S3 key and the scorecard's voice column ambiguous."""
+    for voice in get_settings().hamsa_tts_new_cloned_voice_options:
+        assert voice.startswith(CLONED_VOICE_PREFIX), f"{voice!r} is not namespaced"
+
+
+def test_cloned_names_that_collide_with_builtins_stay_distinct() -> None:
+    """The specific collision, asserted rather than described: the dropdown must
+    never contain two rows that render the same text."""
+    settings = get_settings()
+    voices = TTS_ENGINES["hamsa-tts-new"].voices(settings)
+    lowered = [v.lower() for v in voices]
+    duplicates = sorted({v for v in lowered if lowered.count(v) > 1})
+    assert not duplicates, f"dropdown rows that read identically: {duplicates}"
+    # And the collision really is there to be avoided -- if this ever stops
+    # holding, the prefix guard above is protecting against nothing.
+    assert "mariam" in lowered and "adeo_mariam" in lowered
+
+
+def test_the_default_voice_is_never_a_cloned_voice() -> None:
+    """A clone can be de-registered by a pod restart. Defaulting to one would
+    make every request that specifies no voice fail, on a host where the
+    bundled speakers were working fine."""
+    settings = get_settings()
+    engine = TTS_ENGINES["hamsa-tts-new"]
+    default = engine.default_voice(settings)
+    assert default not in settings.hamsa_tts_new_cloned_voice_options
+    assert default in settings.hamsa_tts_new_builtin_voice_options
+
+
+def test_clones_sit_near_the_top_but_not_at_position_zero() -> None:
+    """Discoverable without scrolling 113 names, while position 0 stays the
+    default bundled speaker."""
+    settings = get_settings()
+    voices = TTS_ENGINES["hamsa-tts-new"].voices(settings)
+    assert voices[0] == settings.hamsa_tts_new_default_voice
+    cloned = settings.hamsa_tts_new_cloned_voice_options
+    assert voices[1 : 1 + len(cloned)] == cloned
+
+
+def test_dropping_the_clones_leaves_a_working_dropdown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Turning them off is one .env line, and it must not degrade anything:
+    the expected state on a host where they were never registered."""
+    settings = get_settings()
+    monkeypatch.setattr(settings, "hamsa_tts_new_cloned_voice", "")
+    engine = TTS_ENGINES["hamsa-tts-new"]
+
+    assert engine.new_voices(settings) == []
+    voices = engine.voices(settings)
+    assert len(voices) == EXPECTED_HAMSA_NEW_VOICE_COUNT
+    assert engine.default_voice(settings) in voices
+    assert not any(v.startswith(CLONED_VOICE_PREFIX) for v in voices)
+
+
+def test_cloned_voice_list_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same CSV contract as every other voice list here, and an empty entry
+    must not become a blank dropdown row the gateway answers with a 500."""
+    settings = get_settings()
+    monkeypatch.setattr(settings, "hamsa_tts_new_cloned_voice", " adeo_a , ,adeo_b,")
+    assert settings.hamsa_tts_new_cloned_voice_options == ["adeo_a", "adeo_b"]

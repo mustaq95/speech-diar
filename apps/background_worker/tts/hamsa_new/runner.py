@@ -15,10 +15,14 @@ container.
 Everything below was measured against the live gateway on 2026-09-09, and
 several findings contradict the vendor's own guide. The probe wins:
 
-  * **The documented model id does not work.** The guide says `hamsa-tts-new`;
-    that returns 403 `team not allowed to access model` on our key, which
-    carries the model as `hamsa-tts`. Hence `HAMSA_TTS_NEW_MODEL` is a setting
-    (default `hamsa-tts`), flippable by .env the day access is granted.
+  * **The model id is `hamsa-tts-new`, and reaching it is about the KEY.**
+    The key this repo shipped with answered 403 `team not allowed to access
+    model` for that id and listed 10 models, which first read as "the id is
+    wrong" -- it was not. The key now in .env lists 14 including this one and
+    is a strict superset of the old one. `hamsa-tts` is the older deployment
+    and still resolves, but the cloned customer voices exist ONLY on
+    `hamsa-tts-new`, so a 403 here means the credential regressed rather than
+    that the model moved.
   * **`Content-Type` is always `audio/mpeg`**, even though the body is a real
     RIFF/WAVE — the identical lie `../inception/` documents on this same
     gateway. Never branch on it; the adapter sniffs magic bytes.
@@ -38,8 +42,19 @@ several findings contradict the vendor's own guide. The probe wins:
   * **An unknown voice is a 500, not the documented 400.** The gateway
     swallows the vendor's `speaker_not_found` and answers
     `{"error":{"message":"Internal server error"}}`, so a 500 from here cannot
-    be distinguished from a real outage. All 113 bundled voices were swept and
-    every one returned real audio, so the shipped dropdown cannot produce it.
+    be distinguished from a real outage. All 125 shipped voices (113 bundled +
+    12 cloned) were swept against this model and every one returned real WAV,
+    so the dropdown cannot produce it -- but the CLONES only resolve on
+    `hamsa-tts-new`, and they 500 on `hamsa-tts` while built-ins on the same
+    call succeed.
+  * **One bundled voice returns near-silence for short Arabic input.** `Ali`
+    answers 200 with a 684-byte body (0.02s of PCM) for a 1-to-5-word Arabic
+    phrase, reproducibly, while returning a normal 3.3s render for a 9-word
+    one; `Zeina` handles the identical short inputs fine. Nothing here filters
+    it: a duration floor would be exactly the kind of heuristic this repo
+    keeps out of the audio path, and the 0.02s clip IS what the engine
+    produced. It surfaces as a 0:00 clip with a large RTF, which is the honest
+    reading of a failed render.
   * **Empty input is a 200 carrying a 44-byte header-only WAV**, not the
     documented validation error. The adapter rejects a frameless body rather
     than store an unplayable clip.

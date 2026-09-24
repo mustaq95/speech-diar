@@ -46,7 +46,7 @@ import {
 import type { RuntimeConfig } from "./adapters";
 import { speakerSignature, decodeWaveformPeaks } from "./playback";
 import { isInFlight } from "./timing";
-import type { ActiveMap, AvailableMap, DiarizationEvaluation, EvalConfig, ModelId, ModelMetadata, ModelRun, Nav, ParamMap, Project, StudioMode, Workflow } from "./types";
+import type { ActiveMap, AvailableMap, DiarizationEvaluation, EvalConfig, ModelId, ModelMetadata, ModelRun, Nav, ParamMap, Project, StudioMode, TranscriptSubMode, Workflow } from "./types";
 import type { ModelContainerStatus, TranscriptionMode, TranscriptRun, UploadAck } from "./types/diarization";
 
 const FLAT_WAVE_PEAKS = Array.from({ length: 210 }, () => 0.3);
@@ -107,7 +107,7 @@ export default function App() {
   // against a reference, or comparing TTS engines' synthesis of that same
   // reference. A toggle inside the transcript page, not a nav destination or a
   // second surface — `nav`/`studioMode`/`listSurface` stay exactly as they were.
-  const [transcriptSubMode, setTranscriptSubMode] = useState<"stt" | "tts">("stt");
+  const [transcriptSubMode, setTranscriptSubMode] = useState<TranscriptSubMode>("stt");
   const [workflow, setWorkflow] = useState<Workflow>("idle");
   const [uploadPct, setUploadPct] = useState(0);
   const [playing, setPlaying] = useState(false);

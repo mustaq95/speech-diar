@@ -187,3 +187,53 @@ def test_hamsa_new_does_not_front_load_audio() -> None:
         "this engine now front-loads audio, so delivery=\"single\" understates it -- "
         "re-probe and relabel it rather than loosening this bound"
     )
+
+
+@pytest.mark.live
+def test_hamsa_new_cloned_voices_are_registered() -> None:
+    """Sweeps the cloned customer voices against the live gateway.
+
+    Verified 2026-09-09: 12/12 return real WAV on `hamsa-tts-new`. This is the
+    only check that can catch them going away, and there are two distinct ways
+    that happens:
+
+      * **The credential regresses.** The clones exist ONLY on
+        `hamsa-tts-new`; on `hamsa-tts` every one answers 500 while built-ins
+        on the same call succeed. A key without access to that model 403s the
+        whole engine.
+      * **The pod restarts.** The vendor's guide says clone reference audio
+        lives in the pod's EPHEMERAL /tmp, so a restart de-registers every
+        clone and the clone flow has to be re-run.
+
+    A red run names which voices are missing. Do not "fix" it by deleting the
+    voices or loosening the assertion -- check HAMSA_TTS_NEW_MODEL and the key
+    first, then re-register upstream, or clear HAMSA_TTS_NEW_CLONED_VOICE to
+    stop offering them.
+    """
+    settings = get_settings()
+    engine = TTS_ENGINES["hamsa-tts-new"]
+    if not engine.configured(settings):
+        pytest.skip("hamsa-tts-new is not configured on this host")
+
+    cloned = settings.hamsa_tts_new_cloned_voice_options
+    if not cloned:
+        pytest.skip("no cloned voices configured on this host")
+
+    failures: list[str] = []
+    for voice in cloned:
+        try:
+            render = engine.adapt(engine.run(SENTENCE, voice))
+        except Exception as exc:  # noqa: BLE001 - the report is the point
+            failures.append(f"{voice}: {type(exc).__name__} {str(exc)[:120]}")
+            continue
+        if not render.audio or render.audio[:4] != b"RIFF":
+            failures.append(f"{voice}: returned {len(render.audio)} non-RIFF bytes")
+
+    assert not failures, (
+        f"{len(failures)}/{len(cloned)} cloned voices did not synthesize. The clone "
+        "clones live ONLY on hamsa-tts-new (they 500 on hamsa-tts), so check "
+        f"HAMSA_TTS_NEW_MODEL (currently {settings.hamsa_tts_new_model!r}) and the "
+        "gateway key first; otherwise the pod restarted and de-registered them, since "
+        "the reference audio sits in its ephemeral /tmp. Re-run the clone flow, or "
+        "clear HAMSA_TTS_NEW_CLONED_VOICE to stop offering them.\n  " + "\n  ".join(failures)
+    )

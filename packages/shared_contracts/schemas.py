@@ -436,6 +436,75 @@ class TtsRun(ContractModel):
     )
 
 
+class ClonedVoice(ContractModel):
+    """One voice registered on the TTS pod from a reference clip.
+
+    Not scoped to an `AudioFile`, unlike every other result contract here: a
+    cloned voice is a speaker NAME the `hamsa-tts` engine can then synthesize
+    with, reusable across every recording, so tying it to one would defeat the
+    point of cloning it.
+
+    `status` separates the two pod calls because they fail independently:
+    "extracted" means tokens exist but the pod holds no speaker under this name
+    yet, "registered" means it does, "failed" means extraction was rejected and
+    `error` carries what the pod said. The token arrays themselves never cross
+    the wire -- only their counts -- because they are thousands of integers the
+    UI has no use for beyond showing how many there are.
+    """
+
+    id: int
+    speaker_id: str = Field(description="The name to pass as 'speaker' when synthesizing")
+    status: str = Field(description="extracted|registered|failed")
+    error: str | None = Field(default=None, description="What the pod returned when status == 'failed'")
+    dialect: str
+    prompt_text: str = Field(description="Verbatim transcript of the reference clip, as sent")
+    audio_url: str = Field(description="The reference clip URL as given to the pod")
+    has_stored_clip: bool = Field(
+        description="Whether this API kept a copy of the reference clip and can serve it back"
+    )
+    audio_format: str | None = Field(default=None, description="Probed from the stored clip")
+    audio_sec: float | None = Field(default=None, ge=0, description="Probed duration of the reference clip")
+    size_bytes: int | None = Field(default=None, ge=0, description="Exact size of the stored clip")
+    native_sample_rate: int | None = Field(default=None, ge=0, description="Probed from the stored clip")
+    channels: int | None = Field(default=None, ge=0, description="Probed from the stored clip")
+    global_token_count: int | None = Field(
+        default=None, ge=0, description="How many global tokens extraction returned"
+    )
+    semantic_token_count: int | None = Field(
+        default=None, ge=0, description="How many semantic tokens extraction returned"
+    )
+    returned_prompt_text: str | None = Field(
+        default=None,
+        description="prompt_text as the pod echoed it back, which need not equal what was sent",
+    )
+    extract_ms: int | None = Field(default=None, ge=0, description="Measured wall clock of the extract call")
+    register_ms: int | None = Field(default=None, ge=0, description="Measured wall clock of the register call")
+    created_at: datetime
+    registered_at: datetime | None = Field(default=None, description="When the pod accepted this voice")
+
+
+class ClonePreview(ContractModel):
+    """One synthesis made with a cloned voice, to hear whether the clone worked.
+
+    Separate from `TtsRun` and deliberately thinner: a preview is not part of
+    the TTS comparison, is not stored per (recording, engine, voice), and has no
+    reference text to score against. It exists so the operator can A/B the clone
+    against the clip it came from. Nothing here rates how close the two are --
+    no such measurement exists in this repo, and inventing one would be exactly
+    the fabrication the diarization surface refuses.
+    """
+
+    voice_id: int
+    speaker_id: str
+    text: str = Field(description="What was synthesized")
+    audio_format: str
+    audio_sec: float | None = Field(default=None, ge=0, description="Measured duration of the clip")
+    size_bytes: int | None = Field(default=None, ge=0)
+    native_sample_rate: int | None = Field(default=None, ge=0)
+    first_audio_ms: int | None = Field(default=None, ge=0, description="Measured time to first audio")
+    synth_ms: int | None = Field(default=None, ge=0, description="Measured total synthesis wall clock")
+
+
 class TtsRawOutput(ContractModel):
     """`ModelRawOutput`'s counterpart for one TTS engine's synthesis.
 

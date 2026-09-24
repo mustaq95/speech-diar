@@ -17,7 +17,15 @@ from apps.background_worker.transcription import (
     transport_for,
 )
 from apps.background_worker.tts import COMPARISON_TTS_IDS, TTS_DELIVERY, TTS_ENGINES
-from apps.backend_api.routers import evaluations, models, recordings, transcript, tts, upload
+from apps.backend_api.routers import (
+    evaluations,
+    models,
+    recordings,
+    transcript,
+    tts,
+    upload,
+    voice_clone,
+)
 from packages.config.logging import configure_logging
 from packages.config.settings import get_settings
 from packages.database.session import init_db
@@ -48,6 +56,7 @@ app.include_router(models.router)
 app.include_router(recordings.router)
 app.include_router(transcript.router)
 app.include_router(tts.router)
+app.include_router(voice_clone.router)
 
 
 @app.get("/health")
@@ -157,6 +166,9 @@ def frontend_config() -> dict[str, object]:
                     "configured": TTS_ENGINES[tts_id].configured(settings),
                     "voices": TTS_ENGINES[tts_id].voices(settings),
                     "defaultVoice": TTS_ENGINES[tts_id].default_voice(settings),
+                    # The subset of `voices` the UI badges as NEW. Same source
+                    # as the dropdown itself, so the two cannot disagree.
+                    "newVoices": TTS_ENGINES[tts_id].new_voices(settings),
                     # Engine-level synthesis settings, true of every voice this
                     # engine offers. The UI shows them beside the voice picker;
                     # neither gateway exposes per-voice metadata (no
@@ -168,5 +180,26 @@ def frontend_config() -> dict[str, object]:
                 if tts_id in TTS_ENGINES
             ],
             "maxInputChars": settings.tts_max_input_chars,
+        },
+        # The Clone sub-mode. Deliberately NOT an entry in the tts.engines list
+        # above: cloning renders no audio and has no delivery, and a row there
+        # would appear in the comparison as an engine that can never produce a
+        # clip. What it produces is a speaker name hamsa-tts then uses.
+        "voiceClone": {
+            "configured": settings.voice_clone_configured,
+            # Exactly what .env holds. The pod has no list-dialects route any
+            # more than it has a list-voices one, so nothing here is discovered
+            # and the UI must not imply it was.
+            "dialects": settings.voice_clone_dialect_options,
+            "defaultDialect": settings.voice_clone_default_dialect,
+            "maxPromptChars": settings.voice_clone_max_prompt_chars,
+            # Whether an UPLOADED clip can be cloned from at all. The pod
+            # downloads the reference itself, so with no base URL it can resolve,
+            # only an already-public URL works -- the UI says which of the two
+            # this host is rather than offering a control that always fails.
+            "uploadsReachable": bool(settings.voice_clone_public_base_url),
+            # The engine a cloned voice becomes usable through, so the UI can
+            # name it instead of hardcoding "hamsa-tts".
+            "previewTtsId": voice_clone.PREVIEW_TTS_ID,
         },
     }

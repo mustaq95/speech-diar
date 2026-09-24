@@ -525,6 +525,7 @@ export function TtsStudio({ runtimeConfig, audioFileId, onScriptSaved }: TtsStud
                   }
                   params={engine.synthesisParams}
                   synthesized={synthesized}
+                  newVoices={engine.newVoices}
                   disabled={busy}
                   label={`${engine.name} voice`}
                 />

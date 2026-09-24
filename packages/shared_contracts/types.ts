@@ -387,6 +387,77 @@ export interface TtsRun {
  *
  * `rawOutput` here is response metadata (status code, headers), never the audio bytes —
  * the audio itself is served by `GET /evaluations/{id}/tts/{ttsId}/audio`. */
+/** One voice registered on the TTS pod from a reference clip.
+ *
+ * Not scoped to an AudioFile, unlike every other result contract here: a cloned
+ * voice is a speaker NAME the `hamsa-tts` engine can then synthesize with,
+ * reusable across every recording.
+ *
+ * `status` separates the two pod calls because they fail independently:
+ * "extracted" means tokens exist but the pod holds no speaker under this name
+ * yet, "registered" means it does, "failed" means extraction was rejected. The
+ * token arrays never cross the wire, only their counts. */
+export interface ClonedVoice {
+  id: number;
+  /** The name to pass as "speaker" when synthesizing. */
+  speakerId: string;
+  /** extracted|registered|failed. */
+  status: string;
+  /** What the pod returned when status === "failed". */
+  error?: string;
+  dialect: string;
+  /** Verbatim transcript of the reference clip, as sent. */
+  promptText: string;
+  /** The reference clip URL as given to the pod. */
+  audioUrl: string;
+  /** Whether this API kept a copy of the reference clip and can serve it back. */
+  hasStoredClip: boolean;
+  /** Probed from the stored clip. */
+  audioFormat?: string;
+  /** Probed duration of the reference clip. */
+  audioSec?: number;
+  /** Exact size of the stored clip. */
+  sizeBytes?: number;
+  /** Probed from the stored clip. */
+  nativeSampleRate?: number;
+  /** Probed from the stored clip. */
+  channels?: number;
+  /** How many global tokens extraction returned. */
+  globalTokenCount?: number;
+  /** How many semantic tokens extraction returned. */
+  semanticTokenCount?: number;
+  /** promptText as the pod echoed it back, which need not equal what was sent. */
+  returnedPromptText?: string;
+  /** Measured wall clock of the extract call. */
+  extractMs?: number;
+  /** Measured wall clock of the register call. */
+  registerMs?: number;
+  createdAt: string;
+  /** When the pod accepted this voice. */
+  registeredAt?: string;
+}
+
+/** One synthesis made with a cloned voice, to hear whether the clone worked.
+ *
+ * Deliberately thinner than TtsRun: a preview is not part of the TTS
+ * comparison and has no reference text to score against. Nothing here rates how
+ * close the clone is to its source -- no such measurement exists in this repo. */
+export interface ClonePreview {
+  voiceId: number;
+  speakerId: string;
+  /** What was synthesized. */
+  text: string;
+  audioFormat: string;
+  /** Measured duration of the clip. */
+  audioSec?: number;
+  sizeBytes?: number;
+  nativeSampleRate?: number;
+  /** Measured time to first audio. */
+  firstAudioMs?: number;
+  /** Measured total synthesis wall clock. */
+  synthMs?: number;
+}
+
 export interface TtsRawOutput {
   /** Engine that ran: "hamsa-tts" | "inception-tts". */
   ttsId: string;
