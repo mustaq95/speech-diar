@@ -13,6 +13,9 @@ apps/frontend/*.tsbuildinfo
 .cursor/
 .gstack/
 test/samples/
+# Large local clips (not in GitHub; keep on disk for live tests)
+tests/samples/youtube_ar_32min_8spk.wav
+tests/samples/youtube_ar_32min_8spk.16k.wav
 tests/fixtures/
 # Python
 .venv
