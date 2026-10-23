@@ -2,6 +2,8 @@
 output to the shared contract. No merging, no fabrication — one segment per
 raw phrase/turn the engine actually reported."""
 
+import pytest
+
 from apps.background_worker.models import _nim_shared
 from apps.background_worker.models.azure_batch.adapter import AzureBatchAdapter
 from apps.background_worker.models.azure_speech.adapter import AzureSpeechAdapter
@@ -12,6 +14,7 @@ from apps.background_worker.models.nim_sortformer_ofl.adapter import NimSortform
 from apps.background_worker.models.nim_sortformer_str.adapter import NimSortformerStrAdapter
 from apps.background_worker.models.pyannote.adapter import PyAnnoteAdapter
 from apps.background_worker.models.pyannote_3_1.adapter import Pyannote31Adapter
+from apps.background_worker.models.pyannote_adeo.adapter import PyannoteAdeoAdapter
 from apps.background_worker.models.sherpa.adapter import SherpaAdapter
 from apps.background_worker.models.speaker3d_clustering.adapter import Speaker3dClusteringAdapter
 from apps.background_worker.models.vibevoice.adapter import VibeVoiceAdapter
@@ -455,3 +458,41 @@ def test_moss_transcribe_adapter_empty_text_yields_no_segments() -> None:
     assert MossTranscribeAdapter().adapt({"text": ""}).segs == []
     assert MossTranscribeAdapter().adapt({}).segs == []
     assert MossTranscribeAdapter().adapt({"text": ""}).num_spk == 0
+
+
+def _adeo_job(diarization, exclusive=None, status="succeeded"):
+    output = {"diarization": diarization}
+    if exclusive is not None:
+        output["exclusiveDiarization"] = exclusive
+    return {"job": {"jobId": "j1", "status": status, "output": output}, "audio_duration_sec": 12.0}
+
+
+def test_pyannote_adeo_adapter_renders_the_overlap_preserving_list() -> None:
+    raw = _adeo_job(
+        diarization=[
+            {"speaker": "SPEAKER_01", "start": 0.3, "end": 2.2},
+            {"speaker": "SPEAKER_00", "start": 1.8, "end": 4.0},  # overlaps the first turn
+            {"speaker": "SPEAKER_01", "start": 4.0, "end": 5.0},
+        ],
+        exclusive=[{"speaker": "SPEAKER_01", "start": 0.3, "end": 1.8}],
+    )
+    adapter = PyannoteAdeoAdapter()
+    run = adapter.adapt(raw)
+    assert run.id == "pyannote-adeo"
+    assert run.num_spk == 2
+    assert [seg.spk for seg in run.segs] == [0, 1, 0]  # first-appearance order
+    assert [(seg.s, seg.e) for seg in run.segs] == [(0.3, 2.2), (1.8, 4.0), (4.0, 5.0)]
+    assert adapter.audio_duration_sec(raw) == 12.0
+
+
+def test_pyannote_adeo_adapter_no_merging_of_adjacent_same_speaker_turns() -> None:
+    raw = _adeo_job([
+        {"speaker": "SPEAKER_00", "start": 0.0, "end": 1.0},
+        {"speaker": "SPEAKER_00", "start": 1.0, "end": 2.0},
+    ])
+    assert len(PyannoteAdeoAdapter().adapt(raw).segs) == 2
+
+
+def test_pyannote_adeo_adapter_rejects_a_job_that_did_not_succeed() -> None:
+    with pytest.raises(ValueError, match="failed"):
+        PyannoteAdeoAdapter().adapt(_adeo_job([], status="failed"))

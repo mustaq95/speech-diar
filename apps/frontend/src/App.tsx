@@ -64,6 +64,29 @@ const AgentationDev = import.meta.env.DEV
     )
   : null;
 
+
+/**
+ * Insert never-run shell rows at their catalog position: each goes right after
+ * the nearest earlier catalog model already in the list (so a model registered
+ * after Azure sits after Azure). Rows that ran keep the order they ran in.
+ */
+function withCatalogShells(runs: ModelRun[], catalog: ModelRun[], shells: ModelRun[]): ModelRun[] {
+  const out = [...runs];
+  for (const shell of shells) {
+    const catalogIndex = catalog.findIndex((model) => model.id === shell.id);
+    let at = 0;
+    for (let i = catalogIndex - 1; i >= 0; i--) {
+      const pos = out.findIndex((model) => model.id === catalog[i].id);
+      if (pos !== -1) {
+        at = pos + 1;
+        break;
+      }
+    }
+    out.splice(at, 0, shell);
+  }
+  return out;
+}
+
 export default function App() {
   // All diarization data enters the UI through the adapter layer as the
   // unified contract — never as a backend's raw payload. No evaluation is
@@ -169,15 +192,23 @@ export default function App() {
   const durationText = fmt(duration);
   // Dashboard always shows the Studio shell; before anything is uploaded it
   // falls back to the configured model catalog so the layout looks the same.
-  // With an evaluation open, append any model the user toggled on that never
-  // ran here (e.g. a model added after this recording was uploaded) as a
-  // shell row, so it shows immediately and can be run via the ↻ button.
+  // With an evaluation open, any model the user toggled on that never ran here
+  // (e.g. a model added after this recording was uploaded) gets a shell row, so
+  // it shows immediately and can be run via the ↻ button.
   const dashboardModels = useMemo(() => {
     if (!evaluation) return catalogModels;
     const present = new Set(models.map((model) => model.id));
     const extra = catalogModels.filter((model) => active[model.id] && !present.has(model.id));
-    return extra.length ? [...models, ...extra] : models;
+    return withCatalogShells(models, catalogModels, extra);
   }, [evaluation, models, catalogModels, active]);
+  // The pill bar lists every catalog model, not only the ones that ran here, so
+  // a model added later always has a pill on an old recording.
+  const configBarModels = useMemo(() => {
+    if (!evaluation) return catalogModels;
+    const present = new Set(models.map((model) => model.id));
+    const missing = catalogModels.filter((model) => !present.has(model.id));
+    return withCatalogShells(models, catalogModels, missing);
+  }, [evaluation, models, catalogModels]);
 
   // Fetch the real, honest model registry and runtime config once at boot.
   useEffect(() => {
@@ -793,7 +824,13 @@ export default function App() {
       .then((result) => {
         if (openRequestRef.current !== requestId) return; // a newer open superseded this one
         setEvaluation(result);
-        setActive(Object.fromEntries(result.models.map((model) => [model.id, true])));
+        // Everything that ran here is shown; a model that never ran follows the
+        // Settings choice (a newly added model defaults on), so it appears as a
+        // shell row ready to run instead of being hidden on old recordings.
+        setActive({
+          ...mergeActiveWithCatalog(loadModelActive() ?? {}, catalog),
+          ...Object.fromEntries(result.models.map((model) => [model.id, true])),
+        });
         setParams(deriveDefaultParams(result));
         setEvalCfg(deriveDefaultEval(result));
         setWorkflow("idle");
@@ -1076,7 +1113,7 @@ export default function App() {
       )}
       {nav === "dashboard" && workflow !== "loading" && (
         <main className="dashboard">
-          <ConfigBar models={dashboardModels} active={active} onToggle={toggleModel} />
+          <ConfigBar models={configBarModels} active={active} onToggle={toggleModel} />
           <section className="file-bar">
             <div>
               File: <strong>{fileName}</strong>

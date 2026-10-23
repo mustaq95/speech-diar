@@ -23,6 +23,8 @@ from .pyannote.adapter import PyAnnoteAdapter
 from .pyannote.runner import PyAnnoteRunner
 from .pyannote_3_1.adapter import Pyannote31Adapter
 from .pyannote_3_1.runner import Pyannote31Runner
+from .pyannote_adeo.adapter import PyannoteAdeoAdapter
+from .pyannote_adeo.runner import PyannoteAdeoRunner
 from .sherpa.adapter import SherpaAdapter
 from .sherpa.runner import SherpaRunner
 from .speaker3d_clustering.adapter import Speaker3dClusteringAdapter
@@ -34,6 +36,7 @@ REGISTRY: dict[str, DiarizationModel] = {
     model.model_id: model
     for model in (
         DiarizationModel(AzureSpeechRunner(), AzureSpeechAdapter()),
+        DiarizationModel(PyannoteAdeoRunner(), PyannoteAdeoAdapter()),
         DiarizationModel(AzureBatchRunner(), AzureBatchAdapter()),
         DiarizationModel(PyAnnoteRunner(), PyAnnoteAdapter()),
         DiarizationModel(SherpaRunner(), SherpaAdapter()),

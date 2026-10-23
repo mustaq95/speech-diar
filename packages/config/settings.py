@@ -373,6 +373,14 @@ class Settings(BaseSettings):
     verify_ssl: bool = True
     litellm_ca_bundle: str = ""
 
+    # --- PyAnnote Community-1 (ADEO), diarization via the same gateway ---
+    # The pyannoteAI /v1/diarize contract (multipart `file` + form fields),
+    # synchronous: the response IS the finished job. Reuses LITELLM_BASE_URL,
+    # LITELLM_API_KEY and the TLS settings above.
+    diarize_path: str = "/v1/diarize"
+    pyannote_adeo_model: str = "pyannote/community-1"
+    pyannote_adeo_timeout_sec: float = 600
+
     # --- Pre-start the transcript surface's GPU containers ---
     # When true, the supervisor daemon starts every container-backed ASR engine
     # at boot, waits for each to report healthy, and then PINS them: they are
@@ -832,6 +840,13 @@ class Settings(BaseSettings):
         if not self.litellm_base_url:
             return None
         return f"{self.litellm_base_url.rstrip('/')}{self.stt_transcription_path}"
+
+    @property
+    def diarize_url(self) -> str | None:
+        """Full gateway diarization URL, or None when unconfigured."""
+        if not self.litellm_base_url:
+            return None
+        return f"{self.litellm_base_url.rstrip('/')}{self.diarize_path}"
 
     @property
     def tts_speech_url(self) -> str | None:

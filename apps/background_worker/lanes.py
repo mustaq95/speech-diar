@@ -14,6 +14,7 @@ LANE_MAP: dict[str, Lane] = {
     "pyannote": "local",
     "sherpa": "local",
     "azure": "local",
+    "pyannote-adeo": "local",
     "azure-batch": "azure",
     "nim-sortformer-str": "local",
     "nim-sortformer-ofl": "local",
